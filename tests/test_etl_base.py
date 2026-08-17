@@ -68,10 +68,7 @@ class TestSourceAdapterAbstractMethods:
             "compute_checksum",
         }
         actual = set(abstract_methods)
-        assert actual == expected, (
-            f"SourceAdapter abstract methods: {actual}\n"
-            f"Expected: {expected}"
-        )
+        assert actual == expected, f"SourceAdapter abstract methods: {actual}\nExpected: {expected}"
 
 
 class TestSourceFileInfoDataclass:

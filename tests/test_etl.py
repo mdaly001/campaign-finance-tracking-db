@@ -118,9 +118,12 @@ class TestBuildLoadConfig:
 
     def test_build_config_for_rcpt_cd(self):
         """RCPT_CD should get proper conflict columns and type coercions."""
-        tsv = _make_tsv_for_table("RCPT_CD", [
-            ["F1", "A1", "1", "Alice", "100.50", "2024-01-01"],
-        ])
+        tsv = _make_tsv_for_table(
+            "RCPT_CD",
+            [
+                ["F1", "A1", "1", "Alice", "100.50", "2024-01-01"],
+            ],
+        )
         h = hashlib.sha256(tsv).hexdigest()
         config = _build_load_config("RCPT_CD", tsv, h)
 
@@ -169,10 +172,13 @@ class TestTableLoaderIntegration:
             """,
         )
 
-        tsv = _make_tsv_for_table("SMRY_CD", [
-            ["F100", "A1", "1", "1000.00", "500.00"],
-            ["F100", "A1", "2", "2000.00", "1000.00"],
-        ])
+        tsv = _make_tsv_for_table(
+            "SMRY_CD",
+            [
+                ["F100", "A1", "1", "1000.00", "500.00"],
+                ["F100", "A1", "2", "2000.00", "1000.00"],
+            ],
+        )
 
         config = LoadConfig(
             table_name="smry_cd",
@@ -209,10 +215,13 @@ class TestTableLoaderIntegration:
             """,
         )
 
-        tsv = _make_tsv_for_table("CNTRB_CD", [
-            ["C001", "Alice Smith", "5000.00"],
-            ["C002", "Bob Jones", "3000.00"],
-        ])
+        tsv = _make_tsv_for_table(
+            "CNTRB_CD",
+            [
+                ["C001", "Alice Smith", "5000.00"],
+                ["C002", "Bob Jones", "3000.00"],
+            ],
+        )
 
         config = LoadConfig(
             table_name="cntrb_cd",
@@ -226,9 +235,7 @@ class TestTableLoaderIntegration:
 
         assert summary.rows_upserted == 2
 
-        rows = _fetch(
-            self.engine, "SELECT ctrib_naml, total_gives FROM cntrb_cd ORDER BY ctrib_id"
-        )
+        rows = _fetch(self.engine, "SELECT ctrib_naml, total_gives FROM cntrb_cd ORDER BY ctrib_id")
         assert rows[0][0] == "Alice Smith"
         assert float(rows[0][1]) == 5000.0
 
@@ -506,16 +513,34 @@ class TestLoadOrder:
     def test_dimensions_before_facts(self):
         """All dimension tables should appear before fact tables in LOAD_ORDER."""
         fact_codes = {
-            "RCPT_CD", "CNTRB_CD", "EXPPD_CD", "LOANS_CD",
-            "INTTRF_CD", "DEBT_CD", "SMRY_CD", "SPLT_CD",
+            "RCPT_CD",
+            "CNTRB_CD",
+            "EXPPD_CD",
+            "LOANS_CD",
+            "INTTRF_CD",
+            "DEBT_CD",
+            "SMRY_CD",
+            "SPLT_CD",
             "TEXT_MEMO_CD",
         }
         dim_codes = {
-            "FILERNAME_CD", "ADDRESS_CD", "FILER_XREF_CD", "FILER_LINKS_CD",
-            "NAMES_CD", "FILINGS_CD", "FILING_TYPE_CD", "FILING_PERIOD_CD",
-            "HDR_CD", "HEADER_DEFS_CD", "ACRONYMS_CD", "FILER_TYPES_CD",
-            "FILER_STATUS_CD", "GROUP_TYPES_CD", "REPORT_TYPES_CD",
-            "LEGISLATIVE_SESSIONS_CD", "LOOKUP_CODES",
+            "FILERNAME_CD",
+            "ADDRESS_CD",
+            "FILER_XREF_CD",
+            "FILER_LINKS_CD",
+            "NAMES_CD",
+            "FILINGS_CD",
+            "FILING_TYPE_CD",
+            "FILING_PERIOD_CD",
+            "HDR_CD",
+            "HEADER_DEFS_CD",
+            "ACRONYMS_CD",
+            "FILER_TYPES_CD",
+            "FILER_STATUS_CD",
+            "GROUP_TYPES_CD",
+            "REPORT_TYPES_CD",
+            "LEGISLATIVE_SESSIONS_CD",
+            "LOOKUP_CODES",
         }
 
         last_dim_idx = -1
@@ -570,6 +595,4 @@ class TestTableDefinitions:
         """Partitioned tables should specify date_column."""
         for code, td in TABLE_DEFINITIONS.items():
             if td.partition_by_date:
-                assert td.date_column, (
-                    f"Table {code} is partitioned but missing date_column"
-                )
+                assert td.date_column, f"Table {code} is partitioned but missing date_column"

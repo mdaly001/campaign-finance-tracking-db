@@ -1,6 +1,5 @@
 """Tests for core/etl/validation.py — RowValidator class."""
 
-
 from core.etl.validation import RowValidator
 
 
@@ -232,10 +231,10 @@ class TestRowValidatorBatch:
         validator = RowValidator(rules)
 
         records = [
-            {"name": "Alice", "amount": "100"},       # valid
-            {"name": "Bob", "amount": "-50"},           # invalid (negative)
-            {"name": "Charlie", "amount": "200"},       # valid
-            {"name": None, "amount": "300"},            # invalid (required missing)
+            {"name": "Alice", "amount": "100"},  # valid
+            {"name": "Bob", "amount": "-50"},  # invalid (negative)
+            {"name": "Charlie", "amount": "200"},  # valid
+            {"name": None, "amount": "300"},  # invalid (required missing)
         ]
 
         valid, invalid = validator.validate_batch(records)

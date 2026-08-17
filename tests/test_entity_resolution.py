@@ -22,7 +22,8 @@ def engine():
     )
     # Create entity and merge_queue tables
     with eng.begin() as conn:
-        conn.execute(text("""
+        conn.execute(
+            text("""
             CREATE TABLE entity (
                 entity_id INTEGER PRIMARY KEY,
                 naml VARCHAR(120),
@@ -40,8 +41,10 @@ def engine():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """))
-        conn.execute(text("""
+        """)
+        )
+        conn.execute(
+            text("""
             CREATE TABLE entity_alias (
                 alias_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 entity_id INTEGER NOT NULL,
@@ -50,8 +53,10 @@ def engine():
                 source_table VARCHAR(30),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """))
-        conn.execute(text("""
+        """)
+        )
+        conn.execute(
+            text("""
             CREATE TABLE entity_merge_queue (
                 queue_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 entity_a_id INTEGER,
@@ -64,7 +69,8 @@ def engine():
                 notes TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """))
+        """)
+        )
     return eng
 
 
@@ -78,7 +84,8 @@ def resolver(engine):
 def sample_entities(resolver):
     """Insert test entities with known names."""
     with resolver._conn.begin() as conn:
-        conn.execute(text("""
+        conn.execute(
+            text("""
             INSERT INTO entity (entity_id, naml, namf, nams, city, st)
             VALUES
                 (1, 'John Smith', 'A', '', 'Los Angeles', 'CA'),
@@ -89,9 +96,11 @@ def sample_entities(resolver):
                 (6, 'Acme Corporation', '', '', 'Sacramento', 'CA'),
                 (7, 'John M Smith', '', '', 'San Diego', 'CA'),
                 (8, 'Completely Different Entity', '', '', 'Fresno', 'CA')
-        """))
+        """)
+        )
         # Insert some aliases
-        conn.execute(text("""
+        conn.execute(
+            text("""
             INSERT INTO entity_alias (entity_id, alias_name, source_table)
             VALUES
                 (1, 'J. Smith', 'manual'),
@@ -99,7 +108,8 @@ def sample_entities(resolver):
                 (2, 'J. Smith Jr', 'manual'),
                 (5, 'Acme Inc', 'manual'),
                 (5, 'A.Corp', 'manual')
-        """))
+        """)
+        )
 
 
 class TestEntityMatch:
@@ -180,9 +190,7 @@ class TestEntityResolverFindMatches:
 
     @pytest.mark.skip(reason="find_matches requires PostgreSQL pg_trgm extension")
     def test_find_matches_for_entity(self, resolver, sample_entities):
-        results = resolver.find_matches_for_entity(
-            entity_id=1, name="John Smith", limit=20
-        )
+        results = resolver.find_matches_for_entity(entity_id=1, name="John Smith", limit=20)
         assert len(results) > 0
         assert all(r.source_id == 1 for r in results)
 
@@ -206,10 +214,7 @@ class TestEntityResolverSuggestMerge:
 
         with resolver._conn.begin() as conn:
             row = conn.execute(
-                text(
-                    "SELECT entity_a_id, entity_b_id, match_score, status "
-                    "FROM entity_merge_queue"
-                )
+                text("SELECT entity_a_id, entity_b_id, match_score, status FROM entity_merge_queue")
             ).fetchone()
             assert row is not None
             assert row[0] == 1
@@ -289,9 +294,7 @@ class TestEntityResolverGetEntityStats:
 
         # Mark entity 8 as resolved into 1
         with resolver._conn.begin() as conn:
-            conn.execute(
-                text("UPDATE entity SET resolved_by = 1 WHERE entity_id = 8")
-            )
+            conn.execute(text("UPDATE entity SET resolved_by = 1 WHERE entity_id = 8"))
 
         stats = resolver.get_entity_stats()
         assert stats["total_entities"] == 8
@@ -317,9 +320,7 @@ class TestEntityResolverApplyMerge:
     """Test apply_merge method."""
 
     def test_apply_merge_merges_aliases(self, resolver, sample_entities):
-        resolver.suggest_merge(
-            entity_a_id=1, entity_b_id=5, match_score=0.85
-        )
+        resolver.suggest_merge(entity_a_id=1, entity_b_id=5, match_score=0.85)
 
         with resolver._conn.begin() as conn:
             row = conn.execute(

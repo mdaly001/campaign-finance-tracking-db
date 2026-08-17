@@ -158,27 +158,27 @@ class TestSeededFilingCalendar:
     def test_seeded_2024_general(self):
         entries = seeded_filing_calendar_entries()
         general_entries = [
-            e for e in entries
-            if e.election_date == date(2024, 11, 5)
-            and e.election_type == "General"
+            e
+            for e in entries
+            if e.election_date == date(2024, 11, 5) and e.election_type == "General"
         ]
         assert len(general_entries) > 0
 
     def test_seeded_2026_general(self):
         entries = seeded_filing_calendar_entries()
         general_2026 = [
-            e for e in entries
-            if e.election_date == date(2026, 11, 3)
-            and e.election_type == "General"
+            e
+            for e in entries
+            if e.election_date == date(2026, 11, 3) and e.election_type == "General"
         ]
         assert len(general_2026) > 0
 
     def test_seeded_2026_primary(self):
         entries = seeded_filing_calendar_entries()
         primary_2026 = [
-            e for e in entries
-            if e.election_date == date(2026, 3, 3)
-            and e.election_type == "Primary"
+            e
+            for e in entries
+            if e.election_date == date(2026, 3, 3) and e.election_type == "Primary"
         ]
         assert len(primary_2026) == 1
 
@@ -371,89 +371,97 @@ class TestInferenceHelpers:
 
     def test_infer_filing_type_general(self):
         from state.scrapers import _infer_filing_type
+
         assert _infer_filing_type("General") == "GENERAL"
 
     def test_infer_filing_type_primary(self):
         from state.scrapers import _infer_filing_type
+
         assert _infer_filing_type("Primary") == "PRIMARY"
 
     def test_infer_filing_type_special(self):
         from state.scrapers import _infer_filing_type
+
         assert _infer_filing_type("Special") == "SPECIAL"
 
     def test_infer_filing_type_recall(self):
         from state.scrapers import _infer_filing_type
+
         assert _infer_filing_type("Recall") == "RECALL"
 
     def test_infer_filing_type_unknown(self):
         from state.scrapers import _infer_filing_type
+
         assert _infer_filing_type("Some weird type") == "Some weird type"
 
     def test_infer_election_type_general(self):
         from state.scrapers import _infer_election_type
+
         assert _infer_election_type("General Election Results") == "General"
 
     def test_infer_election_type_primary(self):
         from state.scrapers import _infer_election_type
+
         assert _infer_election_type("Primary Election Results") == "Primary"
 
     def test_infer_election_type_special(self):
         from state.scrapers import _infer_election_type
+
         assert _infer_election_type("Special Election Results") == "Special"
 
     def test_infer_election_type_recall(self):
         from state.scrapers import _infer_election_type
+
         assert _infer_election_type("Recall Election Results") == "Recall"
 
     def test_infer_election_type_unknown(self):
         from state.scrapers import _infer_election_type
+
         assert _infer_election_type("Some Results") == "Unknown"
 
     def test_infer_jurisdiction_county(self):
         from state.scrapers import _infer_jurisdiction
+
         assert _infer_jurisdiction("Los Angeles County Results", "") == "County"
 
     def test_infer_jurisdiction_city(self):
         from state.scrapers import _infer_jurisdiction
+
         assert _infer_jurisdiction("City of Sacramento Results", "") == "City"
 
     def test_infer_jurisdiction_statewide_default(self):
         from state.scrapers import _infer_jurisdiction
+
         assert _infer_jurisdiction("Statewide Results", "") == "Statewide"
 
     def test_infer_jurisdiction_default(self):
         from state.scrapers import _infer_jurisdiction
+
         assert _infer_jurisdiction("Results", "") == "Statewide"
 
     def test_infer_sub_jurisdiction_district(self):
         from state.scrapers import _infer_sub_jurisdiction
+
         result = _infer_sub_jurisdiction("District 35", "")
         assert result == "District 35"
 
     def test_infer_sub_jurisdiction_none(self):
         from state.scrapers import _infer_sub_jurisdiction
+
         assert _infer_sub_jurisdiction("General Results", "") is None
 
     def test_looks_like_results_pdf_true(self):
         from state.scrapers import _looks_like_results_pdf
-        assert _looks_like_results_pdf(
-            "Election Results", "https://example.com/results.pdf"
-        )
-        assert _looks_like_results_pdf(
-            "Official Results", "https://example.com/2024.pdf"
-        )
-        assert _looks_like_results_pdf(
-            "Canvass Report", "https://example.com/canvass.pdf"
-        )
+
+        assert _looks_like_results_pdf("Election Results", "https://example.com/results.pdf")
+        assert _looks_like_results_pdf("Official Results", "https://example.com/2024.pdf")
+        assert _looks_like_results_pdf("Canvass Report", "https://example.com/canvass.pdf")
 
     def test_looks_like_results_pdf_false(self):
         from state.scrapers import _looks_like_results_pdf
-        assert not _looks_like_results_pdf(
-            "Registration Form", "https://example.com/form.pdf"
-        )
-        assert not _looks_like_results_pdf(
-            "Press Release", "https://example.com/news.pdf"
-        )
+
+        assert not _looks_like_results_pdf("Registration Form", "https://example.com/form.pdf")
+        assert not _looks_like_results_pdf("Press Release", "https://example.com/news.pdf")
 
 
 # =============================================================================
@@ -528,14 +536,17 @@ class TestTableDefinitions:
 
     def test_filing_calendar_in_tables(self):
         from state.tables import TABLE_DEFINITIONS
+
         assert "FILING_CALENDAR" in TABLE_DEFINITIONS
 
     def test_election_results_in_tables(self):
         from state.tables import TABLE_DEFINITIONS
+
         assert "ELECTION_RESULTS" in TABLE_DEFINITIONS
 
     def test_filing_calendar_definition(self):
         from state.tables import TABLE_DEFINITIONS
+
         td = TABLE_DEFINITIONS["FILING_CALENDAR"]
         assert td.code == "FILING_CALENDAR"
         assert td.tsv_files == []
@@ -543,6 +554,7 @@ class TestTableDefinitions:
 
     def test_election_results_definition(self):
         from state.tables import TABLE_DEFINITIONS
+
         td = TABLE_DEFINITIONS["ELECTION_RESULTS"]
         assert td.code == "ELECTION_RESULTS"
         assert td.tsv_files == []
@@ -559,20 +571,22 @@ class TestLoadOrder:
 
     def test_filing_calendar_in_load_order(self):
         from state.etl import LOAD_ORDER
+
         assert "FILING_CALENDAR" in LOAD_ORDER
 
     def test_election_results_in_load_order(self):
         from state.etl import LOAD_ORDER
+
         assert "ELECTION_RESULTS" in LOAD_ORDER
 
     def test_scraper_tables_at_end(self):
         from state.etl import LOAD_ORDER
         from state.tables import TABLE_DEFINITIONS as TBL_DEF
+
         # Scraper tables should be after all TSV tables
         scraper_codes = ["FILING_CALENDAR", "ELECTION_RESULTS"]
         for code in scraper_codes:
             tsv_codes = [
-                c for c in LOAD_ORDER
-                if getattr(TBL_DEF.get(c), "source", None) != "scrape"
+                c for c in LOAD_ORDER if getattr(TBL_DEF.get(c), "source", None) != "scrape"
             ]
             assert LOAD_ORDER.index(code) > min(LOAD_ORDER.index(t) for t in tsv_codes)

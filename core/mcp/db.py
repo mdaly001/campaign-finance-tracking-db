@@ -16,7 +16,10 @@ from sqlalchemy import Engine, create_engine, text
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_URL = "postgresql://cfdb_reader:reader@db:5432/cfdb"
+_DEFAULT_URL = "postgresql://cfdb_reader:***@db:5432/cfdb"
+
+# Whether unredacted donor data schema is accessible to MCP server
+UNREDACTED_ENABLED = os.environ.get("UNREDACTED_ENABLED", "false").lower() == "true"
 
 
 def _build_url() -> str:

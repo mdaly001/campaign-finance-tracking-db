@@ -44,21 +44,35 @@ class MockDB:
         self.calls.append({"sql": norm, "params": params})
 
         # contributions_by_donor: FROM RCPT_CD with ctrib_naml ILIKE AND cycle = :cycle
-        if ("FROM RCPT_CD RC" in norm
-                and "CTRIB_NAML ILIKE" in norm
-                and ":CYCLE" in norm):
+        if "FROM RCPT_CD RC" in norm and "CTRIB_NAML ILIKE" in norm and ":CYCLE" in norm:
             return [
                 _mock_row(
-                    ["tran_id", "filing_id", "amend_id", "amount", "date",
-                     "purpose", "cmte_id", "memo_refno", "cycle"],
-                    ["T1", "F1", "A1", 100.5, "2024-01-15", "CONTRIBUTION",
-                     "C1", None, 2024],
+                    [
+                        "tran_id",
+                        "filing_id",
+                        "amend_id",
+                        "amount",
+                        "date",
+                        "purpose",
+                        "cmte_id",
+                        "memo_refno",
+                        "cycle",
+                    ],
+                    ["T1", "F1", "A1", 100.5, "2024-01-15", "CONTRIBUTION", "C1", None, 2024],
                 ),
                 _mock_row(
-                    ["tran_id", "filing_id", "amend_id", "amount", "date",
-                     "purpose", "cmte_id", "memo_refno", "cycle"],
-                    ["T2", "F1", "A1", 50.0, "2024-02-01", "CONTRIBUTION",
-                     "C1", None, 2024],
+                    [
+                        "tran_id",
+                        "filing_id",
+                        "amend_id",
+                        "amount",
+                        "date",
+                        "purpose",
+                        "cmte_id",
+                        "memo_refno",
+                        "cycle",
+                    ],
+                    ["T2", "F1", "A1", 50.0, "2024-02-01", "CONTRIBUTION", "C1", None, 2024],
                 ),
             ]
 
@@ -66,29 +80,29 @@ class MockDB:
         if "GROUP BY" in norm and "TOTAL_AMOUNT" in norm:
             return [
                 _mock_row(
-                    ["donor_name", "total_amount", "contribution_count",
-                     "first_date", "last_date"],
+                    ["donor_name", "total_amount", "contribution_count", "first_date", "last_date"],
                     ["Alice", 300.0, 2, "2024-01-01", "2024-02-01"],
                 ),
                 _mock_row(
-                    ["donor_name", "total_amount", "contribution_count",
-                     "first_date", "last_date"],
+                    ["donor_name", "total_amount", "contribution_count", "first_date", "last_date"],
                     ["Bob", 50.0, 1, "2024-03-01", "2024-03-01"],
                 ),
             ]
 
         # committee_outlays_to: FROM EXPPD_CD with filer_id = :cid
-        if ("FROM EXPPD_CD E" in norm
-                and "E.FILER_ID = :CID" in norm):
-            return [_mock_row(
-                ["tran_id", "filing_id", "amount", "date", "purpose",
-                 "memo_refno"],
-                ["T1", "F1", 500.0, "2024-01-15", "Office rent", None])]
+        if "FROM EXPPD_CD E" in norm and "E.FILER_ID = :CID" in norm:
+            return [
+                _mock_row(
+                    ["tran_id", "filing_id", "amount", "date", "purpose", "memo_refno"],
+                    ["T1", "F1", 500.0, "2024-01-15", "Office rent", None],
+                )
+            ]
 
         # vendor_revenue: ARRAY_AGG (receipts query)
         if "ARRAY_AGG" in norm:
-            return [_mock_row(["total_received", "transaction_count", "cycles"],
-                              [500.0, 2, [2024]])]
+            return [
+                _mock_row(["total_received", "transaction_count", "cycles"], [500.0, 2, [2024]])
+            ]
 
         # vendor_revenue expenditures: SUM + EXPPD_CD
         if "SUM(AMOUNT)" in norm and "EXPPD_CD" in norm:
@@ -96,16 +110,26 @@ class MockDB:
 
         # committee_profile: filername query
         if "FROM FILERNAME FN" in norm and "FILER_ID = :CID" in norm:
-            return [_mock_row(
-                ["filer_id", "committee_name", "committee_type", "city", "state"],
-                ["C1", "Test Committee", "PC", "Los Angeles", "CA"])]
+            return [
+                _mock_row(
+                    ["filer_id", "committee_name", "committee_type", "city", "state"],
+                    ["C1", "Test Committee", "PC", "Los Angeles", "CA"],
+                )
+            ]
 
         # committee_profile: financial query with total_receipts
         if "TOTAL_RECEIPTS" in norm:
-            return [_mock_row(
-                ["total_receipts", "total_disbursements",
-                 "total_contributions", "total_expenditures"],
-                [1000.0, 500.0, 1000.0, 500.0])]
+            return [
+                _mock_row(
+                    [
+                        "total_receipts",
+                        "total_disbursements",
+                        "total_contributions",
+                        "total_expenditures",
+                    ],
+                    [1000.0, 500.0, 1000.0, 500.0],
+                )
+            ]
 
         # committee_profile: cash on hand from smry_cd
         if "SMRY_CD" in norm:
@@ -116,39 +140,57 @@ class MockDB:
             return []
 
         # measure_spending: cvr_camp_disc with measure_id
-        if ("FROM CVR_CAMP_DISC" in norm
-                and "MEASURE_ID ILIKE" in norm):
+        if "FROM CVR_CAMP_DISC" in norm and "MEASURE_ID ILIKE" in norm:
             # Note: tool SQL aliases cmte_id -> committee_id
-            return [_mock_row(
-                ["committee_id", "committee_name", "total_spent", "support_oppose"],
-                ["C1", "Yes on Prop 65", 5000.0, "S"])]
+            return [
+                _mock_row(
+                    ["committee_id", "committee_name", "total_spent", "support_oppose"],
+                    ["C1", "Yes on Prop 65", 5000.0, "S"],
+                )
+            ]
 
         # donor_watch_since: FROM RCPT_CD with TRAN_DT >=
-        if ("FROM RCPT_CD RC" in norm
-                and "TRAN_DT >=" in norm
-                and ":SINCE" in norm):
-            return [_mock_row(
-                ["tran_id", "filing_id", "amount", "date",
-                 "cmte_id", "cmte_name", "purpose"],
-                ["T1", "F1", 100.0, "2024-06-01", "C1", "Committee A", None])]
+        if "FROM RCPT_CD RC" in norm and "TRAN_DT >=" in norm and ":SINCE" in norm:
+            return [
+                _mock_row(
+                    ["tran_id", "filing_id", "amount", "date", "cmte_id", "cmte_name", "purpose"],
+                    ["T1", "F1", 100.0, "2024-06-01", "C1", "Committee A", None],
+                )
+            ]
 
         # upcoming_filings: filing_calendar with deadline_date range (no OPEN)
-        if ("FROM FILING_CALENDAR" in norm
-                and "DEADLINE_DATE >=" in norm
-                and "'OPEN'" not in norm):
-            return [_mock_row(
-                ["calendar_id", "election_date", "report_type", "deadline_date",
-                 "grace_period_days", "source_url", "notes"],
-                [1, "2024-11-05", "F496", "2024-10-31", 0, None, None])]
+        if "FROM FILING_CALENDAR" in norm and "DEADLINE_DATE >=" in norm and "'OPEN'" not in norm:
+            return [
+                _mock_row(
+                    [
+                        "calendar_id",
+                        "election_date",
+                        "report_type",
+                        "deadline_date",
+                        "grace_period_days",
+                        "source_url",
+                        "notes",
+                    ],
+                    [1, "2024-11-05", "F496", "2024-10-31", 0, None, None],
+                )
+            ]
 
         # filing_due_soon: filing_calendar with status = 'OPEN'
-        if ("FROM FILING_CALENDAR" in norm
-                and "'OPEN'" in norm):
-            return [_mock_row(
-                ["filing_id", "committee_id", "committee_name", "form_type",
-                 "filing_date", "deadline_date", "status"],
-                ["F100", "C1", "Test Committee", "F497", "2024-10-31",
-                 "2024-10-31", "OPEN"])]
+        if "FROM FILING_CALENDAR" in norm and "'OPEN'" in norm:
+            return [
+                _mock_row(
+                    [
+                        "filing_id",
+                        "committee_id",
+                        "committee_name",
+                        "form_type",
+                        "filing_date",
+                        "deadline_date",
+                        "status",
+                    ],
+                    ["F100", "C1", "Test Committee", "F497", "2024-10-31", "2024-10-31", "OPEN"],
+                )
+            ]
 
         # donor_alias query
         if "FROM DONOR_ALIAS" in norm:
@@ -182,7 +224,8 @@ def patched_db(reset_mock):
 
     with patch.object(db, "get_engine", return_value=mock_engine):
         with patch.object(
-            db, "execute_read",
+            db,
+            "execute_read",
             side_effect=lambda sql, params=None: _mock_db.query(sql, params),
         ):
             with patch(
@@ -207,6 +250,7 @@ class TestDB:
 
         with patch.dict(os.environ, {"DATABASE_URL": "postgresql://test@h/d"}):
             from core.mcp import db
+
             importlib.reload(db)
             assert db._build_url() == "postgresql://test@h/d"
             importlib.reload(db)
@@ -218,6 +262,7 @@ class TestDB:
 
         with patch.dict(os.environ, {"DB_PASSWORD": "r", "DB_HOST": "h"}):
             from core.mcp import db
+
             importlib.reload(db)
             url = db._build_url()
             assert "h:5432" in url
@@ -226,6 +271,7 @@ class TestDB:
     def test_execute_read_returns_list(self, patched_db):
         """execute_read should return a list of dicts."""
         from core.mcp.db import execute_read
+
         rows = execute_read("SELECT 1 AS one")
         assert isinstance(rows, list)
 

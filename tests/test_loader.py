@@ -1,6 +1,5 @@
 """Tests for core/etl/loader.py — TableLoader class."""
 
-
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import StaticPool
 
@@ -75,13 +74,15 @@ class TestTableLoaderBasic:
 
     def test_load_small_file(self):
         """A small file with 5 rows should upsert all 5."""
-        tsv = _make_tsv([
-            ["1", "Alice", "100.0"],
-            ["2", "Bob", "200.0"],
-            ["3", "Charlie", "300.0"],
-            ["4", "Diana", "400.0"],
-            ["5", "Eve", "500.0"],
-        ])
+        tsv = _make_tsv(
+            [
+                ["1", "Alice", "100.0"],
+                ["2", "Bob", "200.0"],
+                ["3", "Charlie", "300.0"],
+                ["4", "Diana", "400.0"],
+                ["5", "Eve", "500.0"],
+            ]
+        )
 
         config = LoadConfig(
             table_name="test_table",
@@ -129,10 +130,12 @@ class TestTypeCoercion:
 
     def test_numeric_coercion(self):
         """String amounts should become floats."""
-        tsv = _make_tsv([
-            ["1", "Alice", "100.50"],
-            ["2", "Bob", "200.75"],
-        ])
+        tsv = _make_tsv(
+            [
+                ["1", "Alice", "100.50"],
+                ["2", "Bob", "200.75"],
+            ]
+        )
 
         config = LoadConfig(
             table_name="coerce_table",
@@ -155,10 +158,12 @@ class TestTypeCoercion:
 
     def test_integer_coercion(self):
         """String IDs should become integers."""
-        tsv = _make_tsv([
-            ["1", "Alice", "100"],
-            ["2", "Bob", "200"],
-        ])
+        tsv = _make_tsv(
+            [
+                ["1", "Alice", "100"],
+                ["2", "Bob", "200"],
+            ]
+        )
 
         config = LoadConfig(
             table_name="int_table",
@@ -180,10 +185,12 @@ class TestTypeCoercion:
 
     def test_date_coercion(self):
         """String dates should become date objects."""
-        tsv = _make_tsv([
-            ["1", "Alice", "2024-01-15"],
-            ["2", "Bob", "2024-02-20"],
-        ])
+        tsv = _make_tsv(
+            [
+                ["1", "Alice", "2024-01-15"],
+                ["2", "Bob", "2024-02-20"],
+            ]
+        )
 
         config = LoadConfig(
             table_name="date_table",
@@ -201,10 +208,12 @@ class TestTypeCoercion:
 
     def test_timestamp_coercion(self):
         """String timestamps should become datetime objects."""
-        tsv = _make_tsv([
-            ["1", "Alice", "2024-01-15 10:30:00"],
-            ["2", "Bob", "2024-02-20 14:45:00"],
-        ])
+        tsv = _make_tsv(
+            [
+                ["1", "Alice", "2024-01-15 10:30:00"],
+                ["2", "Bob", "2024-02-20 14:45:00"],
+            ]
+        )
 
         config = LoadConfig(
             table_name="ts_table",
@@ -222,10 +231,12 @@ class TestTypeCoercion:
 
     def test_coercion_failure_nulls_out(self):
         """Invalid numeric strings should become None, not crash."""
-        tsv = _make_tsv([
-            ["1", "Alice", "not_a_number"],
-            ["2", "Bob", "200"],
-        ])
+        tsv = _make_tsv(
+            [
+                ["1", "Alice", "not_a_number"],
+                ["2", "Bob", "200"],
+            ]
+        )
 
         config = LoadConfig(
             table_name="bad_num_table",
@@ -251,11 +262,13 @@ class TestRequiredColumnValidation:
 
     def test_required_column_missing(self):
         """Rows missing a required column should be skipped."""
-        tsv = _make_tsv([
-            ["1", "Alice", "100"],
-            ["2", "", "200"],  # name is empty/None
-            ["3", "Charlie", "300"],
-        ])
+        tsv = _make_tsv(
+            [
+                ["1", "Alice", "100"],
+                ["2", "", "200"],  # name is empty/None
+                ["3", "Charlie", "300"],
+            ]
+        )
 
         config = LoadConfig(
             table_name="req_table",
@@ -274,10 +287,12 @@ class TestRequiredColumnValidation:
 
     def test_no_required_columns_passes_all(self):
         """When no required columns are set, all rows pass."""
-        tsv = _make_tsv([
-            ["1", "", ""],
-            ["2", "Bob", "200"],
-        ])
+        tsv = _make_tsv(
+            [
+                ["1", "", ""],
+                ["2", "Bob", "200"],
+            ]
+        )
 
         config = LoadConfig(
             table_name="all_pass_table",
@@ -302,10 +317,12 @@ class TestSkipColumns:
 
     def test_skip_columns_excluded(self):
         """Specified skip columns should be excluded from the insert."""
-        tsv = _make_tsv([
-            ["1", "Alice", "100"],
-            ["2", "Bob", "200"],
-        ])
+        tsv = _make_tsv(
+            [
+                ["1", "Alice", "100"],
+                ["2", "Bob", "200"],
+            ]
+        )
 
         config = LoadConfig(
             table_name="skip_table",
@@ -334,10 +351,12 @@ class TestCheckpoint:
 
     def test_checkpoint_skips_same_file(self):
         """Loading the same file twice should skip on second load."""
-        tsv = _make_tsv([
-            ["1", "Alice", "100"],
-            ["2", "Bob", "200"],
-        ])
+        tsv = _make_tsv(
+            [
+                ["1", "Alice", "100"],
+                ["2", "Bob", "200"],
+            ]
+        )
 
         config = LoadConfig(
             table_name="checkpoint_table",
@@ -372,13 +391,15 @@ class TestBatchUpsert:
 
     def test_batch_sends_multiple_batches(self):
         """5 rows with batch_size=2 should result in 3 batches (2+2+1)."""
-        tsv = _make_tsv([
-            ["1", "Alice", "100"],
-            ["2", "Bob", "200"],
-            ["3", "Charlie", "300"],
-            ["4", "Diana", "400"],
-            ["5", "Eve", "500"],
-        ])
+        tsv = _make_tsv(
+            [
+                ["1", "Alice", "100"],
+                ["2", "Bob", "200"],
+                ["3", "Charlie", "300"],
+                ["4", "Diana", "400"],
+                ["5", "Eve", "500"],
+            ]
+        )
 
         config = LoadConfig(
             table_name="batch_table",

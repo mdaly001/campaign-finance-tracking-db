@@ -82,7 +82,6 @@ def test_get_source_files_returns_source_file_info(
         "README.txt": b"not a tsv",
     }
 
-
     with (
         patch.object(adapter, "_download_zip") as mock_dl,
         patch("zipfile.ZipFile") as mock_zipfile,
@@ -236,17 +235,13 @@ def test_upsert_records_with_conflict_cols(
 
     assert summary.rows_read == 1
     assert summary.rows_upserted == 1
-    mock_upsert.assert_called_once_with(
-        mock_session, "rcpt_cd", records, ["id"]
-    )
+    mock_upsert.assert_called_once_with(mock_session, "rcpt_cd", records, ["id"])
 
 
 # -- is_up_to_date (mocked) ----------------------------------------------- #
 
 
-def test_is_up_to_date_false_when_no_cache(
-    cache_dir: Path, adapter: StateSourceAdapter
-) -> None:
+def test_is_up_to_date_false_when_no_cache(cache_dir: Path, adapter: StateSourceAdapter) -> None:
     """is_up_to_date returns False when nothing is cached."""
     with patch("httpx.Client") as mock_client:
         mock_resp = MagicMock()
@@ -257,9 +252,7 @@ def test_is_up_to_date_false_when_no_cache(
         assert adapter.is_up_to_date() is False
 
 
-def test_is_up_to_date_true_when_match(
-    cache_dir: Path, adapter: StateSourceAdapter
-) -> None:
+def test_is_up_to_date_true_when_match(cache_dir: Path, adapter: StateSourceAdapter) -> None:
     """is_up_to_date returns True when checksums match."""
     cached_zip = cache_dir / "dbwebexport.zip"
     cached_zip.write_bytes(b"same content")
@@ -274,9 +267,7 @@ def test_is_up_to_date_true_when_match(
         assert adapter.is_up_to_date() is True
 
 
-def test_is_up_to_date_true_on_304(
-    cache_dir: Path, adapter: StateSourceAdapter
-) -> None:
+def test_is_up_to_date_true_on_304(cache_dir: Path, adapter: StateSourceAdapter) -> None:
     """is_up_to_date returns True on HTTP 304 Not Modified."""
     with patch("httpx.Client") as mock_client:
         mock_resp = MagicMock()
@@ -299,9 +290,7 @@ def test_clear_cache_removes_zip(cache_dir: Path, adapter: StateSourceAdapter) -
     assert not zip_path.exists()
 
 
-def test_clear_cache_noop_when_missing(
-    cache_dir: Path, adapter: StateSourceAdapter
-) -> None:
+def test_clear_cache_noop_when_missing(cache_dir: Path, adapter: StateSourceAdapter) -> None:
     """clear_cache does nothing when no zip exists."""
     # Should not raise
     adapter.clear_cache()

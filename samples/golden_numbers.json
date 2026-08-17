@@ -1,0 +1,100 @@
+{
+  "metadata": {
+    "description": "Golden numbers for Campaign Finance DB verification",
+    "created_date": "2026-08-16",
+    "verified_by": "system",
+    "source_url": "Internal test data — not real SOS data",
+    "cycle": 2024,
+    "version": "0.1.0-rc1"
+  },
+  "golden_numbers": [
+    {
+      "cycle": 2024,
+      "table": "rcpt_cd",
+      "metric": "total_contributions",
+      "expected_value": 1750.0,
+      "tolerance": 1.0,
+      "verification_date": "2026-08-16",
+      "verified_by": "system",
+      "source_url": "Internal test data",
+      "notes": "Sample test data: Alice 500+250 + Bob 1000"
+    },
+    {
+      "cycle": 2024,
+      "table": "rcpt_cd",
+      "metric": "contribution_count",
+      "expected_value": 3,
+      "tolerance": 0,
+      "verification_date": "2026-08-16",
+      "verified_by": "system",
+      "source_url": "Internal test data",
+      "notes": "Sample test data: 3 contribution rows"
+    },
+    {
+      "cycle": 2024,
+      "table": "exppd_cd",
+      "metric": "total_expenditures",
+      "expected_value": 1050.0,
+      "tolerance": 1.0,
+      "verification_date": "2026-08-16",
+      "verified_by": "system",
+      "source_url": "Internal test data",
+      "notes": "Sample test data: Acme 300 + Bob 750"
+    },
+    {
+      "cycle": 2024,
+      "table": "exppd_cd",
+      "metric": "expenditure_count",
+      "expected_value": 2,
+      "tolerance": 0,
+      "verification_date": "2026-08-16",
+      "verified_by": "system",
+      "source_url": "Internal test data",
+      "notes": "Sample test data: 2 expenditure rows"
+    },
+    {
+      "cycle": 2024,
+      "table": "filername",
+      "metric": "committee_count",
+      "expected_value": 2,
+      "tolerance": 0,
+      "verification_date": "2026-08-16",
+      "verified_by": "system",
+      "source_url": "Internal test data",
+      "notes": "Sample test data: Test Committee + Other Committee"
+    },
+    {
+      "cycle": 2024,
+      "table": "ballot_measures",
+      "metric": "measure_count",
+      "expected_value": 1,
+      "tolerance": 0,
+      "verification_date": "2026-08-16",
+      "verified_by": "system",
+      "source_url": "Internal test data",
+      "notes": "Sample test data: PROP 15"
+    },
+    {
+      "cycle": 2024,
+      "table": "filing_calendar",
+      "metric": "deadline_count",
+      "expected_value": 1,
+      "tolerance": 0,
+      "verification_date": "2026-08-16",
+      "verified_by": "system",
+      "source_url": "Internal test data",
+      "notes": "Sample test data: F496 deadline"
+    },
+    {
+      "cycle": 2024,
+      "table": "rcpt_cd+exppd_cd",
+      "metric": "net_cash_flow",
+      "expected_value": 700.0,
+      "tolerance": 1.0,
+      "verification_date": "2026-08-16",
+      "verified_by": "system",
+      "source_url": "Internal test data",
+      "notes": "Net cash: receipts (1750) - expenditures (1050) = 700"
+    }
+  ]
+}
