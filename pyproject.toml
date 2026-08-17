@@ -1,0 +1,43 @@
+[project]
+name = "cfdb"
+version = "0.1.0"
+description = "Campaign Finance Disclosure Database — privacy-first CA campaign finance data pipeline and MCP server"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+readme = "README.md"
+
+dependencies = [
+    "psycopg2-binary",
+    "mcp",
+    "httpx",
+    "pydantic",
+    "structlog",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "pytest",
+    "pytest-asyncio",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "ruff",
+    "pytest",
+    "pytest-asyncio",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

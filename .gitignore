@@ -1,0 +1,35 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.venv/
+.venv/
+
+# Cache
+.cache/
+.mypy_cache/
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Data files (downloaded raw)
+*.tsv
+*.zip
+*.db
+
+# Node modules (for any frontend tooling)
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Docker volumes
+pgdata/

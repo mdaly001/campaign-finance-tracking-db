@@ -1,0 +1,50 @@
+services:
+  db:
+    image: postgres:15
+    container_name: cfdb-db
+    environment:
+      POSTGRES_USER: cfdb
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change-me}
+      POSTGRES_DB: cfdb
+      TZ: America/Los_Angeles
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cfdb -d cfdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  mcp:
+    build: .
+    container_name: cfdb-mcp
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${MCP_PORT:-9527}:9527"
+    env_file: .env
+    environment:
+      DATABASE_URL: "postgresql://cfdb:${DB_PASSWORD:-change-me}@db:5432/cfdb"
+      UNREDACTED_ENABLED: "${UNREDACTED_ENABLED:-false}"
+      MCP_PORT: "${MCP_PORT:-9527}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    restart: unless-stopped
+
+  etl:
+    build: .
+    container_name: cfdb-etl
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: "postgresql://cfdb:${DB_PASSWORD:-change-me}@db:5432/cfdb"
+      UNREDACTED_ENABLED: "${UNREDACTED_ENABLED:-false}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    entrypoint: ["python", "-m", "cfdb.workflows.scheduler", "run"]
+    restart: "no"
+
+volumes:
+  pgdata:
