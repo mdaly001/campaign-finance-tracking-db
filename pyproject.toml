@@ -8,6 +8,7 @@ readme = "README.md"
 
 dependencies = [
     "psycopg2-binary",
+    "sqlalchemy",
     "mcp",
     "httpx",
     "pydantic",
@@ -31,6 +32,9 @@ dev-dependencies = [
     "pytest",
     "pytest-asyncio",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["core", "config", "docs", "samples", "state", "federal", "local", "tests", "core/mcp", "core/workflows"]
 
 [tool.ruff]
 target-version = "py311"
