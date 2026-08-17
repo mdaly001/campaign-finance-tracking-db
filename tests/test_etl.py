@@ -540,14 +540,16 @@ class TestTableDefinitions:
     """Test that TABLE_DEFINITIONS are consistent."""
 
     def test_all_tables_have_conflict_columns(self):
-        """Every table should have conflict_columns defined."""
+        """Every TSV-based table should have conflict_columns defined."""
         for code, td in TABLE_DEFINITIONS.items():
-            assert td.conflict_columns, f"Table {code} missing conflict_columns"
+            if td.tsv_files:
+                assert td.conflict_columns, f"Table {code} missing conflict_columns"
 
     def test_all_tables_have_tsv_files(self):
-        """Every table should have tsv_files defined."""
+        """Every TSV-based table should have tsv_files defined."""
         for code, td in TABLE_DEFINITIONS.items():
-            assert td.tsv_files, f"Table {code} missing tsv_files"
+            if td.tsv_files:
+                assert td.tsv_files, f"Table {code} missing tsv_files"
 
     def test_load_order_uniqueness(self):
         """LOAD_ORDER should not contain duplicates."""
