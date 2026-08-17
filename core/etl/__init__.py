@@ -1,30 +1,24 @@
-"""Campaign finance ETL infrastructure.
+"""ETL utilities for the Campaign Finance Database."""
 
-Public exports:
-    SourceAdapter    — abstract interface for data sources
-    SourceFileInfo   — metadata about a source file
-    LoadSummary      — load operation summary
-    TSVReader        — tab-delimited parser
-    LoadCheckpoint   — idempotent load tracking
-    upsert_records   — generic PostgreSQL upsert
-    DeadLetter       — bad-row quarantine
-    setup_logging    — JSON structured logging
-"""
-
-from core.etl.adapter import LoadSummary, SourceAdapter, SourceFileInfo
-from core.etl.checkpoint import LoadCheckpoint
-from core.etl.dead_letter import DeadLetter
-from core.etl.logging import setup_logging
-from core.etl.tsv import TSVReader
-from core.etl.upsert import upsert_records
+from .adapter import LoadSummary, SourceAdapter, SourceFileInfo
+from .checkpoint import LoadCheckpoint
+from .dead_letter import DeadLetter
+from .loader import LoadConfig, TableLoader
+from .logging import setup_logging
+from .tsv import TSVReader
+from .upsert import upsert_records
+from .validation import RowValidator
 
 __all__ = [
-    "LoadCheckpoint",
-    "LoadSummary",
     "DeadLetter",
+    "LoadCheckpoint",
+    "LoadConfig",
+    "LoadSummary",
+    "RowValidator",
     "SourceAdapter",
     "SourceFileInfo",
+    "TableLoader",
     "TSVReader",
-    "upsert_records",
     "setup_logging",
+    "upsert_records",
 ]

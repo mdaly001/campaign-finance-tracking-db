@@ -3,11 +3,10 @@
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.engine import Connection, Engine
 
 
 def upsert_records(
-    session: Connection | Engine,
+    session,
     table_name: str,
     records: list[dict[str, Any]],
     conflict_columns: list[str],
@@ -19,7 +18,7 @@ def upsert_records(
     upserted; columns not in the conflict key are updated on conflict.
 
     Args:
-        session: SQLAlchemy ``Connection`` or ``Engine``.
+        session: SQLAlchemy ``Engine`` or ``Connection``.
         table_name: Target table name.
         records: List of row dicts to upsert.
         conflict_columns: Column names that form the conflict key
@@ -48,7 +47,7 @@ def upsert_records(
     conflict_clause = ", ".join(f'"{c}"' for c in conflict_cols)
 
     total = 0
-    conn = session if isinstance(session, Connection) else session.connect()
+    conn = session if hasattr(session, "execute") else session.connect()
     is_managed = session is not conn
 
     try:
@@ -78,7 +77,7 @@ def _normalize(name: str) -> str:
 
 
 def _execute_batch(
-    conn: Connection,
+    conn,
     table: str,
     columns: list[str],
     batch: list[dict[str, Any]],

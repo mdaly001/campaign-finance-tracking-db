@@ -51,14 +51,15 @@ class LoadCheckpoint:
             ON CONFLICT (table_name, file_hash) DO NOTHING
             """
         )
-        self._conn.execute(
-            stmt,
-            {
-                "table_name": table_name,
-                "file_hash": file_hash,
-                "processed_date": processed_date,
-            },
-        )
+        with self._conn.begin() as conn:
+            conn.execute(
+                stmt,
+                {
+                    "table_name": table_name,
+                    "file_hash": file_hash,
+                    "processed_date": processed_date,
+                },
+            )
 
     # -- queries ----------------------------------------------------------- #
 
@@ -74,11 +75,12 @@ class LoadCheckpoint:
             "WHERE table_name = :table_name AND file_hash = :file_hash "
             "ORDER BY loaded_at DESC LIMIT 1"
         )
-        row = self._conn.execute(
-            stmt,
-            {"table_name": table_name, "file_hash": file_hash},
-        ).fetchone()
-        return row[0] if row else None
+        with self._conn.begin() as conn:
+            row = conn.execute(
+                stmt,
+                {"table_name": table_name, "file_hash": file_hash},
+            ).fetchone()
+            return row[0] if row else None
 
     def get_unchecked_tables(self, file_hash: str) -> list[str]:
         """Return list of tables not yet loaded for this file hash.
@@ -94,10 +96,11 @@ class LoadCheckpoint:
             "SELECT DISTINCT table_name FROM load_checkpoint "
             "WHERE file_hash != :file_hash OR file_hash IS NULL"
         )
-        rows = self._conn.execute(
-            stmt, {"file_hash": file_hash}
-        ).fetchall()
-        return [r[0] for r in rows]
+        with self._conn.begin() as conn:
+            rows = conn.execute(
+                stmt, {"file_hash": file_hash}
+            ).fetchall()
+            return [r[0] for r in rows]
 
     def get_last_date(self, table_name: str) -> str | None:
         """Return the latest processed_date for a table, or None.
@@ -108,10 +111,11 @@ class LoadCheckpoint:
             "SELECT MAX(processed_date) FROM load_checkpoint "
             "WHERE table_name = :table_name"
         )
-        row = self._conn.execute(
-            stmt, {"table_name": table_name}
-        ).fetchone()
-        return row[0] if row and row[0] else None
+        with self._conn.begin() as conn:
+            row = conn.execute(
+                stmt, {"table_name": table_name}
+            ).fetchone()
+            return row[0] if row and row[0] else None
 
     def is_loaded(self, table_name: str, file_hash: str) -> bool:
         """Return True if the file has already been loaded for this table."""
