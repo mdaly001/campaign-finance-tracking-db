@@ -1407,6 +1407,24 @@ filing_calendar = Table(
 )
 
 # =============================================================================
+# 11. Election Results
+# =============================================================================
+
+election_results = Table(
+    "election_results", metadata,
+    Column("election_id", Integer, primary_key=True, autoincrement=True),
+    Column("election_date", Date, nullable=False),
+    Column("election_type", String(30), nullable=False),
+    Column("jurisdiction", String(100), nullable=False),
+    Column("sub_jurisdiction", String(100)),
+    Column("pdf_url", String(500)),
+    Column("pdf_filename", String(200)),
+    Column("file_size_bytes", Integer),
+    Column("discovered_at", DateTime),
+    Column("notes", Text),
+)
+
+# =============================================================================
 # 12. Entity Resolution Tables
 # =============================================================================
 

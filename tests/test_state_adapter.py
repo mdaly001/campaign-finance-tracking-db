@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core.etl.adapter import LoadSummary, SourceAdapter, SourceFileInfo
+from core.etl.adapter import SourceAdapter, SourceFileInfo
 from state.adapter import StateDownload, StateSourceAdapter
 
 
@@ -83,7 +82,6 @@ def test_get_source_files_returns_source_file_info(
         "README.txt": b"not a tsv",
     }
 
-    fake_zip_data = b""  # Not a real zip; we're mocking zipfile
 
     with (
         patch.object(adapter, "_download_zip") as mock_dl,
@@ -265,7 +263,7 @@ def test_is_up_to_date_true_when_match(
     """is_up_to_date returns True when checksums match."""
     cached_zip = cache_dir / "dbwebexport.zip"
     cached_zip.write_bytes(b"same content")
-    checksum = hashlib.sha256(b"same content").hexdigest()
+    hashlib.sha256(b"same content").hexdigest()
 
     with patch("httpx.Client") as mock_client:
         mock_resp = MagicMock()

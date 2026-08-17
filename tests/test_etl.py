@@ -92,28 +92,10 @@ def _make_tsv_for_table(table_code, rows):
     # We pick columns that make sense for a small test dataset
     if table_code == "SMRY_CD":
         header = ["filing_id", "amend_id", "line_item", "amount_a", "amount_b"]
-        col_map = {
-            "filing_id": 0,
-            "amend_id": 1,
-            "line_item": 2,
-            "amount_a": 3,
-            "amount_b": 4,
-        }
     elif table_code == "CNTRB_CD":
         header = ["ctrib_id", "ctrib_naml", "total_gives"]
-        col_map = {
-            "ctrib_id": 0,
-            "ctrib_naml": 1,
-            "total_gives": 2,
-        }
     elif table_code == "EXPPD_CD":
         header = ["filing_id", "payee_naml", "amount", "expn_date"]
-        col_map = {
-            "filing_id": 0,
-            "payee_naml": 1,
-            "amount": 2,
-            "expn_date": 3,
-        }
     elif table_code == "RCPT_CD":
         header = ["filing_id", "amend_id", "line_item", "ctrib_naml", "amount", "receipt_dt"]
     elif table_code == "SMRY_CD":

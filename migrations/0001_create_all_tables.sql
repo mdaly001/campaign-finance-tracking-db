@@ -61,13 +61,15 @@
 --   [cvr_campaign_disclosure] N──1 [rcpt_cd] (via filing_id)
 --   [cvr_lobby_disclosure]    N──1 [lemp_cd] (via filing_id)
 --
---   [filing_calendar] ← used by scheduler to compute deadlines
---   [source_info]     ← tracks zip checksum, load date
---   [load_checkpoint] ← ETL checkpoint tracking
---   [etl_dead_letter] ← bad row quarantine
---   [entity]          ← resolved entity master
---   [entity_alias]    ← entity aliases for fuzzy matching
---   [entity_merge_queue] ← pending merges
+|--   [ballot_measures]   ← measure metadata from CAL-ACCESS
+|--   [filing_calendar]   ← election dates + filing deadlines
+|--   [election_results]  ← SOS election results PDF discovery
+|--   [source_info]       ← tracks zip checksum, load date
+|--   [load_checkpoint]   ← ETL checkpoint tracking
+|--   [etl_dead_letter]   ← bad row quarantine
+|--   [entity]            ← resolved entity master
+|--   [entity_alias]      ← entity aliases for fuzzy matching
+|--   [entity_merge_queue] ← pending merges
 --
 -- Data dictionary: see docs/data_dictionary.md
 -- ============================================================================
@@ -1753,22 +1755,87 @@ COMMENT ON TABLE lobbyist_firm_lobbyist IS 'Lobbyist-firm relationships';
 -- ============================================================================
 -- 10. Ballot Measure Tables
 -- ============================================================================
+-- Source: SOS BALLOT_MEASURES_CD.TSV (calaccess.cdn.sos.ca.gov/dbwebexport.zip)
+-- 6 columns, ~110 rows in historical data
 
 CREATE TABLE ballot_measures (
     election_date DATE NOT NULL,
-    filer_id VARCHAR(20),
+    filer_id VARCHAR(20) NOT NULL,
     measure_no VARCHAR(20) NOT NULL,
     measure_name TEXT NOT NULL,
     measure_short_name VARCHAR(200),
-    jurisdiction VARCHAR(60),
+    jurisdiction VARCHAR(60) NOT NULL,
     PRIMARY KEY (election_date, measure_no)
 );
+
 CREATE INDEX idx_ballot_msr_election ON ballot_measures(election_date);
 CREATE INDEX idx_ballot_msr_jurisdiction ON ballot_measures(jurisdiction);
-COMMENT ON TABLE ballot_measures IS 'Ballot measure metadata';
+CREATE INDEX idx_ballot_msr_filer ON ballot_measures(filer_id);
+
+
+COMMENT ON COLUMN ballot_measures.election_date IS 'Date of the election (from real TSV: MM/DD/YYYY HH:MM:SS AM/PM)';
+COMMENT ON COLUMN ballot_measures.filer_id IS 'Filer ID associated with the measure';
+COMMENT ON COLUMN ballot_measures.measure_no IS 'Measure number (e.g., 1A, 1B, 5)';
+COMMENT ON COLUMN ballot_measures.measure_name IS 'Full measure name/description';
+COMMENT ON COLUMN ballot_measures.measure_short_name IS 'Short title (nullable)';
+COMMENT ON COLUMN ballot_measures.jurisdiction IS 'Geographic scope (Statewide, County, City, etc.)';
+
+-- 11. Election & Filing Calendar
+-- ============================================================================
+-- Filing calendar tracks official deadlines for campaign finance reports.
+-- Populated from SOS publications and cross-referenced with report types.
+
+CREATE TABLE filing_calendar (
+    calendar_id SERIAL PRIMARY KEY,
+    election_date DATE NOT NULL,
+    report_type VARCHAR(50) NOT NULL,
+    deadline_date DATE NOT NULL,
+    grace_period_days INTEGER DEFAULT 0,
+    source_url VARCHAR(500),
+    notes TEXT
+);
+
+CREATE INDEX idx_filing_cal_election ON filing_calendar(election_date);
+CREATE INDEX idx_filing_cal_report ON filing_calendar(report_type);
+
+COMMENT ON TABLE filing_calendar IS 'Official filing deadlines cross-referenced with election dates';
+COMMENT ON COLUMN filing_calendar.report_type IS 'e.g., PRE-Qualification, QUARTERLY, YEAR-END, 48-HOUR, TERMINAL';
+COMMENT ON COLUMN filing_calendar.deadline_date IS 'Filing deadline date';
+COMMENT ON COLUMN filing_calendar.grace_period_days IS 'Grace period after deadline (if any)';
 
 -- ============================================================================
--- 11. Filer Filings History
+-- 11. Election Results (PDF discovery from SOS Elections Division)
+-- ============================================================================
+-- Source: SOS Elections Division website
+-- URL: https://www.sos.ca.gov/elections/election-data-and-reports/
+-- The SOS publishes election results as PDF reports; this table tracks
+-- discovered PDFs for downstream parsing.
+
+CREATE TABLE election_results (
+    election_id SERIAL PRIMARY KEY,
+    election_date DATE NOT NULL,
+    election_type VARCHAR(30) NOT NULL,
+    jurisdiction VARCHAR(100) NOT NULL,
+    sub_jurisdiction VARCHAR(100),
+    pdf_url VARCHAR(500),
+    pdf_filename VARCHAR(200),
+    file_size_bytes BIGINT,
+    discovered_at TIMESTAMPTZ DEFAULT NOW(),
+    notes TEXT
+);
+
+CREATE INDEX idx_election_results_date ON election_results(election_date);
+CREATE INDEX idx_election_results_type ON election_results(election_type);
+CREATE INDEX idx_election_results_jurisdiction ON election_results(jurisdiction);
+
+COMMENT ON TABLE election_results IS 'SOS Elections Division results PDF discovery metadata';
+COMMENT ON COLUMN election_results.election_type IS 'General, Primary, Special, Consolidated, etc.';
+COMMENT ON COLUMN election_results.jurisdiction IS 'Statewide, County, City';
+COMMENT ON COLUMN election_results.sub_jurisdiction IS 'e.g., "District 35", "Los Angeles County"';
+COMMENT ON COLUMN election_results.pdf_url IS 'Full URL to the PDF report';
+
+-- ============================================================================
+-- 12. Filer Filings History
 -- ============================================================================
 
 CREATE TABLE filer_filings (
@@ -1794,26 +1861,6 @@ CREATE INDEX idx_filer_filings_date ON filer_filings(filing_date);
 CREATE INDEX idx_filer_filings_session ON filer_filings(session_id);
 COMMENT ON TABLE filer_filings IS 'Filer filing history';
 
--- ============================================================================
--- 12. Filing Calendar
--- ============================================================================
-
-CREATE TABLE filing_calendar (
-    election_date DATE NOT NULL,
-    election_type VARCHAR(30) NOT NULL,
-    filing_type VARCHAR(30),
-    deadline DATE NOT NULL,
-    grace_period_days INTEGER DEFAULT 0,
-    extended_deadline DATE,
-    source VARCHAR(50), -- 'sos', 'statute', 'computed'
-    notes TEXT,
-    PRIMARY KEY (election_date, filing_type)
-);
-CREATE INDEX idx_filing_cal_election ON filing_calendar(election_date);
-CREATE INDEX idx_filing_cal_deadline ON filing_calendar(deadline);
-COMMENT ON TABLE filing_calendar IS 'Election dates and filing deadlines';
-
--- ============================================================================
 -- 13. Entity Resolution Tables
 -- ============================================================================
 

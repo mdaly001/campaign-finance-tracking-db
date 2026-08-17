@@ -1,10 +1,6 @@
 """Tests for core/etl/loader.py — TableLoader class."""
 
-import hashlib
-from io import BytesIO
-from unittest.mock import MagicMock, patch
 
-import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import StaticPool
 

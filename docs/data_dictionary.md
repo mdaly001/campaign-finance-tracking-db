@@ -136,7 +136,55 @@
 |-------|-------------|-------------|-------------|
 | `filing_calendar` | Election dates and filing deadlines | 2,000 | election_date, filing_type, deadline |
 
-### Entity Resolution Tables
+### ballot_measures
+- **Category:** Ballot Measures
+- **Source:** BALLOT_MEASURES_CD.TSV (CAL-ACCESS raw data)
+- **Partitioned:** No
+- **Key:** (election_date, measure_no)
+- **Columns:**
+  - `election_date` DATE NOT NULL — Date of the election
+  - `filer_id` VARCHAR(20) NOT NULL — Filer ID associated with the measure
+  - `measure_no` VARCHAR(20) NOT NULL — Measure number (e.g., "1A", "5")
+  - `measure_name` TEXT NOT NULL — Full measure name/description
+  - `measure_short_name` VARCHAR(200) — Short title (nullable)
+  - `jurisdiction` VARCHAR(60) NOT NULL — Geographic scope
+- **Indexes:** idx_ballot_msr_election, idx_ballot_msr_jurisdiction, idx_ballot_msr_filer
+- **Notes:** ~110 rows in historical data. Links to rcpt_cd/filings via filer_id + election_date
+
+## filing_calendar
+- **Category:** Election Metadata
+- **Source:** Manual population from SOS publications (no TSV)
+- **Partitioned:** No
+- **Columns:**
+  - `calendar_id` SERIAL PK — Auto-incrementing ID
+  - `election_date` DATE NOT NULL — Election date
+  - `report_type` VARCHAR(50) NOT NULL — Report type
+  - `deadline_date` DATE NOT NULL — Filing deadline date
+  - `grace_period_days` INTEGER DEFAULT 0 — Grace period after deadline
+  - `source_url` VARCHAR(500) — Reference URL
+  - `notes` TEXT — Additional context
+- **Indexes:** idx_filing_cal_election, idx_filing_cal_report
+- **Notes:** Used by scheduler.py to warn about upcoming filing deadlines
+
+## election_results
+- **Category:** Election Metadata
+- **Source:** SOS Elections Division PDF discovery
+- **Partitioned:** No
+- **Columns:**
+  - `election_id` SERIAL PK — Auto-incrementing ID
+  - `election_date` DATE NOT NULL — Date of the election
+  - `election_type` VARCHAR(30) NOT NULL — General, Primary, Special, Consolidated
+  - `jurisdiction` VARCHAR(100) NOT NULL — Statewide, County, City
+  - `sub_jurisdiction` VARCHAR(100) — Sub-jurisdiction detail
+  - `pdf_url` VARCHAR(500) — Full URL to the PDF report
+  - `pdf_filename` VARCHAR(200) — Local filename after download
+  - `file_size_bytes` BIGINT — Size of the PDF
+  - `discovered_at` TIMESTAMPTZ DEFAULT NOW() — Discovery timestamp
+  - `notes` TEXT — Additional context
+- **Indexes:** idx_election_results_date, idx_election_results_type, idx_election_results_jurisdiction
+- **Notes:** Tracks discovered PDF election result files for downstream parsing. Precinct-level results excluded per spec.
+
+## Entity Resolution Tables
 
 | Table | Description | Rows (est.) | Key Columns |
 |-------|-------------|-------------|-------------|

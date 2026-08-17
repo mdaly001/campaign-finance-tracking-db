@@ -1,6 +1,5 @@
 """Tests for core/etl/validation.py — RowValidator class."""
 
-import pytest
 
 from core.etl.validation import RowValidator
 

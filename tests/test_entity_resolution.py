@@ -1,16 +1,15 @@
 """Tests for entity resolution and background workflow."""
 
-import pytest
-from unittest.mock import MagicMock, patch
-from sqlalchemy import text, create_engine
-from sqlalchemy.pool import StaticPool
-
 import sys
 from pathlib import Path
 
+import pytest
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import StaticPool
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.etl.entity_resolution import EntityResolver, EntityMatch, MergeSuggestion
+from core.etl.entity_resolution import EntityMatch, EntityResolver, MergeSuggestion
 
 
 @pytest.fixture

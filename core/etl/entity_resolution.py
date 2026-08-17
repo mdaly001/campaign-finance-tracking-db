@@ -11,11 +11,11 @@ database before this module can function:
 """
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.engine import Engine, Connection
+from sqlalchemy.engine import Connection, Engine
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,6 @@ class EntityResolver:
 
     def _ensure_extensions(self, conn: Connection) -> None:
         """Ensure pg_trgm and fuzzystrmatch extensions exist (Postgres only).
-        
         On SQLite, these extensions are not available but also not needed
         for unit tests that only exercise merge queue operations.
         """
@@ -373,7 +372,7 @@ class EntityResolver:
                 ),
                 {
                     "reviewed_by": reviewed_by,
-                    "reviewed_at": datetime.datetime.now(datetime.timezone.utc),
+                    "reviewed_at": datetime.datetime.now(datetime.UTC),
                     "queue_id": queue_id,
                 },
             )
@@ -403,7 +402,7 @@ class EntityResolver:
                     """
                 ),
                 {
-                    "reviewed_at": datetime.datetime.now(datetime.timezone.utc),
+                    "reviewed_at": datetime.datetime.now(datetime.UTC),
                     "queue_id": queue_id,
                 },
             )
@@ -422,11 +421,20 @@ class EntityResolver:
                 text(
                     """
                     SELECT
-                        (SELECT COUNT(*) FROM entity) AS total_entities,
-                        (SELECT COUNT(*) FROM entity WHERE resolved_by IS NOT NULL) AS resolved_entities,
-                        (SELECT COUNT(*) FROM entity_merge_queue WHERE status = 'pending') AS pending_merges,
-                        (SELECT COUNT(*) FROM entity_merge_queue WHERE status = 'applied') AS applied_merges,
-                        (SELECT COUNT(*) FROM entity_merge_queue WHERE status = 'rejected') AS rejected_merges
+                        (SELECT COUNT(*) FROM entity)
+                            AS total_entities,
+                        (SELECT COUNT(*) FROM entity
+                            WHERE resolved_by IS NOT NULL)
+                            AS resolved_entities,
+                        (SELECT COUNT(*) FROM entity_merge_queue
+                            WHERE status = 'pending')
+                            AS pending_merges,
+                        (SELECT COUNT(*) FROM entity_merge_queue
+                            WHERE status = 'applied')
+                            AS applied_merges,
+                        (SELECT COUNT(*) FROM entity_merge_queue
+                            WHERE status = 'rejected')
+                            AS rejected_merges
                     """
                 )
             ).fetchone()
