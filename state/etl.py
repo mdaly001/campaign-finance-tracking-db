@@ -86,6 +86,9 @@ LOAD_ORDER: list[str] = [
     "LOANS_CD",
     "EXPPD_CD",
     "RCPT_CD",
+    # Scraper tables (non-TSV — populated via state.scrapers, not dbwebexport.zip)
+    "FILING_CALENDAR",
+    "ELECTION_RESULTS",
 ]
 
 

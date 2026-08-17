@@ -39,6 +39,7 @@ class TableDefinition:
     skip_columns: list[str] | None = None
     partition_by_date: bool = False
     date_column: str | None = None
+    source: str | None = None  # "tsv" or "scrape" — data loading method
 
 
 # ------------------------------------------------------------------ #
@@ -556,6 +557,25 @@ TABLE_DEFINITIONS: dict[str, TableDefinition] = {
             "effect_dt": "date",
             "session_id": "integer",
         },
+    ),
+    # ------------------------------------------------------------------ #
+    #  Non-TSV tables (populated via scrapers, not dbwebexport.zip)
+    # ------------------------------------------------------------------ #
+    "FILING_CALENDAR": TableDefinition(
+        code="FILING_CALENDAR",
+        description="Filing deadlines cross-referenced with election dates",
+        category="dimension",
+        tsv_files=[],
+        conflict_columns=[],
+        source="scrape",
+    ),
+    "ELECTION_RESULTS": TableDefinition(
+        code="ELECTION_RESULTS",
+        description="SOS election results PDF discovery metadata",
+        category="dimension",
+        tsv_files=[],
+        conflict_columns=[],
+        source="scrape",
     ),
 }
 
