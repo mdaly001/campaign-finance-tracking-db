@@ -1,7 +1,7 @@
 # Campaign Finance Disclosure DB — Docker deployment
 #
 #   docker compose up -d db        # start Postgres (schema auto-applied on first boot)
-#   docker compose run --rm etl    # full CAL-ACCESS ETL (first time: hours, 8.5 GB download)
+#   docker compose run --rm etl    # full CAL-ACCESS ETL (first time: hours, 1.5 GB download)
 #   docker compose up -d mcp       # start the MCP SSE server on :9527
 #
 # Incremental re-check (re-downloads only if the SOS export changed):

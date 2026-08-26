@@ -16,12 +16,12 @@ Docker Compose are installed (`docker compose version` should print a version).
 
 | Requirement | Minimum | Recommended |
 |---|---|---|
-| Free disk | ~60 GB | ~100 GB |
+| Free disk | ~30 GB | ~50 GB |
 | RAM | 8 GB | 16 GB |
-| One-time download | ~8.5 GB (the SOS data zip) | |
+| One-time download | ~1.5 GB (the SOS data zip) | |
 | First load time | a few hours | |
 
-The disk is for the data zip (8.5 GB) plus the loaded database (~30-40 GB).
+The disk is for the data zip (~1.5 GB) plus the loaded database (~17-20 GB).
 RAM matters because one big file (contributions, 3.8 GB) is parsed in memory.
 
 ## The four steps
@@ -57,7 +57,7 @@ docker compose run --rm etl
 What it does, in order:
 
 1. Downloads the official SOS export zip from
-   `https://campaignfinance.cdn.sos.ca.gov/dbwebexport.zip` (~8.5 GB,
+   `https://campaignfinance.cdn.sos.ca.gov/dbwebexport.zip` (~1.5 GB,
    one time — it's cached in the `statecache` volume afterwards).
 2. Loads all 80 tables into Postgres in dependency order.
 3. Keeps a checkpoint per table, so **if it gets interrupted you can just

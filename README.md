@@ -27,7 +27,7 @@ cp .env.example .env
 # 2. Start PostgreSQL (schema + cfdb_reader role auto-applied on first boot)
 docker compose up -d db
 
-# 3. Load data (initial full load — downloads ~8.5 GB, may take hours).
+# 3. Load data (initial full load — downloads ~1.5 GB, may take hours).
 #    Give the etl container/host ≥ 8 GB RAM (RCPT_CD is a ~3.8 GB TSV).
 docker compose run --rm etl
 
@@ -55,7 +55,7 @@ uv run pytest tests/
 
 - **SOS CAL-ACCESS Database** — Daily TSV dump from the California Secretary of State's Campaign Disclosure Data system (docs: <https://calaccess.calstate.edu/>)
   - Dataset: `dbwebexport.zip` (all CA campaign finance, lobbying, ballot measure, and election result data)
-  - Direct download: <https://campaignfinance.cdn.sos.ca.gov/dbwebexport.zip> (~8.5 GB; the old `www.sos.ca.gov` path 404s)
+  - Direct download: <https://campaignfinance.cdn.sos.ca.gov/dbwebexport.zip> (~1.5 GB; the old `www.sos.ca.gov` path 404s)
   - 80 TSV files under `CalAccess/DATA/`; table docs in the `CalAccessTablesWeb.pdf`
   - Update frequency: Daily
 

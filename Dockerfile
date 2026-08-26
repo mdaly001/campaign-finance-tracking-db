@@ -18,7 +18,7 @@ COPY --chown=appuser:appuser state/ ./state/
 COPY --chown=appuser:appuser migrations/ ./migrations/
 COPY --chown=appuser:appuser scripts/ ./scripts/
 
-# ETL download cache + logs (zip is ~8.5 GB; mount a volume for persistence)
+# ETL download cache + logs (zip is ~1.5 GB; mount a volume for persistence)
 RUN mkdir -p /app/state/cache && chown -R appuser:appuser /app
 
 USER appuser
