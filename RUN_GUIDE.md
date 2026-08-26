@@ -106,11 +106,12 @@ sleep 2; kill %1
 ```
 
 **c. (Optional) connect a client.** Point any MCP client at
-`http://localhost:9527/sse`. It exposes 9 tools, for example:
+`http://localhost:9527/sse`. It exposes 10 tools, for example:
 
 - `contributions_by_donor` — everything a donor has given, with cycle filter
 - `top_donors_for_committee_or_candidate` — biggest donors to a committee
 - `committee_profile` — who runs the committee, status, address
+- `find_committees` — search committees by name, returns the id to pass to the tools above
 - `measure_spending` — spending tied to a ballot measure
 - `vendor_revenue` — what vendors are paid across the system
 - `donor_watch_since`, `upcoming_filings`, `filing_due_soon`, `committee_outlays_to`

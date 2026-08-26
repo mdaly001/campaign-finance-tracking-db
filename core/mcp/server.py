@@ -1,6 +1,6 @@
 """MCP server entry point for the Campaign Finance Database.
 
-Launches an SSE-based MCP server with 9 Phase 1 query tools.
+Launches an SSE-based MCP server with 10 Phase 1 query tools.
 Runs on port 9527 (configurable via MCP_PORT env var) with /sse endpoint.
 
 Usage:
@@ -25,6 +25,7 @@ from core.mcp.tools import (
     contributions_by_donor,
     donor_watch_since,
     filing_due_soon,
+    find_committees,
     measure_spending,
     top_donors_for_committee_or_candidate,
     upcoming_filings,
@@ -40,6 +41,7 @@ TOOLS: list[str] = [
     "committee_outlays_to",
     "vendor_revenue",
     "committee_profile",
+    "find_committees",
     "measure_spending",
     "donor_watch_since",
     "upcoming_filings",
@@ -118,7 +120,17 @@ def _create_server() -> MCPServer:
         ),
     )
 
-    # 6. measure_spending
+    # 6. find_committees
+    server.add_tool(
+        find_committees,
+        name="find_committees",
+        description=(
+            "Find committees by (partial) name and return their IDs. "
+            "Use the returned cmte_id as committee_id in the other tools."
+        ),
+    )
+
+    # 7. measure_spending
     server.add_tool(
         measure_spending,
         name="measure_spending",
@@ -128,7 +140,7 @@ def _create_server() -> MCPServer:
         ),
     )
 
-    # 7. donor_watch_since
+    # 8. donor_watch_since
     server.add_tool(
         donor_watch_since,
         name="donor_watch_since",
@@ -138,7 +150,7 @@ def _create_server() -> MCPServer:
         ),
     )
 
-    # 8. upcoming_filings
+    # 9. upcoming_filings
     server.add_tool(
         upcoming_filings,
         name="upcoming_filings",
@@ -148,7 +160,7 @@ def _create_server() -> MCPServer:
         ),
     )
 
-    # 9. filing_due_soon
+    # 10. filing_due_soon
     server.add_tool(
         filing_due_soon,
         name="filing_due_soon",

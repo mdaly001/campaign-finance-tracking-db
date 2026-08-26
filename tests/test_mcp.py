@@ -2,7 +2,7 @@
 
 Tests cover:
 - DB engine creation and execute_read (mocked Postgres)
-- All 9 MCP tool functions against the real CAL-ACCESS schema
+- All 10 MCP tool functions against the real CAL-ACCESS schema
   (rcpt_cd / expn_cd / smry_cd / cvr_campaign_disclosure_cd /
   filername_cd / filer_xref_cd / filing_period_cd / filing_calendar /
   entity_alias)
@@ -63,6 +63,10 @@ class MockDB:
                 )
             ]
 
+        # -- committee filer resolution (xref_id -> filer_id) --------- #
+        if "FROM FILER_XREF_CD WHERE XREF_ID" in norm:
+            return [_mock_row(["filer_id"], [4242])]
+
         # -- measure metadata (ballot_measures_cd) -------------------- #
         if "FROM BALLOT_MEASURES_CD" in norm:
             return [
@@ -108,7 +112,7 @@ class MockDB:
 
         # -- rcpt_cd queries (distinguish by shape) ------------------- #
         if "FROM RCPT_CD" in norm:
-            if "GROUP BY" in norm and ":CMTE" in norm:
+            if "GROUP BY" in norm and ":FILER" in norm:
                 # top_donors aggregation
                 return [
                     _mock_row(["donor_name", "contributions", "total"],
@@ -145,7 +149,7 @@ class MockDB:
 
         # -- expn_cd queries (distinguish by shape) ------------------- #
         if "FROM EXPN_CD" in norm:
-            if "GROUP BY" in norm and ":CMTE" not in norm:
+            if "GROUP BY" in norm and ":FILER" not in norm:
                 # vendor_revenue aggregation
                 return [
                     _mock_row(["vendor_name", "payments", "total"],
@@ -164,8 +168,19 @@ class MockDB:
                     )
                 ]
 
+        # -- committee search (filername ⋈ filer_xref) ---------------- #
+        if "FROM FILERNAME_CD" in norm:
+            return [
+                _mock_row(
+                    ["cmte_id", "filer_id", "committee_name",
+                     "committee_type", "status", "city"],
+                    ["C1234", 4242, "Test Committee",
+                     "Recipient Committee", "Active", "Los Angeles"],
+                )
+            ]
+
         # -- committee_profile last activity --------------------------- #
-        if "GREATEST(" in norm and "MAX(RCPT_DATE)" in norm:
+        if "AS LAST_ACTIVITY" in norm:
             return [_mock_row(["last_activity"], ["2026-05-01"])]
 
         # Fallback: no data
@@ -400,7 +415,7 @@ class TestCommitteeProfile:
             s = sql.upper()
             if "SUM(AMOUNT)" in s:
                 return [{"total": 0, "n": 0}]
-            if "GREATEST(" in s:
+            if "AS LAST_ACTIVITY" in s:
                 return [{"last_activity": None}]
             return []
 
@@ -437,6 +452,39 @@ class TestCommitteeProfile:
         )
         assert rcpt_call["params"]["asof"] == date(2026, 1, 1)
         assert "RCPT_DATE <= :ASOF" in rcpt_call["sql"]
+
+
+# ------------------------------------------------------------------ #
+#  Test: find_committees
+# ------------------------------------------------------------------ #
+
+
+class TestFindCommittees:
+    """Tool: find_committees(name, limit)."""
+
+    def test_returns_matches(self, patched_db):
+        from core.mcp.tools import find_committees
+
+        result = find_committees("test")
+        assert len(result) == 1
+        assert result[0]["cmte_id"] == "C1234"
+        assert result[0]["filer_id"] == 4242
+        assert result[0]["committee_name"] == "Test Committee"
+        assert result[0]["status"] == "Active"
+
+    def test_name_and_limit_passed(self, patched_db):
+        from core.mcp.tools import find_committees
+
+        find_committees("Becerra", limit=5)
+        call = next(c for c in _mock_db.calls if "FROM FILERNAME_CD" in c["sql"])
+        assert call["params"]["q"] == "%Becerra%"
+        assert call["params"]["lim"] == 5
+
+    def test_returns_empty_when_no_match(self, patched_db):
+        from core.mcp.tools import find_committees
+
+        with patch("core.mcp.tools.execute_read", return_value=[]):
+            assert find_committees("zzz-no-such") == []
 
 
 # ------------------------------------------------------------------ #
@@ -573,14 +621,14 @@ class TestServer:
         return _create_server()
 
     def test_server_creation(self, server):
-        """_create_server should return an MCPServer with 9 tools."""
+        """_create_server should return an MCPServer with 10 tools."""
         import asyncio
 
         tools = asyncio.run(server.list_tools())
-        assert len(tools) == 9
+        assert len(tools) == 10
 
     def test_tool_names_registered(self, server):
-        """All 9 expected tool names should be present."""
+        """All 10 expected tool names should be present."""
         import asyncio
 
         tools = asyncio.run(server.list_tools())
@@ -604,16 +652,17 @@ class TestServer:
 
 
 class TestExports:
-    """Test that core.mcp exports all 9 tools."""
+    """Test that core.mcp exports all 10 tools."""
 
     def test_all_tools_exported(self):
-        """All 9 tool functions should be importable from core.mcp."""
+        """All 10 tool functions should be importable from core.mcp."""
         from core.mcp import (
             committee_outlays_to,
             committee_profile,
             contributions_by_donor,
             donor_watch_since,
             filing_due_soon,
+            find_committees,
             measure_spending,
             top_donors_for_committee_or_candidate,
             upcoming_filings,
@@ -625,6 +674,7 @@ class TestExports:
         assert callable(committee_outlays_to)
         assert callable(vendor_revenue)
         assert callable(committee_profile)
+        assert callable(find_committees)
         assert callable(measure_spending)
         assert callable(donor_watch_since)
         assert callable(upcoming_filings)

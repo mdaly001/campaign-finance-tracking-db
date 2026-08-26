@@ -12,6 +12,7 @@ from core.mcp.tools import (
     contributions_by_donor,
     donor_watch_since,
     filing_due_soon,
+    find_committees,
     measure_spending,
     top_donors_for_committee_or_candidate,
     upcoming_filings,
@@ -24,7 +25,7 @@ __all__ = [
     "execute_read",
     # Server
     "main",
-    # Tools (Phase 1: 9 tools)
+    # Tools (Phase 1: 10 tools)
     "contributions_by_donor",
     "top_donors_for_committee_or_candidate",
     "committee_outlays_to",

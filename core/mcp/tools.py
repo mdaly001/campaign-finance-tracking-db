@@ -133,6 +133,47 @@ def _alias_names(base: str, limit: int = 50) -> list[str]:
         return []
 
 
+def _resolve_filer_id(committee_id: str) -> int:
+    """Resolve a committee id to the filer_id that owns its filings.
+
+    Accepts a ``cmte_id``/``xref_id`` (e.g. ``C0695132``, ``900532``) or a
+    bare numeric ``filer_id``.  Returns ``-1`` when the id cannot be
+    resolved; the filing subquery then matches nothing, which is the safe
+    behaviour for an unknown committee.
+    """
+    rows = execute_read(
+        "SELECT filer_id FROM filer_xref_cd WHERE xref_id = :cmte LIMIT 1",
+        {"cmte": committee_id},
+    )
+    if rows:
+        fid = rows[0].get("filer_id")
+        if fid is not None:
+            return int(fid)
+    if committee_id.isdigit():
+        return int(committee_id)
+    return -1
+
+
+def _committee_predicate(alias: str) -> str:
+    """SQL predicate matching detail-table rows belonging to filer :filer.
+
+    A row belongs to the committee iff the filing it was filed on belongs
+    to the committee's filer (``filer_filings_cd``), resolved from the
+    committee id via ``filer_xref_cd`` by the caller.
+
+    The detail tables' own ``cmte_id`` column must NOT be used for this
+    attribution: in the SOS export it names the *donor* committee on
+    receipt lines and an unrelated cross-reference on expenditure lines
+    (e.g. independent-expenditure committees carry a candidate's committee
+    id on their lines), so matching it pulls in other committees' filings.
+    """
+    return (
+        f"{alias}.filing_id IN ("
+        "SELECT ff.filing_id FROM filer_filings_cd ff "
+        "WHERE ff.filer_id = :filer)"
+    )
+
+
 def _committee_name(committee_id: str) -> dict[str, Any] | None:
     """Resolve a cmte_id (e.g. 'C0695132') to its filername_cd record.
 
@@ -232,6 +273,17 @@ class CommitteeProfile(BaseModel):
     expenditure_count: int
     last_activity_date: str | None = None
     as_of_date: str | None = None
+
+
+class CommitteeRef(BaseModel):
+    """A committee matched by name, with the ID to pass to other tools."""
+
+    cmte_id: str
+    filer_id: int | None = None
+    committee_name: str
+    committee_type: str | None = None
+    status: str | None = None
+    city: str | None = None
 
 
 # -- 6. measure_spending -------------------------------------------------------- #
@@ -343,7 +395,7 @@ def contributions_by_donor(
             r.cmte_id,
             r.memo_refno,
             COALESCE(
-                NULLIF(TRIM(r.ctrib_naml || ' ' || r.ctrib_namf), ''),
+                NULLIF(TRIM(COALESCE(r.ctrib_naml, '') || ' ' || COALESCE(r.ctrib_namf, '')), ''),
                 r.ctrib_dscr
             ) AS donor_name
         FROM rcpt_cd r
@@ -389,32 +441,46 @@ def top_donors_for_committee_or_candidate(
     """Return the top N donors by total amount to a committee in a cycle.
 
     Args:
-        committee_id: Committee ID as it appears on filings (``cmte_id``,
-            e.g. ``C0695132``).
+        committee_id: Committee ID as it appears on filings (``cmte_id``
+            or ``xref_id``, e.g. ``C0695132``).
         cycle: Election cycle year (derived from ``rcpt_date``).
         limit: Maximum number of donors to return (default 10).
 
     Returns:
         List of TopDonor dicts sorted by total descending.
     """
-    sql = """
+    # For PAC / committee-to-committee receipts the SOS export leaves the
+    # donor name fields blank and identifies the donor by committee ID in
+    # rcpt_cd.cmte_id; resolve the name through filer_xref -> filername.
+    # (filer_xref.xref_id is unique per filer, and donor_cmte is deduped to
+    # one row per filer, so the joins cannot multiply receipt rows.)
+    sql = f"""
+        WITH donor_cmte AS (
+            SELECT DISTINCT ON (filer_id) filer_id, naml, namf
+            FROM filername_cd
+        )
         SELECT
             COALESCE(
-                NULLIF(TRIM(r.ctrib_naml || ' ' || r.ctrib_namf), ''),
+                NULLIF(TRIM(COALESCE(r.ctrib_naml, '') || ' ' || COALESCE(r.ctrib_namf, '')), ''),
                 r.ctrib_dscr,
+                NULLIF(TRIM(COALESCE(dc.naml, '') || ' ' || COALESCE(dc.namf, '')), ''),
                 '(unknown)'
             ) AS donor_name,
             COUNT(*) AS contributions,
             COALESCE(SUM(r.amount), 0) AS total
         FROM rcpt_cd r
-        WHERE r.cmte_id = :cmte
+        LEFT JOIN filer_xref_cd fx ON fx.xref_id = r.cmte_id
+        LEFT JOIN donor_cmte dc ON dc.filer_id = fx.filer_id
+        WHERE {_committee_predicate('r')}
           AND EXTRACT(YEAR FROM r.rcpt_date)::int = :cycle
         GROUP BY 1
         ORDER BY total DESC
         LIMIT :lim
     """
     rows = execute_read(
-        sql, {"cmte": committee_id, "cycle": cycle, "lim": limit}
+        sql,
+        {"filer": _resolve_filer_id(committee_id),
+         "cycle": cycle, "lim": limit},
     )
     out: list[dict[str, Any]] = []
     for row in rows:
@@ -437,7 +503,8 @@ def committee_outlays_to(
     """Return expenditures from a committee to a vendor/payee in a cycle.
 
     Args:
-        committee_id: Spending committee ID (``cmte_id``, e.g. ``C0695132``).
+        committee_id: Spending committee ID (``cmte_id`` or ``xref_id``,
+            e.g. ``C0695132``).
         vendor_name: Payee name (``"Last, First M"`` or org name).
         cycle: Election cycle year (derived from ``expn_date``).
         limit: Maximum rows (default 50).
@@ -446,20 +513,20 @@ def committee_outlays_to(
         List of OutlayRecord dicts (newest first).
     """
     p = _name_parts(vendor_name)
-    sql = """
+    sql = f"""
         SELECT
             e.expn_date,
             e.amount,
             e.expn_dscr AS purpose,
             COALESCE(
-                NULLIF(TRIM(e.payee_naml || ' ' || e.payee_namf), ''),
+                NULLIF(TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, '')), ''),
                 '(unknown payee)'
             ) AS payee_name,
             e.cmte_id,
             e.tran_id,
             e.memo_refno
         FROM expn_cd e
-        WHERE e.cmte_id = :cmte
+        WHERE {_committee_predicate('e')}
           AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle
           AND (
                 e.payee_naml ILIKE :last
@@ -471,7 +538,7 @@ def committee_outlays_to(
     """
     rows = execute_read(
         sql,
-        {"cmte": committee_id, "cycle": cycle, "lim": limit,
+        {"filer": _resolve_filer_id(committee_id), "cycle": cycle, "lim": limit,
          "last": p["last"], "first_mid": p["first_mid"], "full": p["full"]},
     )
     out: list[dict[str, Any]] = []
@@ -504,7 +571,7 @@ def vendor_revenue(vendor_name: str, limit: int = 20) -> list[dict[str, Any]]:
     sql = """
         SELECT
             COALESCE(
-                NULLIF(TRIM(e.payee_naml || ' ' || e.payee_namf), ''),
+                NULLIF(TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, '')), ''),
                 '(unknown payee)'
             ) AS vendor_name,
             COUNT(*) AS payments,
@@ -543,7 +610,8 @@ def committee_profile(
     """Return a summary profile for a committee.
 
     Args:
-        committee_id: Committee ID (``cmte_id``, e.g. ``C0695132``).
+        committee_id: Committee ID (``cmte_id`` or ``xref_id``,
+            e.g. ``C0695132``).
         as_of_date: If set, totals are computed over activity on or before
             this date.
 
@@ -551,18 +619,19 @@ def committee_profile(
         CommitteeProfile dict, or None if the committee ID is unknown.
     """
     name_row = _committee_name(committee_id)
+    filer_id = _resolve_filer_id(committee_id)
 
-    asof_clause_r = " AND rcpt_date <= :asof" if as_of_date else ""
-    asof_clause_e = " AND expn_date <= :asof" if as_of_date else ""
-    params_base: dict[str, Any] = {"cmte": committee_id}
+    asof_clause_r = " AND r.rcpt_date <= :asof" if as_of_date else ""
+    asof_clause_e = " AND e.expn_date <= :asof" if as_of_date else ""
+    params_base: dict[str, Any] = {"filer": filer_id}
     if as_of_date:
         params_base["asof"] = as_of_date
 
     rcpt = execute_read(
         f"""
         SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS n
-        FROM rcpt_cd
-        WHERE cmte_id = :cmte{asof_clause_r}
+        FROM rcpt_cd r
+        WHERE {_committee_predicate('r')}{asof_clause_r}
         """,
         params_base,
     )[0]
@@ -570,20 +639,24 @@ def committee_profile(
     expn = execute_read(
         f"""
         SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS n
-        FROM expn_cd
-        WHERE cmte_id = :cmte{asof_clause_e}
+        FROM expn_cd e
+        WHERE {_committee_predicate('e')}{asof_clause_e}
         """,
         params_base,
     )[0]
 
+    # Note: GREATEST() would return NULL when the committee has receipts
+    # but no expenditures (or vice versa), so the two maxima are merged
+    # with MAX() over a UNION ALL, which ignores NULLs.
     last_row = execute_read(
-        """
-        SELECT GREATEST(
-            (SELECT MAX(rcpt_date) FROM rcpt_cd WHERE cmte_id = :cmte),
-            (SELECT MAX(expn_date) FROM expn_cd WHERE cmte_id = :cmte)
-        ) AS last_activity
+        f"""
+        SELECT MAX(d) AS last_activity FROM (
+            SELECT r.rcpt_date AS d FROM rcpt_cd r WHERE {_committee_predicate('r')}
+            UNION ALL
+            SELECT e.expn_date AS d FROM expn_cd e WHERE {_committee_predicate('e')}
+        ) t
         """,
-        {"cmte": committee_id},
+        {"filer": filer_id},
     )[0]
 
     rec = CommitteeProfile(
@@ -601,6 +674,54 @@ def committee_profile(
         as_of_date=as_of_date.isoformat() if as_of_date else None,
     )
     return rec.model_dump()
+
+
+def find_committees(name: str, limit: int = 10) -> list[dict[str, Any]]:
+    """Find committees by (partial) name and return their IDs.
+
+    Most of the other tools take a committee ID, which is awkward to
+    guess; this tool bridges name -> ID.
+
+    Args:
+        name: Committee name fragment (case-insensitive substring,
+            matched against the last/name and first-name columns).
+        limit: Maximum number of committees to return (default 10).
+
+    Returns:
+        List of CommitteeRef dicts; ``cmte_id`` is the value to pass as
+        ``committee_id`` to the other tools.
+    """
+    sql = """
+        SELECT DISTINCT
+            x.xref_id AS cmte_id,
+            n.filer_id,
+            n.naml AS committee_name,
+            n.filer_type AS committee_type,
+            n.status,
+            n.city
+        FROM filername_cd n
+        JOIN filer_xref_cd x ON x.filer_id = n.filer_id
+        WHERE n.naml ILIKE :q OR n.namf ILIKE :q
+        ORDER BY n.naml
+        LIMIT :lim
+    """
+    rows = execute_read(sql, {"q": f"%{name}%", "lim": limit})
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        c = _coerce_row(row)
+        cmte_id = c.get("cmte_id")
+        if not cmte_id:
+            continue
+        rec = CommitteeRef(
+            cmte_id=str(cmte_id),
+            filer_id=c.get("filer_id"),
+            committee_name=c.get("committee_name") or "",
+            committee_type=c.get("committee_type"),
+            status=c.get("status"),
+            city=c.get("city"),
+        )
+        out.append(rec.model_dump())
+    return out
 
 
 def measure_spending(measure_id: str, limit: int = 20) -> list[dict[str, Any]]:
@@ -632,12 +753,12 @@ def measure_spending(measure_id: str, limit: int = 20) -> list[dict[str, Any]]:
         """
         SELECT
             COALESCE(
-                NULLIF(TRIM(c.cand_naml || ' ' || c.cand_namf), ''),
+                NULLIF(TRIM(COALESCE(c.cand_naml, '') || ' ' || COALESCE(c.cand_namf, '')), ''),
                 c.filer_naml,
                 NULL
             ) AS candidate,
             COALESCE(
-                NULLIF(TRIM(c.filer_naml || ' ' || c.filer_namf), ''),
+                NULLIF(TRIM(COALESCE(c.filer_naml, '') || ' ' || COALESCE(c.filer_namf, '')), ''),
                 c.cand_naml,
                 NULL
             ) AS committee_name,
@@ -720,7 +841,7 @@ def donor_watch_since(
             r.cmte_id,
             r.memo_refno,
             COALESCE(
-                NULLIF(TRIM(r.ctrib_naml || ' ' || r.ctrib_namf), ''),
+                NULLIF(TRIM(COALESCE(r.ctrib_naml, '') || ' ' || COALESCE(r.ctrib_namf, '')), ''),
                 r.ctrib_dscr
             ) AS donor_name
         FROM rcpt_cd r

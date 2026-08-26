@@ -2059,5 +2059,22 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO cfdb_reader;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO cfdb_reader;
 
 -- ============================================================================
+-- Query-support indexes
+--
+-- The SOS export leaves CMTE_ID blank on most detail rows (~87% of rcpt_cd,
+-- ~75% of expn_cd). A committee's activity is reliably identified through
+-- the filing the row was filed on (detail.filing_id -> filer_filings_cd
+-- -> filer_xref_cd.xref_id), so the MCP query tools need fast lookups on
+-- the filing-related columns below.
+-- ============================================================================
+CREATE INDEX IF NOT EXISTS idx_rcpt_cd_filing_id ON rcpt_cd (filing_id);
+CREATE INDEX IF NOT EXISTS idx_expn_cd_filing_id ON expn_cd (filing_id);
+CREATE INDEX IF NOT EXISTS idx_smry_cd_filing_id ON smry_cd (filing_id);
+CREATE INDEX IF NOT EXISTS idx_filer_filings_cd_filing_id ON filer_filings_cd (filing_id);
+CREATE INDEX IF NOT EXISTS idx_filer_filings_cd_filer_id ON filer_filings_cd (filer_id);
+CREATE INDEX IF NOT EXISTS idx_filer_xref_cd_xref_id ON filer_xref_cd (xref_id);
+CREATE INDEX IF NOT EXISTS idx_filername_cd_filer_id ON filername_cd (filer_id);
+
+-- ============================================================================
 -- End of migration
 -- ============================================================================
