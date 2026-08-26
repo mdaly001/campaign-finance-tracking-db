@@ -149,6 +149,18 @@ class MockDB:
 
         # -- expn_cd queries (distinguish by shape) ------------------- #
         if "FROM EXPN_CD" in norm:
+            if "FROM FILER_TO_FILER_TYPE_CD" in norm and "~* :VENDOR" in norm:
+                # committees_paying_vendor aggregation
+                return [
+                    _mock_row(
+                        ["committee", "cmte_id", "filer_category", "payments", "total"],
+                        ["Test Committee", "C1234", 40002, 3, 1500.0],
+                    ),
+                    _mock_row(
+                        ["committee", "cmte_id", "filer_category", "payments", "total"],
+                        ["Other Committee", "C5678", 0, 2, 700.0],
+                    ),
+                ]
             if "GROUP BY" in norm and ":FILER" not in norm:
                 # vendor_revenue aggregation
                 return [
@@ -399,6 +411,49 @@ class TestVendorRevenue:
 
 
 # ------------------------------------------------------------------ #
+#  Test: Tool 4b — committees_paying_vendor
+# ------------------------------------------------------------------ #
+
+
+class TestCommitteesPayingVendor:
+    """Tool: committees_paying_vendor(vendor_name, limit, candidate_only)."""
+
+    def test_returns_empty(self, patched_db):
+        from core.mcp.tools import committees_paying_vendor
+
+        with patch("core.mcp.tools.execute_read", return_value=[]):
+            result = committees_paying_vendor("Nobody")
+            assert result == []
+
+    def test_ranks_committees_and_flags_candidates(self, patched_db):
+        from core.mcp.tools import committees_paying_vendor
+
+        result = committees_paying_vendor("Google")
+        assert len(result) == 2
+        # sorted by total descending
+        assert result[0]["committee"] == "Test Committee"
+        assert result[0]["cmte_id"] == "C1234"
+        assert result[0]["total"] == 1500.0
+        assert result[0]["is_candidate"] is True  # category 40002
+        assert result[1]["committee"] == "Other Committee"
+        assert result[1]["is_candidate"] is False  # category 0
+
+    def test_candidate_only_adds_category_filter(self, patched_db):
+        from core.mcp.tools import committees_paying_vendor
+
+        committees_paying_vendor("Google", candidate_only=True)
+        sqls = [c["sql"] for c in patched_db.calls]
+        assert any("AND FCL.CATEGORY = 40002" in s for s in sqls)
+
+    def test_no_category_filter_by_default(self, patched_db):
+        from core.mcp.tools import committees_paying_vendor
+
+        committees_paying_vendor("Google")
+        sqls = [c["sql"] for c in patched_db.calls]
+        assert not any("AND FCL.CATEGORY = 40002" in s for s in sqls)
+
+
+# ------------------------------------------------------------------ #
 #  Test: Tool 5 — committee_profile
 # ------------------------------------------------------------------ #
 
@@ -621,14 +676,14 @@ class TestServer:
         return _create_server()
 
     def test_server_creation(self, server):
-        """_create_server should return an MCPServer with 10 tools."""
+        """_create_server should return an MCPServer with 11 tools."""
         import asyncio
 
         tools = asyncio.run(server.list_tools())
-        assert len(tools) == 10
+        assert len(tools) == 11
 
     def test_tool_names_registered(self, server):
-        """All 10 expected tool names should be present."""
+        """All expected tool names should be present."""
         import asyncio
 
         tools = asyncio.run(server.list_tools())
@@ -652,13 +707,14 @@ class TestServer:
 
 
 class TestExports:
-    """Test that core.mcp exports all 10 tools."""
+    """Test that core.mcp exports all 11 tools."""
 
     def test_all_tools_exported(self):
-        """All 10 tool functions should be importable from core.mcp."""
+        """All 11 tool functions should be importable from core.mcp."""
         from core.mcp import (
             committee_outlays_to,
             committee_profile,
+            committees_paying_vendor,
             contributions_by_donor,
             donor_watch_since,
             filing_due_soon,
@@ -673,6 +729,7 @@ class TestExports:
         assert callable(top_donors_for_committee_or_candidate)
         assert callable(committee_outlays_to)
         assert callable(vendor_revenue)
+        assert callable(committees_paying_vendor)
         assert callable(committee_profile)
         assert callable(find_committees)
         assert callable(measure_spending)

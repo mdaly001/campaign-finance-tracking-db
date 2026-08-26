@@ -1,6 +1,6 @@
 """MCP server entry point for the Campaign Finance Database.
 
-Launches an SSE-based MCP server with 10 Phase 1 query tools.
+Launches an SSE-based MCP server with 11 Phase 1 query tools.
 Runs on port 9527 (configurable via MCP_PORT env var) with /sse endpoint.
 
 Usage:
@@ -22,6 +22,7 @@ from core.etl.logging import setup_logging
 from core.mcp.tools import (
     committee_outlays_to,
     committee_profile,
+    committees_paying_vendor,
     contributions_by_donor,
     donor_watch_since,
     filing_due_soon,
@@ -40,6 +41,7 @@ TOOLS: list[str] = [
     "top_donors_for_committee_or_candidate",
     "committee_outlays_to",
     "vendor_revenue",
+    "committees_paying_vendor",
     "committee_profile",
     "find_committees",
     "measure_spending",
@@ -95,8 +97,9 @@ def _create_server() -> MCPServer:
         committee_outlays_to,
         name="committee_outlays_to",
         description=(
-            "Get expenditures made by a committee to vendors/payees in a cycle. "
-            "Returns all outlay records from the committee."
+            "Get expenditures made by a committee to a vendor/payee in a cycle. "
+            "The vendor is matched as a whole phrase anchored to a word "
+            "boundary. Returns all matching outlay records (newest first)."
         ),
     )
 
@@ -105,8 +108,10 @@ def _create_server() -> MCPServer:
         vendor_revenue,
         name="vendor_revenue",
         description=(
-            "Get total revenue received by a vendor name across committees. "
-            "Aggregates receipts and expenditures for the vendor."
+            "Get total payments made to a vendor across all committees "
+            "(from expenditure records, grouped by payee). The vendor is "
+            "matched as a whole phrase anchored to a word boundary, so "
+            "'AL Media' hits 'AL MEDIA LLC' but not 'CENTRAL MEDIA'."
         ),
     )
 
@@ -167,6 +172,20 @@ def _create_server() -> MCPServer:
         description=(
             "Get all filings due within the next N days. "
             "Defaults to 7 days. Reports OPEN status filings."
+        ),
+    )
+
+    # 11. committees_paying_vendor
+    server.add_tool(
+        committees_paying_vendor,
+        name="committees_paying_vendor",
+        description=(
+            "Rank the committees that paid a given vendor by total amount. "
+            "The vendor is matched as a whole phrase anchored to a word "
+            "boundary, which catches fragmented spellings (e.g. 'AL Media' "
+            "hits 'AL MEDIA LLC' but not 'CENTRAL MEDIA'). "
+            "Set candidate_only=True to restrict to candidate committees "
+            "(excludes ballot-measure and other committee types)."
         ),
     )
 

@@ -32,6 +32,7 @@ JSON-serializable dictionaries for the MCP transport layer.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -113,6 +114,20 @@ def _name_parts(name: str) -> dict[str, str]:
         "full": f"%{name}%",
         "base": name,
     }
+
+
+def _vendor_regex(name: str) -> str:
+    """Build a word-boundary-anchored, case-insensitive regex for a
+    vendor/payee name.
+
+    Payee names are organizations (not "last name" fields), so the
+    ``_name_parts`` last-token substring match over-counts:
+    ``"AL Media"`` -> ``%Media%`` would also match ``CENTRAL MEDIA``,
+    ``LOCAL MEDIA``, ``GCW MEDIA``... Anchoring on a word boundary
+    (``\\m``) makes ``"AL Media"`` match ``AL MEDIA`` / ``AL MEDIA LLC``
+    but NOT ``CENTRAL MEDIA``. Used with the SQL ``~*`` operator.
+    """
+    return r"\m" + re.sub(r"([.\\+*?[](){}^$|])", r"\\\1", (name or "").strip())
 
 
 def _alias_names(base: str, limit: int = 50) -> list[str]:
@@ -253,6 +268,20 @@ class OutlayRecord(BaseModel):
 
 class VendorRevenue(BaseModel):
     vendor_name: str
+    payments: int
+    total: float
+
+
+# -- 4b. committees_paying_vendor --------------------------------------------- #
+
+
+class VendorPayer(BaseModel):
+    """A committee ranked by how much it paid a given vendor."""
+
+    committee: str
+    cmte_id: str | None = None
+    filer_category: int | None = None
+    is_candidate: bool = False
     payments: int
     total: float
 
@@ -505,14 +534,14 @@ def committee_outlays_to(
     Args:
         committee_id: Spending committee ID (``cmte_id`` or ``xref_id``,
             e.g. ``C0695132``).
-        vendor_name: Payee name (``"Last, First M"`` or org name).
+        vendor_name: Payee/vendor name fragment (e.g. ``"Google"``); matched
+            as a whole phrase anchored to a word boundary.
         cycle: Election cycle year (derived from ``expn_date``).
         limit: Maximum rows (default 50).
 
     Returns:
         List of OutlayRecord dicts (newest first).
     """
-    p = _name_parts(vendor_name)
     sql = f"""
         SELECT
             e.expn_date,
@@ -528,18 +557,15 @@ def committee_outlays_to(
         FROM expn_cd e
         WHERE {_committee_predicate('e')}
           AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle
-          AND (
-                e.payee_naml ILIKE :last
-             OR (e.payee_naml ILIKE :last AND e.payee_namf ILIKE :first_mid)
-             OR e.payee_naml ILIKE :full
-          )
+          AND TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, ''))
+               ~* :vendor
         ORDER BY e.expn_date DESC
         LIMIT :lim
     """
     rows = execute_read(
         sql,
         {"filer": _resolve_filer_id(committee_id), "cycle": cycle, "lim": limit,
-         "last": p["last"], "first_mid": p["first_mid"], "full": p["full"]},
+         "vendor": _vendor_regex(vendor_name)},
     )
     out: list[dict[str, Any]] = []
     for row in rows:
@@ -560,14 +586,17 @@ def committee_outlays_to(
 def vendor_revenue(vendor_name: str, limit: int = 20) -> list[dict[str, Any]]:
     """Return total payments received by a vendor across all committees.
 
+    The vendor is matched as a whole phrase anchored to a word boundary,
+    so ``"AL Media"`` hits ``AL MEDIA`` / ``AL MEDIA LLC`` but not
+    ``CENTRAL MEDIA``.
+
     Args:
-        vendor_name: Payee name (``"Last, First M"`` or org name).
+        vendor_name: Payee/vendor name fragment (e.g. ``"Google"``).
         limit: Maximum rows (default 20).
 
     Returns:
         List of VendorRevenue dicts sorted by total descending.
     """
-    p = _name_parts(vendor_name)
     sql = """
         SELECT
             COALESCE(
@@ -577,25 +606,101 @@ def vendor_revenue(vendor_name: str, limit: int = 20) -> list[dict[str, Any]]:
             COUNT(*) AS payments,
             COALESCE(SUM(e.amount), 0) AS total
         FROM expn_cd e
-        WHERE (
-                e.payee_naml ILIKE :last
-             OR (e.payee_naml ILIKE :last AND e.payee_namf ILIKE :first_mid)
-             OR e.payee_naml ILIKE :full
-          )
+        WHERE TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, ''))
+              ~* :vendor
         GROUP BY 1
         ORDER BY total DESC
         LIMIT :lim
     """
     rows = execute_read(
         sql,
-        {"last": p["last"], "first_mid": p["first_mid"],
-         "full": p["full"], "lim": limit},
+        {"vendor": _vendor_regex(vendor_name), "lim": limit},
     )
     out: list[dict[str, Any]] = []
     for row in rows:
         c = _coerce_row(row)
         rec = VendorRevenue(
             vendor_name=c.get("vendor_name") or "(unknown payee)",
+            payments=int(c.get("payments") or 0),
+            total=_money(c.get("total")),
+        )
+        out.append(rec.model_dump())
+    return out
+
+
+def committees_paying_vendor(
+    vendor_name: str,
+    limit: int = 10,
+    candidate_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Rank the committees that paid a given vendor, by total amount.
+
+    Vendor names are heavily fragmented across filings (e.g. 16+ spellings
+    of "Google"), so the payee name is matched as a case-insensitive
+    substring of the full payee name rather than exactly.
+
+    Args:
+        vendor_name: Vendor/payee name fragment (e.g. ``"Google"``,
+            ``"AL Media"``, ``"The Trade Desk"``).
+        limit: Maximum number of committees to return (default 10).
+        candidate_only: When True, restrict to candidate committees
+            (filer category ``40002``), excluding ballot-measure and other
+            committee types.
+
+    Returns:
+        List of VendorPayer dicts sorted by total descending.
+    """
+    # Match the vendor as a whole phrase anchored to a word boundary so that
+    # "AL Media" hits "AL MEDIA" / "AL MEDIA LLC" but NOT "CENTRAL MEDIA".
+    vendor_regex = _vendor_regex(vendor_name)
+
+    candidate_clause = "          AND fcl.category = 40002" if candidate_only else ""
+    sql = f"""
+        WITH filings AS (
+            SELECT DISTINCT filing_id, filer_id FROM filer_filings_cd
+        ),
+        filer_name AS (
+            SELECT DISTINCT ON (filer_id) filer_id, naml, namf
+            FROM filername_cd ORDER BY filer_id
+        ),
+        filer_cmte AS (
+            SELECT DISTINCT ON (filer_id) filer_id, xref_id
+            FROM filer_xref_cd ORDER BY filer_id, effect_dt DESC NULLS LAST
+        ),
+        filer_class AS (
+            SELECT DISTINCT ON (filer_id) filer_id, category
+            FROM filer_to_filer_type_cd ORDER BY filer_id, effect_dt DESC NULLS LAST
+        )
+        SELECT
+            COALESCE(
+                NULLIF(TRIM(COALESCE(fn.naml, '') || ' ' || COALESCE(fn.namf, '')), ''),
+                '(unknown)'
+            ) AS committee,
+            fc.xref_id AS cmte_id,
+            fcl.category AS filer_category,
+            COUNT(*) AS payments,
+            COALESCE(SUM(e.amount), 0) AS total
+        FROM expn_cd e
+        JOIN filings ff ON ff.filing_id = e.filing_id
+        LEFT JOIN filer_name fn ON fn.filer_id = ff.filer_id
+        LEFT JOIN filer_cmte fc ON fc.filer_id = ff.filer_id
+        LEFT JOIN filer_class fcl ON fcl.filer_id = ff.filer_id
+        WHERE TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, ''))
+              ~* :vendor{candidate_clause}
+        GROUP BY 1, 2, 3
+        ORDER BY total DESC
+        LIMIT :lim
+    """
+    rows = execute_read(sql, {"vendor": vendor_regex, "lim": limit})
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        c = _coerce_row(row)
+        cat = c.get("filer_category")
+        rec = VendorPayer(
+            committee=c.get("committee") or "(unknown)",
+            cmte_id=str(c["cmte_id"]) if c.get("cmte_id") else None,
+            filer_category=cat,
+            is_candidate=(cat == 40002),
             payments=int(c.get("payments") or 0),
             total=_money(c.get("total")),
         )
