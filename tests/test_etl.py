@@ -40,12 +40,15 @@ def _make_engine():
     _exec(
         """
         CREATE TABLE load_checkpoint (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_name    TEXT NOT NULL,
-            file_hash     TEXT NOT NULL,
-            processed_date TEXT NOT NULL,
-            loaded_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(table_name, file_hash)
+            checkpoint_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_name     TEXT NOT NULL,
+            source         TEXT NOT NULL DEFAULT 'calaccess',
+            file_hash      TEXT NOT NULL,
+            source_file    TEXT,
+            processed_date TIMESTAMP,
+            rows_processed INTEGER,
+            notes          TEXT,
+            UNIQUE(table_name, source, file_hash)
         )
         """
     )
@@ -81,25 +84,24 @@ def _make_tsv_for_table(table_code, rows):
     """Build TSV bytes matching the columns of a specific table.
 
     Args:
-        table_code: Table definition key (e.g. "SMRY_CD", "CNTRB_CD").
+        table_code: Table definition key (e.g. "SMRY_CD", "EXPN_CD").
         rows: List of lists, each inner list is one row's values.
 
     Returns: TSV-encoded bytes with header matching the table's columns.
     """
     if table_code not in TABLE_DEFINITIONS:
         raise KeyError(f"Unknown table: {table_code}")
-    # Use a subset of the table's columns that will exist in the test schema
-    # We pick columns that make sense for a small test dataset
+    # Use a subset of the table's real columns that will exist in the
+    # small in-test schema.
     if table_code == "SMRY_CD":
         header = ["filing_id", "amend_id", "line_item", "amount_a", "amount_b"]
-    elif table_code == "CNTRB_CD":
-        header = ["ctrib_id", "ctrib_naml", "total_gives"]
-    elif table_code == "EXPPD_CD":
+    elif table_code == "EXPN_CD":
         header = ["filing_id", "payee_naml", "amount", "expn_date"]
     elif table_code == "RCPT_CD":
-        header = ["filing_id", "amend_id", "line_item", "ctrib_naml", "amount", "receipt_dt"]
-    elif table_code == "SMRY_CD":
-        header = ["filing_id", "amend_id", "line_item", "amount_a", "amount_b"]
+        header = [
+            "filing_id", "amend_id", "line_item", "form_type", "rec_type",
+            "ctrib_naml", "amount", "rcpt_date",
+        ]
     else:
         # Fallback: generic
         header = ["id", "name", "amount"]
@@ -107,7 +109,9 @@ def _make_tsv_for_table(table_code, rows):
     lines = ["\t".join(header)]
     for row in rows:
         lines.append("\t".join(str(row[i]) if i < len(row) else "" for i in range(len(header))))
-    return "\n".join(lines).encode("utf-8")
+    # Trailing newline matches real export TSVs (and the loader's
+    # count(b"\n") - 1 skipped-rows heuristic on checkpoint hits).
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 # ------------------------------------------------------------------ #
@@ -117,18 +121,21 @@ class TestBuildLoadConfig:
     """Test LoadConfig construction from TableDefinitions."""
 
     def test_build_config_for_rcpt_cd(self):
-        """RCPT_CD should get proper conflict columns and type coercions."""
+        """RCPT_CD should get the 5-column composite PK as conflict columns."""
         tsv = _make_tsv_for_table(
             "RCPT_CD",
             [
-                ["F1", "A1", "1", "Alice", "100.50", "2024-01-01"],
+                ["100", "0", "1", "F460", "I", "Alice", "100.50", "1/1/2024"],
             ],
         )
         h = hashlib.sha256(tsv).hexdigest()
         config = _build_load_config("RCPT_CD", tsv, h)
 
         assert config.table_name == "rcpt_cd"
-        assert config.conflict_columns == ["filing_id", "amend_id", "line_item"]
+        # Real CAL-ACCESS PK: (amend_id, filing_id, form_type, line_item, rec_type)
+        assert config.conflict_columns == [
+            "amend_id", "filing_id", "form_type", "line_item", "rec_type",
+        ]
         assert config.type_coercions["amount"] == "numeric"
         assert config.type_coercions["line_item"] == "integer"
 
@@ -204,30 +211,31 @@ class TestTableLoaderIntegration:
         assert float(rows[0][1]) == 1000.0
         assert float(rows[1][1]) == 2000.0
 
-    def test_load_cntrb_cd_with_coercion(self):
-        """Loading CNTRB_CD should coerce total_gives to numeric."""
+    def test_load_expn_cd_with_coercion(self):
+        """Loading EXPN_CD should coerce amount to numeric."""
         _exec_sql(
             self.engine,
             """
-            CREATE TABLE cntrb_cd (
-                ctrib_id TEXT PRIMARY KEY, ctrib_naml TEXT, total_gives REAL
+            CREATE TABLE expn_cd (
+                filing_id TEXT PRIMARY KEY, payee_naml TEXT,
+                amount REAL, expn_date TEXT
             )
             """,
         )
 
         tsv = _make_tsv_for_table(
-            "CNTRB_CD",
+            "EXPN_CD",
             [
-                ["C001", "Alice Smith", "5000.00"],
-                ["C002", "Bob Jones", "3000.00"],
+                ["F1", "Alice Smith", "5000.00", "2024-01-15"],
+                ["F2", "Bob Jones", "3000.00", "2024-02-15"],
             ],
         )
 
         config = LoadConfig(
-            table_name="cntrb_cd",
-            tsv_files=["CNTRB_CD.tsv"],
-            conflict_columns=["ctrib_id"],
-            type_coercions={"total_gives": "numeric"},
+            table_name="expn_cd",
+            tsv_files=["EXPN_CD.tsv"],
+            conflict_columns=["filing_id"],
+            type_coercions={"amount": "numeric"},
             skip_columns=["__table__", "__file_hash__"],
         )
         loader = TableLoader(self.engine, batch_size=100)
@@ -235,7 +243,7 @@ class TestTableLoaderIntegration:
 
         assert summary.rows_upserted == 2
 
-        rows = _fetch(self.engine, "SELECT ctrib_naml, total_gives FROM cntrb_cd ORDER BY ctrib_id")
+        rows = _fetch(self.engine, "SELECT payee_naml, amount FROM expn_cd ORDER BY filing_id")
         assert rows[0][0] == "Alice Smith"
         assert float(rows[0][1]) == 5000.0
 
@@ -319,19 +327,20 @@ class TestIncrementalLoadRunner:
         _exec_sql(
             self.engine,
             """
-            CREATE TABLE cntrb_cd (
-                ctrib_id TEXT PRIMARY KEY, ctrib_naml TEXT, total_gives REAL
+            CREATE TABLE expn_cd (
+                filing_id TEXT PRIMARY KEY, payee_naml TEXT,
+                amount REAL, expn_date TEXT
             )
             """,
         )
 
         # First load
-        tsv1 = _make_tsv_for_table("CNTRB_CD", [["C1", "Alice", "100"]])
+        tsv1 = _make_tsv_for_table("EXPN_CD", [["F1", "Alice", "100", "2024-01-01"]])
         config1 = LoadConfig(
-            table_name="cntrb_cd",
-            tsv_files=["CNTRB_CD.tsv"],
-            conflict_columns=["ctrib_id"],
-            type_coercions={"total_gives": "numeric"},
+            table_name="expn_cd",
+            tsv_files=["EXPN_CD.tsv"],
+            conflict_columns=["filing_id"],
+            type_coercions={"amount": "numeric"},
             skip_columns=["__table__", "__file_hash__"],
         )
         loader1 = TableLoader(self.engine, batch_size=100)
@@ -348,7 +357,7 @@ class TestIncrementalLoadRunner:
         _exec_sql(
             self.engine,
             """
-            CREATE TABLE exppd_cd (
+            CREATE TABLE expn_cd (
                 filing_id TEXT PRIMARY KEY, payee_naml TEXT,
                 amount REAL, expn_date TEXT
             )
@@ -356,10 +365,10 @@ class TestIncrementalLoadRunner:
         )
 
         # Load with hash A
-        tsv_a = _make_tsv_for_table("EXPPD_CD", [["F1", "Vendor A", "500", "2024-01-01"]])
+        tsv_a = _make_tsv_for_table("EXPN_CD", [["F1", "Vendor A", "500", "2024-01-01"]])
         config_a = LoadConfig(
-            table_name="exppd_cd",
-            tsv_files=["EXPPD_CD.tsv"],
+            table_name="expn_cd",
+            tsv_files=["EXPN_CD.tsv"],
             conflict_columns=["filing_id"],
             type_coercions={"amount": "numeric"},
             skip_columns=["__table__", "__file_hash__"],
@@ -370,15 +379,15 @@ class TestIncrementalLoadRunner:
 
         # Load with hash B (different data) — should load again
         tsv_b = _make_tsv_for_table(
-            "EXPPD_CD",
+            "EXPN_CD",
             [
                 ["F1", "Vendor A", "600", "2024-02-01"],
                 ["F2", "Vendor B", "700", "2024-03-01"],
             ],
         )
         config_b = LoadConfig(
-            table_name="exppd_cd",
-            tsv_files=["EXPPD_CD.tsv"],
+            table_name="expn_cd",
+            tsv_files=["EXPN_CD.tsv"],
             conflict_columns=["filing_id"],
             type_coercions={"amount": "numeric"},
             skip_columns=["__table__", "__file_hash__"],
@@ -508,54 +517,39 @@ class TestWatchdog:
 #  Test Load Order
 # ------------------------------------------------------------------ #
 class TestLoadOrder:
-    """Test that dimension tables load before fact tables."""
+    """Test that LOAD_ORDER is monotone by table category."""
 
-    def test_dimensions_before_facts(self):
-        """All dimension tables should appear before fact tables in LOAD_ORDER."""
-        fact_codes = {
-            "RCPT_CD",
-            "CNTRB_CD",
-            "EXPPD_CD",
-            "LOANS_CD",
-            "INTTRF_CD",
-            "DEBT_CD",
-            "SMRY_CD",
-            "SPLT_CD",
-            "TEXT_MEMO_CD",
-        }
-        dim_codes = {
-            "FILERNAME_CD",
-            "ADDRESS_CD",
-            "FILER_XREF_CD",
-            "FILER_LINKS_CD",
-            "NAMES_CD",
-            "FILINGS_CD",
-            "FILING_TYPE_CD",
-            "FILING_PERIOD_CD",
-            "HDR_CD",
-            "HEADER_DEFS_CD",
-            "ACRONYMS_CD",
-            "FILER_TYPES_CD",
-            "FILER_STATUS_CD",
-            "GROUP_TYPES_CD",
-            "REPORT_TYPES_CD",
-            "LEGISLATIVE_SESSIONS_CD",
-            "LOOKUP_CODES",
-        }
+    def test_categories_load_in_block_order(self):
+        """TSV-backed tables must load in category block order:
 
-        last_dim_idx = -1
-        first_fact_idx = len(LOAD_ORDER)
+        dimension → disclosure → lobbying → fact.
 
-        for i, code in enumerate(LOAD_ORDER):
-            if code in dim_codes:
-                last_dim_idx = i
-            if code in fact_codes:
-                first_fact_idx = min(first_fact_idx, i)
-
-        assert last_dim_idx < first_fact_idx, (
-            f"Dimension table at index {last_dim_idx} appears after "
-            f"fact table at index {first_fact_idx}"
+        (The real export has no cross-category FK dependencies beyond
+        this block ordering; scraper-only tables without TSV files are
+        excluded.)
+        """
+        rank = {"dimension": 0, "disclosure": 1, "lobbying": 2, "fact": 3, "other": 4}
+        seq = [
+            (code, TABLE_DEFINITIONS[code].category)
+            for code in LOAD_ORDER
+            if TABLE_DEFINITIONS[code].tsv_files
+        ]
+        ranked = [rank[cat] for _, cat in seq]
+        assert ranked == sorted(ranked), (
+            "LOAD_ORDER is not monotone by category: "
+            + "; ".join(f"{c}({cat})" for c, cat in seq)
         )
+
+    def test_fact_tables_load_last(self):
+        """RCPT_CD/EXPN_CD/SMRY_CD (facts) must come after FILERNAME_CD
+        (dimension) so name resolution works in queries."""
+        order = {code: i for i, code in enumerate(LOAD_ORDER)}
+        for dim in ("FILERNAME_CD", "FILER_XREF_CD", "FILINGS_CD"):
+            for fact in ("RCPT_CD", "EXPN_CD", "SMRY_CD"):
+                assert order[dim] < order[fact], (
+                    f"dimension {dim} (idx {order[dim]}) must load before "
+                    f"fact {fact} (idx {order[fact]})"
+                )
 
 
 # ------------------------------------------------------------------ #
@@ -564,11 +558,24 @@ class TestLoadOrder:
 class TestTableDefinitions:
     """Test that TABLE_DEFINITIONS are consistent."""
 
-    def test_all_tables_have_conflict_columns(self):
-        """Every TSV-based table should have conflict_columns defined."""
+    def test_conflict_columns_valid(self):
+        """conflict_columns is a non-empty list, or None only for the
+        documented surrogate-PK tables (loaded TRUNCATE + plain INSERT)."""
+        surrogates = 0
         for code, td in TABLE_DEFINITIONS.items():
             if td.tsv_files:
-                assert td.conflict_columns, f"Table {code} missing conflict_columns"
+                if td.conflict_columns is None:
+                    surrogates += 1
+                    continue
+                assert len(td.conflict_columns) > 0, (
+                    f"Table {code} has empty conflict_columns"
+                )
+                assert len(set(td.conflict_columns)) == len(td.conflict_columns), (
+                    f"Table {code} has duplicate conflict columns"
+                )
+        # The real export has a fixed set of surrogate-PK tables
+        # (FILERNAME, NAMES, EFS_FILING_LOG, RECEIVED_FILINGS, 19 LOBBYIST_*).
+        assert surrogates == 23, f"Expected 23 surrogate tables, found {surrogates}"
 
     def test_all_tables_have_tsv_files(self):
         """Every TSV-based table should have tsv_files defined."""

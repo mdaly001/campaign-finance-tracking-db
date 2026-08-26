@@ -12,6 +12,19 @@ Implements the 9 Phase 1 query tools defined in the project plan:
 8. **upcoming_filings** — Upcoming filing deadlines for a committee
 9. **filing_due_soon** — All filings due within N days
 
+Real-schema conventions (CAL-ACCESS export, 2002 data model):
+
+- Detail tables (``rcpt_cd``, ``expn_cd``) have no election-year column; the
+  report "cycle" is derived from the transaction date
+  (``EXTRACT(YEAR FROM rcpt_date)`` / ``EXTRACT(YEAR FROM expn_date)``).
+- Committee IDs on detail tables (``cmte_id``, VARCHAR) map to names via
+  ``filer_xref_cd`` (``xref_id`` = cmte_id, ``filer_id`` = filername key)
+  joined to ``filername_cd``.
+- Contributor names: individuals in ``ctrib_naml``/``ctrib_namf``,
+  organizations in ``ctrib_dscr``. Payees: ``payee_naml``/``payee_namf``.
+- Aliases come from the scraper-owned ``entity_alias`` table (empty until
+  entity resolution has run); matching degrades gracefully to direct names.
+
 Each tool returns structured data via Pydantic models that map to
 JSON-serializable dictionaries for the MCP transport layer.
 """
@@ -19,7 +32,7 @@ JSON-serializable dictionaries for the MCP transport layer.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -56,7 +69,7 @@ def _dtos(value: Any) -> str | None:
 
 
 def _coerce_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Recursively coerce DB types for Pydantic model construction."""
+    """Coerce DB types (Decimal/date) for JSON transport."""
     out: dict[str, Any] = {}
     for k, v in row.items():
         if v is None:
@@ -70,6 +83,87 @@ def _coerce_row(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _name_parts(name: str) -> dict[str, str]:
+    """Build LIKE patterns for a person or organization name.
+
+    Accepts ``"Last, First M"`` or ``"First M Last"`` (and bare names) and
+    returns:
+      - last:      LIKE pattern for the last-name field
+      - first_mid: LIKE pattern for the first-name/middle-initial field
+      - full:      the whole string (for description/org fields)
+      - base:      the raw string (for alias lookups)
+    """
+    name = (name or "").strip()
+    if "," in name:
+        last, _, first = name.partition(",")
+        last, first = last.strip(), first.strip()
+    else:
+        tokens = name.split()
+        if len(tokens) == 1:
+            last, first = tokens[0], ""
+        elif len(tokens) == 2:
+            first, last = tokens[0], tokens[1]
+        else:
+            first = " ".join(tokens[:-1])
+            last = tokens[-1]
+    first_mid = (first + " %").strip()  # "John J %" or "%"
+    return {
+        "last": f"%{last}%",
+        "first_mid": first_mid,
+        "full": f"%{name}%",
+        "base": name,
+    }
+
+
+def _alias_names(base: str, limit: int = 50) -> list[str]:
+    """Look up alias variations in the scraper-owned entity_alias table.
+
+    Returns an empty list when the table has no matching rows (the normal
+    state until entity resolution has populated it).
+    """
+    try:
+        rows = execute_read(
+            "SELECT alias_name FROM entity_alias "
+            "WHERE alias_name ILIKE :base LIMIT :lim",
+            {"base": f"%{base}%", "lim": limit},
+        )
+        return [r["alias_name"] for r in rows if r.get("alias_name")]
+    except Exception as e:  # table missing / not populated — degrade gracefully
+        logger.debug("entity_alias lookup unavailable: %s", e)
+        return []
+
+
+def _committee_name(committee_id: str) -> dict[str, Any] | None:
+    """Resolve a cmte_id (e.g. 'C0695132') to its filername_cd record.
+
+    Uses the latest effective filer_xref_cd mapping.
+    """
+    rows = execute_read(
+        """
+        SELECT n.naml, n.namf, n.namt, n.nams, n.city, n.st,
+               n.filer_type, n.status
+        FROM filer_xref_cd x
+        JOIN filername_cd n ON n.filer_id = x.filer_id
+        WHERE x.xref_id = :cmte
+        ORDER BY x.effect_dt DESC NULLS LAST
+        LIMIT 1
+        """,
+        {"cmte": committee_id},
+    )
+    return rows[0] if rows else None
+
+
+def _committee_display(row: dict[str, Any] | None) -> str:
+    """Format a filername row as 'Last, First Middle Suffix' (best effort)."""
+    if not row:
+        return ""
+    parts = [
+        row.get("naml"),
+        " ".join(p for p in (row.get("namf"), row.get("namt"), row.get("nams")) if p),
+    ]
+    return ", ".join(p for p in parts if p).strip()
+
+
 # --------------------------------------------------------------------------- #
 #  Pydantic result models
 # --------------------------------------------------------------------------- #
@@ -79,15 +173,131 @@ def _coerce_row(row: dict[str, Any]) -> dict[str, Any]:
 
 
 class ContributionRecord(BaseModel):
-    tran_id: str
-    filing_id: str
-    amend_id: str
-    cycle: int
+    tran_id: str | None = None
+    filing_id: int | None = None
+    amend_id: int | None = None
+    cycle: int | None = None
     amount: float
-    date: str
+    date: str | None = None
     purpose: str | None = None
     cmte_id: str | None = None
     memo_refno: str | None = None
+    donor_name: str | None = None
+
+
+# -- 2. top_donors_for_committee_or_candidate -------------------------------- #
+
+
+class TopDonor(BaseModel):
+    donor_name: str
+    contributions: int
+    total: float
+
+
+# -- 3. committee_outlays_to -------------------------------------------------- #
+
+
+class OutlayRecord(BaseModel):
+    date: str | None = None
+    amount: float
+    purpose: str | None = None
+    payee_name: str | None = None
+    cmte_id: str | None = None
+    tran_id: str | None = None
+    memo_refno: str | None = None
+
+
+# -- 4. vendor_revenue --------------------------------------------------------- #
+
+
+class VendorRevenue(BaseModel):
+    vendor_name: str
+    payments: int
+    total: float
+
+
+# -- 5. committee_profile ------------------------------------------------------ #
+
+
+class CommitteeProfile(BaseModel):
+    committee_id: str
+    committee_name: str | None = None
+    committee_type: str | None = None
+    status: str | None = None
+    city: str | None = None
+    state: str | None = None
+    total_contributions: float
+    contribution_count: int
+    total_expenditures: float
+    expenditure_count: int
+    last_activity_date: str | None = None
+    as_of_date: str | None = None
+
+
+# -- 6. measure_spending -------------------------------------------------------- #
+
+
+class MeasureSpender(BaseModel):
+    committee_name: str | None = None
+    candidate: str | None = None
+    sup_opp: str | None = None
+    total: float
+    filings: int
+
+
+class MeasureSpending(BaseModel):
+    measure_no: str | None = None
+    measure_name: str | None = None
+    measure_short_name: str | None = None
+    election_date: str | None = None
+    jurisdiction: str | None = None
+    total_reported: float
+    top_committees: list[MeasureSpender] = []
+
+
+# -- 7. donor_watch_since -------------------------------------------------------- #
+
+
+class DonorWatchRecord(BaseModel):
+    tran_id: str | None = None
+    filing_id: int | None = None
+    amend_id: int | None = None
+    amount: float
+    date: str | None = None
+    purpose: str | None = None
+    cmte_id: str | None = None
+    memo_refno: str | None = None
+    donor_name: str | None = None
+
+
+# -- 8. upcoming_filings ---------------------------------------------------------- #
+
+
+class FilingDeadline(BaseModel):
+    committee_id: str | None = None
+    committee_name: str | None = None
+    period_desc: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    deadline: str | None = None
+    days_until: int | None = None
+
+
+# -- 9. filing_due_soon ------------------------------------------------------------- #
+
+
+class FilingDueSoon(BaseModel):
+    report_type: str | None = None
+    election_date: str | None = None
+    deadline_date: str | None = None
+    grace_period_days: int | None = None
+    days_until: int | None = None
+    source_url: str | None = None
+
+
+# --------------------------------------------------------------------------- #
+#  Tool implementations
+# --------------------------------------------------------------------------- #
 
 
 def contributions_by_donor(
@@ -98,75 +308,77 @@ def contributions_by_donor(
     """Return all contributions by a donor name in a given election cycle.
 
     Args:
-        donor_name: Partial or full donor name (LIKE match).
-        cycle: Election cycle year (e.g. 2024).
-        include_aliases: If True, also include contributions from
-            donor-alias table for name variations.
+        donor_name: Partial or full donor name (``"Last, First M"`` or free
+            text). Individuals match ``ctrib_naml``/``ctrib_namf``;
+            organizations match ``ctrib_dscr``.
+        cycle: Election cycle year (e.g. 2024) — derived from ``rcpt_date``.
+        include_aliases: If True, also match alias names from the
+            scraper-owned ``entity_alias`` table.
 
     Returns:
-        List of ContributionRecord dicts.
+        List of ContributionRecord dicts (newest first, max 500).
     """
-    alias_names: list[str] = []
-    if include_aliases:
-        alias_rows = execute_read(
-            "SELECT alias_name FROM donor_alias WHERE base_name ILIKE :base",
-            {"base": donor_name},
-        )
-        alias_names = [r["alias_name"] for r in alias_rows if r["alias_name"]]
+    p = _name_parts(donor_name)
 
-    name_pattern = f"%{donor_name}%"
-    name_cond = (
-        "ctrib_naml ILIKE :n OR ctrib_namf ILIKE :nf OR ctrib_namt ILIKE :nt"
-    )
-    alias_cond = ""
-    params: dict[str, Any] = {
-        "n": name_pattern,
-        "nf": name_pattern,
-        "nt": name_pattern,
-        "cycle": cycle,
-    }
-    if alias_names:
-        alias_pattern = f"%{'%'.join(alias_names)}%"
-        alias_cond = (
-            " OR ctrib_naml ILIKE :an OR ctrib_namf ILIKE :anf OR ctrib_namt ILIKE :ant"
-        )
-        params["an"] = alias_pattern
-        params["anf"] = alias_pattern
-        params["ant"] = alias_pattern
+    alias_clauses = ""
+    extra_params: dict[str, Any] = {}
+    if include_aliases:
+        aliases = [a for a in _alias_names(p["base"]) if a.lower() != p["base"].lower()]
+        if aliases:
+            alias_clauses = " OR " + " OR ".join(
+                f"r.ctrib_dscr = :alias{i}" for i in range(len(aliases))
+            )
+            for i, a in enumerate(aliases):
+                extra_params[f"alias{i}"] = a
 
     sql = f"""
         SELECT
-            rc.tran_id, rc.filing_id, rc.amend_id, rc.amount,
-            rc.tran_dt AS date, rc.payd_by AS purpose,
-            rc.cmte_id, rc.memo_refno,
-            COALESCE(f.elect_year, EXTRACT(YEAR FROM rc.tran_dt)::int) AS cycle
-        FROM rcpt_cd rc
-        LEFT JOIN filings f ON rc.filing_id = f.filing_id
-        WHERE ({name_cond}{alias_cond})
-          AND COALESCE(f.elect_year, EXTRACT(YEAR FROM rc.tran_dt)::int) = :cycle
-        ORDER BY rc.tran_dt DESC
+            r.tran_id,
+            r.filing_id,
+            r.amend_id,
+            EXTRACT(YEAR FROM r.rcpt_date)::int AS cycle,
+            r.amount,
+            r.rcpt_date,
+            r.ctrib_dscr AS purpose,
+            r.cmte_id,
+            r.memo_refno,
+            COALESCE(
+                NULLIF(TRIM(r.ctrib_naml || ' ' || r.ctrib_namf), ''),
+                r.ctrib_dscr
+            ) AS donor_name
+        FROM rcpt_cd r
+        WHERE EXTRACT(YEAR FROM r.rcpt_date)::int = :cycle
+          AND (
+                r.ctrib_naml ILIKE :last
+             OR (r.ctrib_naml ILIKE :last AND r.ctrib_namf ILIKE :first_mid)
+             OR r.ctrib_dscr ILIKE :full
+            {alias_clauses}
+          )
+        ORDER BY r.rcpt_date DESC
         LIMIT 500
     """
-
-    rows = execute_read(sql, params)
-
-    result: list[dict[str, Any]] = []
+    rows = execute_read(
+        sql,
+        {"cycle": cycle, "last": p["last"], "first_mid": p["first_mid"],
+         "full": p["full"], **extra_params},
+    )
+    out: list[dict[str, Any]] = []
     for row in rows:
-        coerced = _coerce_row(row)
-        record = ContributionRecord(**coerced)
-        result.append(record.model_dump())
-    return result
-
-
-# -- 2. top_donors_for_committee_or_candidate -------------------------------- #
-
-
-class TopDonorRecord(BaseModel):
-    donor_name: str
-    total_amount: float
-    contribution_count: int
-    first_date: str
-    last_date: str
+        c = _coerce_row(row)
+        rec = ContributionRecord(
+            tran_id=c.get("tran_id"),
+            filing_id=c.get("filing_id"),
+            amend_id=c.get("amend_id"),
+            cycle=c.get("cycle"),
+            amount=_money(c.get("amount")),
+            date=c.get("rcpt_date"),
+            purpose=c.get("purpose"),
+            cmte_id=c.get("cmte_id"),
+            memo_refno=c.get("memo_refno"),
+            donor_name=c.get("donor_name"),
+        )
+        out.append(rec.model_dump())
+    return out
 
 
 def top_donors_for_committee_or_candidate(
@@ -174,448 +386,479 @@ def top_donors_for_committee_or_candidate(
     cycle: int,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
-    """Return the top N donors to a committee or candidate in a cycle.
+    """Return the top N donors by total amount to a committee in a cycle.
 
     Args:
-        committee_id: Committee ID (e.g. 'C00012345').
-        cycle: Election cycle year.
-        limit: Maximum number of results (default 10, max 100).
+        committee_id: Committee ID as it appears on filings (``cmte_id``,
+            e.g. ``C0695132``).
+        cycle: Election cycle year (derived from ``rcpt_date``).
+        limit: Maximum number of donors to return (default 10).
 
     Returns:
-        List of TopDonorRecord dicts sorted by total_amount DESC.
+        List of TopDonor dicts sorted by total descending.
     """
-    limit = min(max(limit, 1), 100)
     sql = """
         SELECT
-            rcpt.ctrib_naml || COALESCE(' ' || rcpt.ctrib_namf, '') AS donor_name,
-            SUM(rcpt.amount) AS total_amount,
-            COUNT(*) AS contribution_count,
-            MIN(rcpt.tran_dt) AS first_date,
-            MAX(rcpt.tran_dt) AS last_date
-        FROM rcpt_cd rcpt
-        LEFT JOIN filings f ON rcpt.filing_id = f.filing_id
-        WHERE (rcpt.cmte_id = :cid OR rcpt.payee_filer_id = :cid)
-          AND COALESCE(f.elect_year, EXTRACT(YEAR FROM rcpt.tran_dt)::int) = :cycle
-        GROUP BY rcpt.ctrib_naml, rcpt.ctrib_namf
-        ORDER BY total_amount DESC
+            COALESCE(
+                NULLIF(TRIM(r.ctrib_naml || ' ' || r.ctrib_namf), ''),
+                r.ctrib_dscr,
+                '(unknown)'
+            ) AS donor_name,
+            COUNT(*) AS contributions,
+            COALESCE(SUM(r.amount), 0) AS total
+        FROM rcpt_cd r
+        WHERE r.cmte_id = :cmte
+          AND EXTRACT(YEAR FROM r.rcpt_date)::int = :cycle
+        GROUP BY 1
+        ORDER BY total DESC
         LIMIT :lim
     """
-    rows = execute_read(sql, {"cid": committee_id, "cycle": cycle, "lim": limit})
-
-    result: list[dict[str, Any]] = []
+    rows = execute_read(
+        sql, {"cmte": committee_id, "cycle": cycle, "lim": limit}
+    )
+    out: list[dict[str, Any]] = []
     for row in rows:
-        coerced = _coerce_row(row)
-        record = TopDonorRecord(**coerced)
-        result.append(record.model_dump())
-    return result
-
-
-# -- 3. committee_outlays_to ------------------------------------------------- #
-
-
-class OutlayRecord(BaseModel):
-    tran_id: str
-    filing_id: str
-    amount: float
-    date: str
-    purpose: str | None = None
-    memo_refno: str | None = None
+        c = _coerce_row(row)
+        rec = TopDonor(
+            donor_name=c.get("donor_name") or "(unknown)",
+            contributions=int(c.get("contributions") or 0),
+            total=_money(c.get("total")),
+        )
+        out.append(rec.model_dump())
+    return out
 
 
 def committee_outlays_to(
     committee_id: str,
-    cycle: int,
-) -> list[dict[str, Any]]:
-    """Return expenditures made by a committee to vendors/payees in a cycle.
-
-    Args:
-        committee_id: Committee ID.
-        cycle: Election cycle year.
-
-    Returns:
-        List of OutlayRecord dicts.
-    """
-    sql = """
-        SELECT
-            e.tran_id, e.filing_id, e.amount, e.expn_date AS date,
-            e.expn_dscr AS purpose, e.memo_refno
-        FROM exppd_cd e
-        LEFT JOIN filings f ON e.filing_id = f.filing_id
-        WHERE e.filer_id = :cid
-          AND COALESCE(f.elect_year, EXTRACT(YEAR FROM e.expn_date)::int) = :cycle
-        ORDER BY e.expn_date DESC
-    """
-    rows = execute_read(sql, {"cid": committee_id, "cycle": cycle})
-
-    result: list[dict[str, Any]] = []
-    for row in rows:
-        coerced = _coerce_row(row)
-        record = OutlayRecord(**coerced)
-        result.append(record.model_dump())
-    return result
-
-
-# -- 4. vendor_revenue ------------------------------------------------------- #
-
-
-def vendor_revenue(
     vendor_name: str,
     cycle: int,
-) -> dict[str, Any]:
-    """Return total revenue received by a vendor name across committees.
-
-    Sums amounts from rcpt_cd (as payee) and exppd_cd (as payee) where
-    the vendor name appears in the recipient fields.
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Return expenditures from a committee to a vendor/payee in a cycle.
 
     Args:
-        vendor_name: Partial or full vendor name.
-        cycle: Election cycle year.
+        committee_id: Spending committee ID (``cmte_id``, e.g. ``C0695132``).
+        vendor_name: Payee name (``"Last, First M"`` or org name).
+        cycle: Election cycle year (derived from ``expn_date``).
+        limit: Maximum rows (default 50).
 
     Returns:
-        Dict with vendor_name, total_received, total_expenditures,
-        transaction_count, cycles.
+        List of OutlayRecord dicts (newest first).
     """
-    name_pattern = f"%{vendor_name}%"
-
-    rev_sql = """
+    p = _name_parts(vendor_name)
+    sql = """
         SELECT
-            COALESCE(SUM(amount), 0) AS total_received,
-            COUNT(*) AS transaction_count,
-            ARRAY_AGG(DISTINCT COALESCE(f.elect_year, EXTRACT(YEAR FROM tran_dt)::int)) AS cycles
-        FROM rcpt_cd
-        LEFT JOIN filings f ON rcpt_cd.filing_id = f.filing_id
-        WHERE (payee_naml ILIKE :n OR payee_namf ILIKE :n OR payee_namt ILIKE :n)
-          AND COALESCE(f.elect_year, EXTRACT(YEAR FROM tran_dt)::int) = :cycle
+            e.expn_date,
+            e.amount,
+            e.expn_dscr AS purpose,
+            COALESCE(
+                NULLIF(TRIM(e.payee_naml || ' ' || e.payee_namf), ''),
+                '(unknown payee)'
+            ) AS payee_name,
+            e.cmte_id,
+            e.tran_id,
+            e.memo_refno
+        FROM expn_cd e
+        WHERE e.cmte_id = :cmte
+          AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle
+          AND (
+                e.payee_naml ILIKE :last
+             OR (e.payee_naml ILIKE :last AND e.payee_namf ILIKE :first_mid)
+             OR e.payee_naml ILIKE :full
+          )
+        ORDER BY e.expn_date DESC
+        LIMIT :lim
     """
-    rev_rows = execute_read(rev_sql, {"n": name_pattern, "cycle": cycle})
-    rev_row = rev_rows[0] if rev_rows else {
-        "total_received": 0, "transaction_count": 0, "cycles": [],
-    }
+    rows = execute_read(
+        sql,
+        {"cmte": committee_id, "cycle": cycle, "lim": limit,
+         "last": p["last"], "first_mid": p["first_mid"], "full": p["full"]},
+    )
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        c = _coerce_row(row)
+        rec = OutlayRecord(
+            date=c.get("expn_date"),
+            amount=_money(c.get("amount")),
+            purpose=c.get("purpose"),
+            payee_name=c.get("payee_name"),
+            cmte_id=c.get("cmte_id"),
+            tran_id=c.get("tran_id"),
+            memo_refno=c.get("memo_refno"),
+        )
+        out.append(rec.model_dump())
+    return out
 
-    exp_sql = """
-        SELECT COALESCE(SUM(amount), 0) AS total_expenditures
-        FROM exppd_cd
-        LEFT JOIN filings f ON exppd_cd.filing_id = f.filing_id
-        WHERE (payee_naml ILIKE :n OR payee_namf ILIKE :n OR payee_namt ILIKE :n)
-          AND COALESCE(f.elect_year, EXTRACT(YEAR FROM expn_date)::int) = :cycle
+
+def vendor_revenue(vendor_name: str, limit: int = 20) -> list[dict[str, Any]]:
+    """Return total payments received by a vendor across all committees.
+
+    Args:
+        vendor_name: Payee name (``"Last, First M"`` or org name).
+        limit: Maximum rows (default 20).
+
+    Returns:
+        List of VendorRevenue dicts sorted by total descending.
     """
-    exp_rows = execute_read(exp_sql, {"n": name_pattern, "cycle": cycle})
-    exp_row = exp_rows[0] if exp_rows else {"total_expenditures": 0}
-
-    cycles_raw: Any = rev_row.get("cycles", [])
-    cycles = [c for c in cycles_raw if c is not None]
-    return {
-        "vendor_name": vendor_name,
-        "total_received": _money(rev_row.get("total_received")),
-        "total_expenditures": _money(exp_row.get("total_expenditures")),
-        "transaction_count": int(rev_row.get("transaction_count") or 0),
-        "cycles": sorted(set(int(c) for c in cycles)),
-    }
-
-
-# -- 5. committee_profile ---------------------------------------------------- #
+    p = _name_parts(vendor_name)
+    sql = """
+        SELECT
+            COALESCE(
+                NULLIF(TRIM(e.payee_naml || ' ' || e.payee_namf), ''),
+                '(unknown payee)'
+            ) AS vendor_name,
+            COUNT(*) AS payments,
+            COALESCE(SUM(e.amount), 0) AS total
+        FROM expn_cd e
+        WHERE (
+                e.payee_naml ILIKE :last
+             OR (e.payee_naml ILIKE :last AND e.payee_namf ILIKE :first_mid)
+             OR e.payee_naml ILIKE :full
+          )
+        GROUP BY 1
+        ORDER BY total DESC
+        LIMIT :lim
+    """
+    rows = execute_read(
+        sql,
+        {"last": p["last"], "first_mid": p["first_mid"],
+         "full": p["full"], "lim": limit},
+    )
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        c = _coerce_row(row)
+        rec = VendorRevenue(
+            vendor_name=c.get("vendor_name") or "(unknown payee)",
+            payments=int(c.get("payments") or 0),
+            total=_money(c.get("total")),
+        )
+        out.append(rec.model_dump())
+    return out
 
 
 def committee_profile(
     committee_id: str,
-    cycle: int = 2024,
-) -> dict[str, Any]:
-    """Return a summary profile of a committee.
-
-    Pulls from rcpt_cd (receipts/contributions), exppd_cd (disbursements),
-    and smry_cd (summary totals), joining with filings for cycle lookup.
+    as_of_date: date | None = None,
+) -> dict[str, Any] | None:
+    """Return a summary profile for a committee.
 
     Args:
-        committee_id: Committee ID (e.g. 'C00012345').
-        cycle: Election cycle year.
+        committee_id: Committee ID (``cmte_id``, e.g. ``C0695132``).
+        as_of_date: If set, totals are computed over activity on or before
+            this date.
 
     Returns:
-        Dict with summary financials.
+        CommitteeProfile dict, or None if the committee ID is unknown.
     """
-    info_rows = execute_read(
-        """
-        SELECT
-            fn.filer_id,
-            fn.naml || COALESCE(' ' || fn.namf, '') AS committee_name,
-            fn.filer_type AS committee_type,
-            fa.city, fa.st AS state
-        FROM filername fn
-        LEFT JOIN filer_address fa ON fn.filer_id = fa.filer_id AND fa.add_type = 'B'
-        WHERE fn.filer_id = :cid
-        LIMIT 1
+    name_row = _committee_name(committee_id)
+
+    asof_clause_r = " AND rcpt_date <= :asof" if as_of_date else ""
+    asof_clause_e = " AND expn_date <= :asof" if as_of_date else ""
+    params_base: dict[str, Any] = {"cmte": committee_id}
+    if as_of_date:
+        params_base["asof"] = as_of_date
+
+    rcpt = execute_read(
+        f"""
+        SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS n
+        FROM rcpt_cd
+        WHERE cmte_id = :cmte{asof_clause_r}
         """,
-        {"cid": committee_id},
-    )
+        params_base,
+    )[0]
 
-    base_info: dict[str, Any] = {}
-    if info_rows:
-        ir = info_rows[0]
-        base_info = {
-            "committee_id": ir["filer_id"],
-            "committee_name": ir["committee_name"] or "Unknown",
-            "committee_type": ir["committee_type"] or "Unknown",
-            "city": ir.get("city"),
-            "state": ir.get("state"),
-        }
-
-    fin_sql = """
-        SELECT
-            COALESCE(
-                SUM(CASE WHEN rc.rec_type = 'R' THEN rc.amount ELSE 0 END), 0
-            ) AS total_receipts,
-            COALESCE(
-                SUM(CASE WHEN rc.rec_type = 'D' THEN rc.amount ELSE 0 END), 0
-            ) AS total_disbursements,
-            COALESCE(SUM(rc.amount), 0) AS total_contributions,
-            COALESCE(SUM(e.amount), 0) AS total_expenditures
-        FROM rcpt_cd rc
-        LEFT JOIN filings f ON rc.filing_id = f.filing_id
-        LEFT JOIN exppd_cd e ON rc.filing_id = e.filing_id
-        WHERE (rc.cmte_id = :cid OR rc.filer_id = :cid
-               OR rc.payee_filer_id = :cid)
-          AND COALESCE(f.elect_year,
-                       EXTRACT(YEAR FROM rc.tran_dt)::int) = :cycle
-    """
-    fin_rows = execute_read(fin_sql, {"cid": committee_id, "cycle": cycle})
-
-    fin = fin_rows[0] if fin_rows else {
-        "total_receipts": 0, "total_disbursements": 0,
-        "total_contributions": 0, "total_expenditures": 0,
-    }
-
-    cash_rows = execute_read(
-        """
-        SELECT amount_b AS cash_on_hand
-        FROM smry_cd s
-        JOIN filings f ON s.filing_id = f.filing_id
-        WHERE s.cmte_id = :cid
-          AND COALESCE(f.elect_year, EXTRACT(YEAR FROM f.elect_dt)::int) = :cycle
-        ORDER BY f.elect_dt DESC
-        LIMIT 1
+    expn = execute_read(
+        f"""
+        SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS n
+        FROM expn_cd
+        WHERE cmte_id = :cmte{asof_clause_e}
         """,
-        {"cid": committee_id, "cycle": cycle},
+        params_base,
+    )[0]
+
+    last_row = execute_read(
+        """
+        SELECT GREATEST(
+            (SELECT MAX(rcpt_date) FROM rcpt_cd WHERE cmte_id = :cmte),
+            (SELECT MAX(expn_date) FROM expn_cd WHERE cmte_id = :cmte)
+        ) AS last_activity
+        """,
+        {"cmte": committee_id},
+    )[0]
+
+    rec = CommitteeProfile(
+        committee_id=committee_id,
+        committee_name=_committee_display(name_row) or None,
+        committee_type=(name_row or {}).get("filer_type"),
+        status=(name_row or {}).get("status"),
+        city=(name_row or {}).get("city"),
+        state=(name_row or {}).get("st"),
+        total_contributions=_money(rcpt.get("total")),
+        contribution_count=int(rcpt.get("n") or 0),
+        total_expenditures=_money(expn.get("total")),
+        expenditure_count=int(expn.get("n") or 0),
+        last_activity_date=_coerce_row({"d": last_row.get("last_activity")}).get("d"),
+        as_of_date=as_of_date.isoformat() if as_of_date else None,
     )
-    cash_on_hand = cash_rows[0]["cash_on_hand"] if cash_rows else 0
-
-    # Ensure defaults for required fields
-    if "committee_name" not in base_info:
-        base_info["committee_name"] = "Unknown"
-    if "committee_id" not in base_info:
-        base_info["committee_id"] = committee_id
-
-    return {
-        **base_info,
-        "cycle": cycle,
-        "total_receipts": _money(fin.get("total_receipts")),
-        "total_disbursements": _money(fin.get("total_disbursements")),
-        "cash_on_hand": _money(cash_on_hand),
-        "total_contributions": _money(fin.get("total_contributions")),
-        "total_expenditures": _money(fin.get("total_expenditures")),
-    }
+    return rec.model_dump()
 
 
-# -- 6. measure_spending ----------------------------------------------------- #
-
-
-class MeasureSpendingRecord(BaseModel):
-    committee_id: str
-    committee_name: str
-    total_spent: float
-    support_oppose: str | None = None  # 'S', 'O', or None
-
-
-def measure_spending(
-    measure_id: str,
-    cycle: int = 2024,
-) -> list[dict[str, Any]]:
-    """Return spending totals for a ballot measure.
-
-    Searches cvr_camp_disc (campaign disclosures for measures) and
-    related detail tables for measure_id references.
+def measure_spending(measure_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    """Return spending/receipt totals reported for a ballot measure.
 
     Args:
-        measure_id: Measure identifier (e.g. 'PROP 65' or measure code).
-        cycle: Election cycle year.
+        measure_id: Ballot measure number (``measure_no``/``bal_num``,
+            e.g. ``114`` or ``AA``).
+        limit: Max number of committees in ``top_committees`` (default 20).
 
     Returns:
-        List of MeasureSpendingRecord dicts.
+        List with one MeasureSpending dict (empty list if the measure is
+        not in ballot_measures_cd and no filings reference it).
     """
-    sql = """
+    meta_rows = execute_read(
+        """
+        SELECT measure_no, measure_name, measure_short_name,
+               election_date, jurisdiction
+        FROM ballot_measures_cd
+        WHERE measure_no = :m
+        ORDER BY election_date DESC
+        LIMIT 1
+        """,
+        {"m": measure_id},
+    )
+    meta = meta_rows[0] if meta_rows else None
+
+    spend_rows = execute_read(
+        """
         SELECT
-            d.cmte_id AS committee_id, d.cmte_name AS committee_name,
-            SUM(d.amount) AS total_spent,
-            d.supp_opp AS support_oppose
-        FROM cvr_camp_disc d
-        JOIN filings f ON d.filing_id = f.filing_id
-        WHERE (d.measure_id ILIKE :mid OR d.measure_desc ILIKE :mdesc)
-          AND COALESCE(f.elect_year, EXTRACT(YEAR FROM f.elect_dt)::int) = :cycle
-        GROUP BY d.cmte_id, d.cmte_name, d.supp_opp
-        ORDER BY total_spent DESC
-    """
-    rows = execute_read(sql, {
-        "mid": f"%{measure_id}%",
-        "mdesc": f"%{measure_id}%",
-        "cycle": cycle,
-    })
+            COALESCE(
+                NULLIF(TRIM(c.cand_naml || ' ' || c.cand_namf), ''),
+                c.filer_naml,
+                NULL
+            ) AS candidate,
+            COALESCE(
+                NULLIF(TRIM(c.filer_naml || ' ' || c.filer_namf), ''),
+                c.cand_naml,
+                NULL
+            ) AS committee_name,
+            c.sup_opp_cd,
+            COALESCE(SUM(s.amount_a), 0) AS total,
+            COUNT(DISTINCT s.filing_id) AS filings
+        FROM cvr_campaign_disclosure_cd c
+        LEFT JOIN smry_cd s ON s.filing_id = c.filing_id
+        WHERE c.bal_num = :m
+        GROUP BY 1, 2, 3
+        ORDER BY total DESC
+        LIMIT :lim
+        """,
+        {"m": measure_id, "lim": limit},
+    )
 
-    result: list[dict[str, Any]] = []
-    for row in rows:
-        coerced = _coerce_row(row)
-        record = MeasureSpendingRecord(**coerced)
-        result.append(record.model_dump())
-    return result
+    spenders = [
+        MeasureSpender(
+            committee_name=(c := _coerce_row(r)).get("committee_name"),
+            candidate=c.get("candidate"),
+            sup_opp=c.get("sup_opp_cd"),
+            total=_money(c.get("total")),
+            filings=int(c.get("filings") or 0),
+        ).model_dump()
+        for r in spend_rows
+    ]
 
+    if meta is None and not spend_rows:
+        return []
 
-# -- 7. donor_watch_since ---------------------------------------------------- #
-
-
-class DonorWatchRecord(BaseModel):
-    tran_id: str
-    filing_id: str
-    amount: float
-    date: str
-    committee_id: str | None = None
-    committee_name: str | None = None
-    purpose: str | None = None
+    m = _coerce_row(meta) if meta else {}
+    rec = MeasureSpending(
+        measure_no=m.get("measure_no") or measure_id,
+        measure_name=m.get("measure_name"),
+        measure_short_name=m.get("measure_short_name"),
+        election_date=m.get("election_date"),
+        jurisdiction=m.get("jurisdiction"),
+        total_reported=sum(s["total"] for s in spenders),
+        top_committees=spenders,
+    )
+    return [rec.model_dump()]
 
 
 def donor_watch_since(
-    since_date: str,
-    donor_name: str | None = None,
+    donor_name: str,
+    since_date: date,
+    include_aliases: bool = True,
 ) -> list[dict[str, Any]]:
-    """Return contributions from a donor since a given date.
-
-    Useful for monitoring new donor activity. If donor_name is None,
-    returns all contributions since the date.
+    """Return contributions from a donor on or after a given date.
 
     Args:
-        since_date: Start date in YYYY-MM-DD format.
-        donor_name: Optional donor name filter (partial match).
+        donor_name: Donor name (``"Last, First M"`` or org name).
+        since_date: Inclusive lower bound on ``rcpt_date``.
+        include_aliases: If True, also match ``entity_alias`` names.
 
     Returns:
-        List of DonorWatchRecord dicts sorted by date DESC.
+        List of DonorWatchRecord dicts (newest first, max 500).
     """
-    conditions = ["tran_dt >= :since"]
-    params: dict[str, Any] = {"since": since_date}
+    p = _name_parts(donor_name)
 
-    if donor_name:
-        name_pattern = f"%{donor_name}%"
-        conditions.append(
-            "ctrib_naml ILIKE :dn OR ctrib_namf ILIKE :dnf OR ctrib_namt ILIKE :dnt"
-        )
-        params.update({"dn": name_pattern, "dnf": name_pattern, "dnt": name_pattern})
+    alias_clauses = ""
+    extra_params: dict[str, Any] = {}
+    if include_aliases:
+        aliases = [a for a in _alias_names(p["base"]) if a.lower() != p["base"].lower()]
+        if aliases:
+            alias_clauses = " OR " + " OR ".join(
+                f"r.ctrib_dscr = :alias{i}" for i in range(len(aliases))
+            )
+            for i, a in enumerate(aliases):
+                extra_params[f"alias{i}"] = a
 
     sql = f"""
-        SELECT rc.tran_id, rc.filing_id, rc.amount, rc.tran_dt AS date,
-               rc.cmte_id, rc.cmte_name, rc.payd_by AS purpose
-        FROM rcpt_cd rc
-        WHERE {' AND '.join(conditions)}
-        ORDER BY rc.tran_dt DESC
+        SELECT
+            r.tran_id,
+            r.filing_id,
+            r.amend_id,
+            r.amount,
+            r.rcpt_date,
+            r.ctrib_dscr AS purpose,
+            r.cmte_id,
+            r.memo_refno,
+            COALESCE(
+                NULLIF(TRIM(r.ctrib_naml || ' ' || r.ctrib_namf), ''),
+                r.ctrib_dscr
+            ) AS donor_name
+        FROM rcpt_cd r
+        WHERE r.rcpt_date >= :since
+          AND (
+                r.ctrib_naml ILIKE :last
+             OR (r.ctrib_naml ILIKE :last AND r.ctrib_namf ILIKE :first_mid)
+             OR r.ctrib_dscr ILIKE :full
+            {alias_clauses}
+          )
+        ORDER BY r.rcpt_date DESC
         LIMIT 500
     """
-    rows = execute_read(sql, params)
-
-    result: list[dict[str, Any]] = []
+    rows = execute_read(
+        sql,
+        {"since": since_date, "last": p["last"], "first_mid": p["first_mid"],
+         "full": p["full"], **extra_params},
+    )
+    out: list[dict[str, Any]] = []
     for row in rows:
-        coerced = _coerce_row(row)
-        record = DonorWatchRecord(**coerced)
-        result.append(record.model_dump())
-    return result
-
-
-# -- 8. upcoming_filings ----------------------------------------------------- #
-
-
-class UpcomingFilingRecord(BaseModel):
-    calendar_id: int
-    election_date: str
-    report_type: str
-    deadline_date: str
-    grace_period_days: int
-    source_url: str | None = None
-    notes: str | None = None
+        c = _coerce_row(row)
+        rec = DonorWatchRecord(
+            tran_id=c.get("tran_id"),
+            filing_id=c.get("filing_id"),
+            amend_id=c.get("amend_id"),
+            amount=_money(c.get("amount")),
+            date=c.get("rcpt_date"),
+            purpose=c.get("purpose"),
+            cmte_id=c.get("cmte_id"),
+            memo_refno=c.get("memo_refno"),
+            donor_name=c.get("donor_name"),
+        )
+        out.append(rec.model_dump())
+    return out
 
 
 def upcoming_filings(
-    committee_id: str | None = None,
+    committee_id: str,
     days_ahead: int = 30,
 ) -> list[dict[str, Any]]:
-    """Return upcoming filing deadlines.
+    """Return filing deadlines falling within the next N days.
+
+    Deadlines come from the CAL-ACCESS ``filing_period_cd`` table (per
+    reporting period type). The committee is annotated with its resolved
+    name; CAL-ACCESS period rows are not committee-specific, so the same
+    period deadlines apply to every reporting committee.
 
     Args:
-        committee_id: Optional committee ID to filter deadlines.
+        committee_id: Committee ID (``cmte_id``, e.g. ``C0695132``).
         days_ahead: Number of days to look ahead (default 30).
 
     Returns:
-        List of UpcomingFilingRecord dicts sorted by deadline_date.
+        List of FilingDeadline dicts ordered by deadline ascending.
     """
     today = date.today()
-    future_date = today + __import__("datetime").timedelta(days=days_ahead)
+    future = today + timedelta(days=days_ahead)
+    name = _committee_name(committee_id)
 
-    sql = """
-        SELECT calendar_id, election_date, report_type, deadline_date,
-               grace_period_days, source_url, notes
-        FROM filing_calendar
-        WHERE deadline_date >= :today AND deadline_date <= :future
-        ORDER BY deadline_date ASC
-    """
-    params = {"today": today.isoformat(), "future": future_date.isoformat()}
+    rows = execute_read(
+        """
+        SELECT period_id, period_desc, start_date, end_date, deadline
+        FROM filing_period_cd
+        WHERE deadline >= :today AND deadline <= :future
+        ORDER BY deadline ASC
+        """,
+        {"today": today, "future": future},
+    )
 
-    rows = execute_read(sql, params)
-
-    result: list[dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for row in rows:
-        coerced = _coerce_row(row)
-        record = UpcomingFilingRecord(**coerced)
-        result.append(record.model_dump())
-    return result
+        c = _coerce_row(row)
+        dl = c.get("deadline")
+        days_until = None
+        if dl:
+            dl_date = (
+                dl.date() if isinstance(dl, datetime)
+                else (dl if isinstance(dl, date) else date.fromisoformat(dl[:10]))
+            )
+            days_until = (dl_date - today).days
+        rec = FilingDeadline(
+            committee_id=committee_id,
+            committee_name=_committee_display(name),
+            period_desc=c.get("period_desc"),
+            start_date=c.get("start_date"),
+            end_date=c.get("end_date"),
+            deadline=dl,
+            days_until=days_until,
+        )
+        out.append(rec.model_dump())
+    return out
 
 
-# -- 9. filing_due_soon ------------------------------------------------------ #
+def filing_due_soon(days_ahead: int = 7) -> list[dict[str, Any]]:
+    """Return scraper-tracked filing deadlines due within N days.
 
-
-class FilingDueSoonRecord(BaseModel):
-    filing_id: str
-    committee_id: str
-    committee_name: str
-    form_type: str
-    filing_date: str
-    deadline_date: str | None = None
-    status: str
-
-
-def filing_due_soon(
-    days_ahead: int = 7,
-) -> list[dict[str, Any]]:
-    """Return filings due within the next N days.
-
-    Queries the filing_calendar for deadlines approaching and cross-references
-    with filings already submitted.
+    Data comes from the scraper-owned ``filing_calendar`` table
+    (``election_date``, ``report_type``, ``deadline_date``,
+    ``grace_period_days``). Until the filing-calendar scraper runs, this
+    table is empty and the tool returns [].
 
     Args:
         days_ahead: Number of days to look ahead (default 7).
 
     Returns:
-        List of FilingDueSoonRecord dicts.
+        List of FilingDueSoon dicts ordered by deadline ascending.
     """
     today = date.today()
-    future_date = today + __import__("datetime").timedelta(days=days_ahead)
+    future = today + timedelta(days=days_ahead)
 
-    calendar_rows = execute_read(
+    rows = execute_read(
         """
-        SELECT filing_id, committee_id, committee_name, form_type,
-               filing_date, deadline_date, status
+        SELECT report_type, election_date, deadline_date,
+               grace_period_days, source_url
         FROM filing_calendar
         WHERE deadline_date >= :today AND deadline_date <= :future
-          AND status = 'OPEN'
         ORDER BY deadline_date ASC
         """,
-        {"today": today.isoformat(), "future": future_date.isoformat()},
+        {"today": today, "future": future},
     )
 
-    result: list[dict[str, Any]] = []
-    for row in calendar_rows:
-        coerced = _coerce_row(row)
-        record = FilingDueSoonRecord(**coerced)
-        result.append(record.model_dump())
-    return result
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        c = _coerce_row(row)
+        dl = c.get("deadline_date")
+        days_until = None
+        if dl:
+            dl_date = (
+                dl.date() if isinstance(dl, datetime)
+                else (dl if isinstance(dl, date) else date.fromisoformat(dl[:10]))
+            )
+            days_until = (dl_date - today).days
+        rec = FilingDueSoon(
+            report_type=c.get("report_type"),
+            election_date=c.get("election_date"),
+            deadline_date=dl,
+            grace_period_days=c.get("grace_period_days"),
+            days_until=days_until,
+            source_url=c.get("source_url"),
+        )
+        out.append(rec.model_dump())
+    return out

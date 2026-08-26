@@ -18,25 +18,27 @@ This project ingests and normalizes campaign finance disclosure data from Califo
 ### Quick Start
 
 ```bash
-# 1. Clone and configure
+# 1. Clone and configure (optional — compose has sane defaults)
 git clone https://github.com/mdaly001/campaign-finance-tracking-db.git
 cd campaign-finance-tracking-db
 cp .env.example .env
 # Edit .env — set DB_PASSWORD at minimum
 
-# 2. Start PostgreSQL
+# 2. Start PostgreSQL (schema + cfdb_reader role auto-applied on first boot)
 docker compose up -d db
 
-# 3. Run migrations
-docker compose run --rm mcp python -m core.schema.migrate
+# 3. Load data (initial full load — downloads ~8.5 GB, may take hours).
+#    Give the etl container/host ≥ 8 GB RAM (RCPT_CD is a ~3.8 GB TSV).
+docker compose run --rm etl
 
-# 4. Load data (initial full load — may take hours)
-docker compose run --rm etl python -m state.etl --full
-
-# 5. Start the MCP server
+# 4. Start the MCP server
 docker compose up -d mcp
 
-# 6. Query at http://localhost:9527/sse
+# 5. Query at http://localhost:9527/sse
+
+# Re-check for updates (no-op if the SOS export is unchanged):
+docker compose run --rm etl -- incremental \
+  --database-url postgresql://cfdb:change-me@db:5432/cfdb
 ```
 
 ### Local Development
@@ -51,8 +53,10 @@ uv run pytest tests/
 
 ### California State (Primary)
 
-- **SOS CAL-ACCESS Database** — Daily TSV dump from the California Secretary of State's Campaign Disclosure Data website: <https://calaccess.calstate.edu/>
+- **SOS CAL-ACCESS Database** — Daily TSV dump from the California Secretary of State's Campaign Disclosure Data system (docs: <https://calaccess.calstate.edu/>)
   - Dataset: `dbwebexport.zip` (all CA campaign finance, lobbying, ballot measure, and election result data)
+  - Direct download: <https://campaignfinance.cdn.sos.ca.gov/dbwebexport.zip> (~8.5 GB; the old `www.sos.ca.gov` path 404s)
+  - 80 TSV files under `CalAccess/DATA/`; table docs in the `CalAccessTablesWeb.pdf`
   - Update frequency: Daily
 
 ### Federal (Planned)
@@ -89,7 +93,7 @@ Ingest county-level disclosure data for comprehensive local coverage.
 ```
 ┌──────────┐     ┌──────────┐     ┌──────────┐
 │   ETL    │────▶│  POSTGRES│◀───▶│   MCP    │
-│  (daily) │     │   (15)   │     │  Server  │
+│  (daily) │     │   (16)   │     │  Server  │
 └──────────┘     └──────────┘     └──────────┘
                        │
                   ┌──────────┐

@@ -51,12 +51,16 @@ class DeadLetter:
             VALUES (:table_name, :row_data, :error, :source_file)
             """
         )
-        with self._conn.connect() as conn:
+        # engine.begin() commits — a bare connect() would roll back the
+        # INSERT on close, silently losing the audit trail.
+        with self._conn.begin() as conn:
             conn.execute(
                 stmt,
                 {
                     "table_name": table_name,
-                    "row_data": json.dumps(row),
+                    # default=str: coerced records carry Decimal/datetime
+                    # values that are not JSON-serializable by default.
+                    "row_data": json.dumps(row, default=str),
                     "error": error,
                     "source_file": source_file,
                 },

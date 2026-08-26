@@ -21,12 +21,15 @@ def _make_engine():
     _exec(
         """
         CREATE TABLE load_checkpoint (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_name    TEXT NOT NULL,
-            file_hash     TEXT NOT NULL,
-            processed_date TEXT NOT NULL,
-            loaded_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(table_name, file_hash)
+            checkpoint_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_name     TEXT NOT NULL,
+            source         TEXT NOT NULL DEFAULT 'calaccess',
+            file_hash      TEXT NOT NULL,
+            source_file    TEXT,
+            processed_date TIMESTAMP,
+            rows_processed INTEGER,
+            notes          TEXT,
+            UNIQUE(table_name, source, file_hash)
         )
         """
     )
@@ -62,7 +65,9 @@ def _make_tsv(rows, has_header=True):
     """Build TSV bytes from a list of row lists."""
     header = "\t".join(["id", "name", "amount"])
     lines = [header] + ["\t".join(row) for row in rows]
-    return "\n".join(lines).encode("utf-8")
+    # Trailing newline matches real export TSVs (and the loader's
+    # count(b"\n") - 1 skipped-rows heuristic on checkpoint hits).
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 class TestTableLoaderBasic:
@@ -426,3 +431,46 @@ class TestGetLoadConfigs:
         result = get_load_configs()
         assert isinstance(result, dict)
         assert len(result) == 0
+
+
+class TestRowByRowRetry:
+    """One bad row in a batch must not dead-letter the whole batch."""
+
+    def setup_method(self):
+        self.engine = _make_engine()
+        self.loader = TableLoader(self.engine, batch_size=3)
+
+    def test_bad_row_does_not_sink_batch(self):
+        """Regression: a multi-row VALUES statement is all-or-nothing.
+        With batch_size=3 and one bad row (empty PK -> NULL), the two
+        good rows must still load and only the bad row is quarantined."""
+        tsv = _make_tsv(
+            [
+                ["1", "Alice", "100.0"],
+                ["", "BadRow", "200.0"],
+                ["2", "Bob", "300.0"],
+            ]
+        )
+        config = LoadConfig(
+            table_name="retry_table",
+            tsv_files=["retry.tsv"],
+            conflict_columns=["id"],
+        )
+        # Explicit NOT NULL (a bare INTEGER PRIMARY KEY in SQLite silently
+        # auto-assigns a rowid on NULL instead of violating).
+        _exec_sql(
+            self.engine,
+            "CREATE TABLE retry_table (id INTEGER NOT NULL UNIQUE, name TEXT, amount TEXT)",
+        )
+
+        summary = self.loader.load(config, tsv)
+        assert summary.rows_read == 3
+        assert summary.rows_upserted == 2, "good rows in a failed batch were lost"
+        assert summary.rows_failed == 1, "only the genuinely bad row may fail"
+
+        rows = _fetch(self.engine, "SELECT name FROM retry_table ORDER BY id")
+        assert [r[0] for r in rows] == ["Alice", "Bob"]
+
+        dl = _fetch(self.engine, "SELECT table_name, row_data FROM etl_dead_letter")
+        assert len(dl) == 1
+        assert "BadRow" in dl[0][1]

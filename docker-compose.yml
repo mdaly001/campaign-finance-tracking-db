@@ -1,6 +1,19 @@
+# Campaign Finance Disclosure DB — Docker deployment
+#
+#   docker compose up -d db        # start Postgres (schema auto-applied on first boot)
+#   docker compose run --rm etl    # full CAL-ACCESS ETL (first time: hours, 8.5 GB download)
+#   docker compose up -d mcp       # start the MCP SSE server on :9527
+#
+# Incremental re-check (re-downloads only if the SOS export changed):
+#   docker compose run --rm etl -- incremental \
+#     --database-url postgresql://cfdb:change-me@db:5432/cfdb
+#
+# RAM note: the ETL parses RCPT_CD (~3.8 GB TSV) in-memory. Give the etl
+# container (or host) at least 8 GB of RAM; 16 GB recommended.
+
 services:
   db:
-    image: postgres:15
+    image: postgres:16
     container_name: cfdb-db
     environment:
       POSTGRES_USER: cfdb
@@ -9,6 +22,8 @@ services:
       TZ: America/Los_Angeles
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # Apply the schema (88 tables + cfdb_reader role) on FIRST boot only.
+      - ./migrations/0001_create_all_tables.sql:/docker-entrypoint-initdb.d/10-cfdb-schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U cfdb -d cfdb"]
       interval: 5s
@@ -24,11 +39,11 @@ services:
         condition: service_healthy
     ports:
       - "${MCP_PORT:-9527}:9527"
-    env_file: .env
     environment:
-      DATABASE_URL: "postgresql://cfdb:${DB_PASSWORD:-change-me}@db:5432/cfdb"
+      # MCP is read-only: the migration creates the cfdb_reader role.
+      DATABASE_URL: "postgresql://cfdb_reader:cfdb_reader@db:5432/cfdb"
       UNREDACTED_ENABLED: "${UNREDACTED_ENABLED:-false}"
-      MCP_PORT: "${MCP_PORT:-9527}"
+      MCP_PORT: "9527"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
     restart: unless-stopped
 
@@ -38,13 +53,18 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    env_file: .env
     environment:
       DATABASE_URL: "postgresql://cfdb:${DB_PASSWORD:-change-me}@db:5432/cfdb"
-      UNREDACTED_ENABLED: "${UNREDACTED_ENABLED:-false}"
+      STATE_CACHE_DIR: /app/state/cache
+      SOS_RAW_DATA_URL: "https://campaignfinance.cdn.sos.ca.gov/dbwebexport.zip"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
-    entrypoint: ["python", "-m", "cfdb.workflows.scheduler", "run"]
+    volumes:
+      - statecache:/app/state/cache
+    # Full load by default. Run incremental instead (see top of file).
+    entrypoint: ["python", "-m", "state.etl"]
+    command: ["full", "--database-url", "postgresql://cfdb:${DB_PASSWORD:-change-me}@db:5432/cfdb"]
     restart: "no"
 
 volumes:
   pgdata:
+  statecache:

@@ -16,8 +16,6 @@ from sqlalchemy import Engine, create_engine, text
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_URL = "postgresql://cfdb_reader:***@db:5432/cfdb"
-
 # Whether unredacted donor data schema is accessible to MCP server
 UNREDACTED_ENABLED = os.environ.get("UNREDACTED_ENABLED", "false").lower() == "true"
 
@@ -34,12 +32,13 @@ def _build_url() -> str:
     if from_env:
         return from_env
 
-    os.environ.get("DB_PASSWORD", "reader")
-    host = os.environ.get("DB_HOST", "db")
+    user = os.environ.get("DB_USER", "cfdb_reader")
+    password = os.environ.get("DB_PASSWORD", "reader")
+    host = os.environ.get("DB_HOST", "localhost")
     port = os.environ.get("DB_PORT", "5432")
     db = os.environ.get("DB_NAME", "cfdb")
 
-    return f"postgresql://{host}:{port}/{db}"
+    return f"postgresql://{user}:{password}@{host}:{port}/{db}"
 
 
 @lru_cache(maxsize=1)

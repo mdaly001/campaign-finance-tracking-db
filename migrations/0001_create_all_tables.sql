@@ -1,1791 +1,1948 @@
 -- ============================================================================
--- Campaign Finance Disclosure Database — Schema v1
+-- Campaign Finance Disclosure Database — Schema v2 (aligned to real CAL-ACCESS export)
 -- Phase 1: California State (CAL-ACCESS)
 -- ============================================================================
 --
 -- Source: California Secretary of State, CAL-ACCESS Raw Data
--- URL: https://www.sos.ca.gov/campaign-lobbying/helpful-resources/raw-data-campaign-finance-and-lobbying-activity
--- Attribution: Informed by prior art from LA Times Newsroom (datadesk/lat-campfin-calaccess)
+--   https://www.sos.ca.gov/campaign-lobbying/helpful-resources/raw-data-campaign-finance-and-lobbying-activity
 --
--- Schema Design Notes:
---   - All monetary columns use NUMERIC(15,2) — no FLOAT/REAL
---   - Dates use DATE or TIMESTAMPTZ (UTC)
---   - Text uses VARCHAR(n) with appropriate limits
---   - Boolean flags use BOOLEAN
---   - Large fact tables are partitioned by year (CREATE TABLE ... PARTITION BY RANGE)
---   - Entity resolution via entity/entity_alias/entity_merge_queue tables
+-- Generated from the real export (verified 2026-07):
+--   - Column sets: actual TSV headers of the 80 files under CalAccess/DATA/
+--   - Column types + primary keys: official SOS data-model document
+--     (CalAccessTablesWeb.pdf, shipped inside the export)
+--   - Columns absent from the 2002 doc: types inferred from sample data
+--
+-- Conventions:
+--   - Table names = lowercased TSV filename stems (rcpt_cd, expn_cd, ...)
+--   - Column names = lowercased TSV headers
+--   - Money: NUMERIC(p,s) as documented; dates: TIMESTAMP (export values
+--     use M/D/YYYY with optional h:mm:ss AM/PM — coerced in the ETL)
+--   - NOT NULL only on primary-key columns (export blanks -> NULL)
+--   - Tables without a documented PK in the export get a surrogate
+--     id BIGSERIAL (append-only loads)
+--   - Scraper-owned tables (filing_calendar, election_results, entity*)
+--     are NOT sourced from CAL-ACCESS; kept for the scraper pipelines
 --   - ETL infrastructure: load_checkpoint, etl_dead_letter
---
--- ERD (simplified):
---
---   [committee] 1──N [rcpt_cd] 1──N [text_memo_cd]
---                   │          │
---                   │          └─N N [cntrb_cd] (via ctrib_id)
---                   │
---                   └─N N [exppd_cd] (via payee/filer)
---                   │
---                   └─N N [loans_cd] (via cmte_id)
---                   │
---                   └─N N [inttrf_cd] (via cmte_id)
---                   │
---                   └─N N [s401_cd] (via cmte_id)
---                   │
---                   └─N N [s497_cd] (via cmte_id)
---                   │
---                   └─N N [s498_cd] (via cmte_id)
---                   │
---                   └─N N [debt_cd] (via cmte_id)
---                   │
---                   └─N N [lccm_cd] (via cmte_id)
---                   │
---                   └─N N [latt_cd] (via cmte_id)
---                   │
---                   └─N N [lpay_cd] (via cmte_id)
---                   │
---                   └─N N [smry_cd] (via filing_id)
---                   │
---                   └─N N [splts_cd] (via filing_id)
---
---   [filer] 1──N [filername_cd]
---                1──N [filer_address_cd] ──N [address_cd]
---                1──N [filer_xref_cd]
---                1──N [filer_links_cd] (self-referential)
---                1──N [filer_to_filer_type_cd] ──N [filer_types_cd]
---                1──N [filer_filings_cd] ──N [filings_cd] ──N [filing_period_cd]
---                1──N [filer_ethics_class_cd]
---                1──N [filer_interests_cd]
---                1──N [filer_acronyms_cd] ──N [acronyms_cd]
---                1──N [cvr_*] (disclosure reports)
---                1──N [lobbying_*] (lobbying disclosures)
---
---   [cvr_campaign_disclosure] N──1 [rcpt_cd] (via filing_id)
---   [cvr_lobby_disclosure]    N──1 [lemp_cd] (via filing_id)
---
-|--   [ballot_measures]   ← measure metadata from CAL-ACCESS
-|--   [filing_calendar]   ← election dates + filing deadlines
-|--   [election_results]  ← SOS election results PDF discovery
-|--   [source_info]       ← tracks zip checksum, load date
-|--   [load_checkpoint]   ← ETL checkpoint tracking
-|--   [etl_dead_letter]   ← bad row quarantine
-|--   [entity]            ← resolved entity master
-|--   [entity_alias]      ← entity aliases for fuzzy matching
-|--   [entity_merge_queue] ← pending merges
---
--- Data dictionary: see docs/data_dictionary.md
 -- ============================================================================
 
--- ============================================================================
--- 0. Extensions and schema setup
--- ============================================================================
+-- Fuzzy-matching extensions (optional; created only when available)
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_trgm')
+    AND NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') THEN
+        CREATE EXTENSION pg_trgm;
+    END IF;
+END $$;
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'fuzzystrmatch')
+    AND NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'fuzzystrmatch') THEN
+        CREATE EXTENSION fuzzystrmatch;
+    END IF;
+END $$;
 
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;
-
-COMMENT ON SCHEMA public IS 'Campaign Finance Disclosure Database — Phase 1 (CA State)';
-
--- ============================================================================
--- 1. Reference / Dimension Tables (loaded first, referenced by fact tables)
--- ============================================================================
-
--- Lookups (code definitions)
-CREATE TABLE lookup_codes (
-    code_type VARCHAR(50) NOT NULL,
-    code_id VARCHAR(50) NOT NULL,
-    code_desc TEXT,
-    PRIMARY KEY (code_type, code_id)
-);
-COMMENT ON TABLE lookup_codes IS 'CAL-ACCESS code definitions (REC_TYPE, FORM_TYPE, etc.)';
-
--- Acronym definitions
-CREATE TABLE acronyms (
-    acronym VARCHAR(20) NOT NULL PRIMARY KEY,
-    stands_for TEXT NOT NULL,
-    effect_dt DATE,
-    a_desc TEXT
-);
-COMMENT ON TABLE acronyms IS 'Committee acronym definitions (CD, PC, LC, etc.)';
-
--- Filer type definitions
-CREATE TABLE filer_types (
-    filer_type VARCHAR(20) NOT NULL PRIMARY KEY,
-    description TEXT,
-    grp_type VARCHAR(20),
-    calc_use VARCHAR(10),
-    grace_period INTEGER
-);
-COMMENT ON TABLE filer_types IS 'Filer type definitions (PC, CD, LC, OC, etc.)';
-
--- Filer status types
-CREATE TABLE filer_status_types (
-    status_type VARCHAR(20) NOT NULL PRIMARY KEY,
-    status_desc TEXT
-);
-COMMENT ON TABLE filer_status_types IS 'Active, Inactive, Cancelled, etc.';
-
--- Group type definitions
-CREATE TABLE group_types (
-    grp_id VARCHAR(20) NOT NULL PRIMARY KEY,
-    grp_name VARCHAR(100),
-    grp_desc TEXT
-);
-COMMENT ON TABLE group_types IS 'Committee group type definitions';
-
--- Report type definitions
-CREATE TABLE report_types (
-    rpt_id VARCHAR(20) NOT NULL PRIMARY KEY,
-    rpt_name VARCHAR(100),
-    rpt_desc TEXT,
-    path TEXT,
-    data_object TEXT,
-    parms_flg_y_n BOOLEAN,
-    rpt_type VARCHAR(20),
-    parm_definition TEXT
-);
-COMMENT ON TABLE report_types IS 'CAL-ACCESS report type definitions (F496, F497, etc.)';
-
--- Legislative sessions
-CREATE TABLE legislative_sessions (
-    session_id INTEGER NOT NULL PRIMARY KEY,
-    begin_date DATE NOT NULL,
-    end_date DATE NOT NULL
-);
-COMMENT ON TABLE legislative_sessions IS 'CA legislative session years';
-
--- Filing period definitions
-CREATE TABLE filing_periods (
-    period_id VARCHAR(30) NOT NULL PRIMARY KEY,
-    start_date DATE NOT NULL,
-    end_date DATE NOT NULL,
-    period_type VARCHAR(20),
-    per_grp_type VARCHAR(20),
-    period_desc TEXT,
-    deadline DATE
-);
-COMMENT ON TABLE filing_periods IS 'Standard filing period definitions';
-
--- Filing type definitions
-CREATE TABLE filing_types (
-    filing_type VARCHAR(30) NOT NULL PRIMARY KEY
-);
-COMMENT ON TABLE filing_types IS 'Cover sheet filing type (F496, F497, etc.)';
-
--- ============================================================================
--- 2. Entity / Committee Tables
--- ============================================================================
-
--- Filers (master entity table)
-CREATE TABLE filers (
-    filer_id VARCHAR(20) NOT NULL PRIMARY KEY,
-    -- Will be populated from filername_cd + filer_xref_cd during ETL
-    source VARCHAR(20) DEFAULT 'calaccess'
-);
-COMMENT ON TABLE filers IS 'Master filer/committee/candidate entity registry';
-
-CREATE INDEX idx_filers_source ON filers(source);
-
--- Filenames (from FILERNAME_CD)
-CREATE TABLE filername (
-    xref_filer_id VARCHAR(20),
-    filer_id VARCHAR(20) NOT NULL,
-    filer_type VARCHAR(20),
-    status VARCHAR(20),
-    effect_dt DATE,
-    naml VARCHAR(120),
-    namf VARCHAR(30),
-    namt VARCHAR(40),
-    nams VARCHAR(30),
-    adr1 VARCHAR(80),
-    adr2 VARCHAR(80),
-    city VARCHAR(40),
-    st CHAR(2),
-    zip4 VARCHAR(10),
-    phon VARCHAR(20),
-    fax VARCHAR(20),
-    email VARCHAR(100),
-    cand_office VARCHAR(60),
-    cand_dist INTEGER,
-    cand_yr SMALLINT,
-    cand_county VARCHAR(30),
-    cand_election_type VARCHAR(30),
-    cand_party VARCHAR(10),
-    PRIMARY KEY (xref_filer_id, filer_id, effect_dt)
-);
-CREATE INDEX idx_filername_filer_id ON filername(filer_id);
-CREATE INDEX idx_filername_status ON filername(status);
-CREATE INDEX idx_filername_type ON filername(filer_type);
-COMMENT ON TABLE filername IS 'Filer names — from FILERNAME_CD (many rows per filer_id over time)';
-
--- Address master (from ADDRESS_CD)
-CREATE TABLE address_master (
-    adrid VARCHAR(30) NOT NULL PRIMARY KEY,
-    city VARCHAR(40),
-    st CHAR(2),
-    zip4 VARCHAR(10),
-    phon VARCHAR(20),
-    fax VARCHAR(20),
-    email VARCHAR(100)
-);
-COMMENT ON TABLE address_master IS 'Address master — from ADDRESS_CD';
-
--- Filer ↔ Address mapping
-CREATE TABLE filer_address (
-    filer_id VARCHAR(20) NOT NULL REFERENCES filers(filer_id),
-    adrid VARCHAR(30) REFERENCES address_master(adrid),
-    effect_dt DATE,
-    add_type VARCHAR(20),
-    session_id INTEGER REFERENCES legislative_sessions(session_id),
-    PRIMARY KEY (filer_id, adrid, effect_dt)
-);
-CREATE INDEX idx_filer_address_filer_id ON filer_address(filer_id);
-
--- Filer cross-references (mergers, ID changes)
-CREATE TABLE filer_xref (
-    filer_id VARCHAR(20) NOT NULL REFERENCES filers(filer_id),
-    xref_id VARCHAR(20) NOT NULL,
-    effect_dt DATE,
-    migration_source VARCHAR(50),
-    PRIMARY KEY (filer_id, xref_id, effect_dt)
-);
-CREATE INDEX idx_filer_xref_xref_id ON filer_xref(xref_id);
-COMMENT ON TABLE filer_xref IS 'Filer ID cross-references (mergers, splits, ID changes)';
-
--- Filer relationships (parent/sponsor)
-CREATE TABLE filer_links (
-    filer_id_a VARCHAR(20) NOT NULL REFERENCES filers(filer_id),
-    filer_id_b VARCHAR(20) NOT NULL REFERENCES filers(filer_id),
-    active_flg BOOLEAN DEFAULT TRUE,
-    session_id INTEGER REFERENCES legislative_sessions(session_id),
-    link_type VARCHAR(20),
-    link_desc TEXT,
-    effect_dt DATE,
-    dominate_filer VARCHAR(20),
-    termination_dt DATE,
-    PRIMARY KEY (filer_id_a, filer_id_b, effect_dt)
-);
-CREATE INDEX idx_filer_links_filer_b ON filer_links(filer_id_b);
-CREATE INDEX idx_filer_links_active ON filer_links(active_flg);
-COMMENT ON TABLE filer_links IS 'Filer relationships (sponsorship, parent/child)';
-
--- Filer type assignments (many-to-many)
-CREATE TABLE filer_type_assignments (
-    filer_id VARCHAR(20) NOT NULL REFERENCES filers(filer_id),
-    filer_type VARCHAR(20) NOT NULL REFERENCES filer_types(filer_type),
-    active BOOLEAN DEFAULT TRUE,
-    race BOOLEAN,
-    session_id INTEGER REFERENCES legislative_sessions(session_id),
-    category VARCHAR(50),
-    category_type VARCHAR(50),
-    sub_category VARCHAR(50),
-    effect_dt DATE,
-    sub_category_type VARCHAR(50),
-    election_type VARCHAR(30),
-    sub_category_a VARCHAR(30),
-    nyq_dt DATE,
-    party_cd VARCHAR(10),
-    county_cd VARCHAR(10),
-    PRIMARY KEY (filer_id, filer_type, effect_dt)
-);
-CREATE INDEX idx_filer_type_assign_filer ON filer_type_assignments(filer_id);
-COMMENT ON TABLE filer_type_assignments IS 'Filer-to-type assignments';
-
--- Filer ethics classifications
-CREATE TABLE filer_ethics_class (
-    filer_id VARCHAR(20) NOT NULL REFERENCES filers(filer_id),
-    session_id INTEGER REFERENCES legislative_sessions(session_id),
-    ethics_date DATE,
-    PRIMARY KEY (filer_id, session_id)
-);
-COMMENT ON TABLE filer_ethics_class IS 'Ethics class for lobbying filers';
-
--- Filer interests (lobbying)
-CREATE TABLE filer_interests (
-    filer_id VARCHAR(20) NOT NULL REFERENCES filers(filer_id),
-    session_id INTEGER REFERENCES legislative_sessions(session_id),
-    interest_cd VARCHAR(20),
-    effect_date DATE,
-    PRIMARY KEY (filer_id, session_id, interest_cd)
-);
-COMMENT ON TABLE filer_interests IS 'Lobbying interest codes per filer';
-
--- Filer acronyms
-CREATE TABLE filer_acronyms (
-    acronym VARCHAR(20) NOT NULL REFERENCES acronyms(acronym),
-    filer_id VARCHAR(20) NOT NULL REFERENCES filers(filer_id),
-    PRIMARY KEY (acronym, filer_id)
+-- CalAccess/DATA/ACRONYMS_CD.TSV  (doc table: ACRONYMS)
+CREATE TABLE IF NOT EXISTS acronyms_cd (
+    acronym TEXT,
+    stands_for TEXT,
+    effect_dt TIMESTAMP,
+    a_desc TEXT,
+    PRIMARY KEY (acronym)
 );
 
--- Names master (from NAMES_CD — entity resolution target)
-CREATE TABLE names_master (
-    namid VARCHAR(30) NOT NULL PRIMARY KEY,
-    naml VARCHAR(120),
-    namf VARCHAR(30),
-    namt VARCHAR(40),
-    nams VARCHAR(30),
-    moniker VARCHAR(30),
-    moniker_pos SMALLINT,
-    namm VARCHAR(30),
-    fullname VARCHAR(300),
-    naml_search VARCHAR(200),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX idx_names_master_naml ON names_master(naml) WHERE naml IS NOT NULL;
-CREATE INDEX idx_names_master_fullname ON names_master(fullname) WHERE fullname IS NOT NULL;
-COMMENT ON TABLE names_master IS 'Entity name master — from NAMES_CD, used for fuzzy matching';
-
--- ============================================================================
--- 3. Filing / Report Tables
--- ============================================================================
-
--- Filings (cover sheets)
-CREATE TABLE filings (
-    filing_id VARCHAR(30) NOT NULL PRIMARY KEY,
-    filing_type VARCHAR(30) REFERENCES filing_types(filing_type),
-    filer_id VARCHAR(20) REFERENCES filers(filer_id),
-    form_id VARCHAR(30),
-    filing_date DATE,
-    amend_id VARCHAR(30),
-    period_id VARCHAR(30) REFERENCES filing_periods(period_id),
-    election_date DATE,
-    election_type VARCHAR(30),
-    coverage_type VARCHAR(20),
-    filing_status VARCHAR(20),
-    stmnt_type VARCHAR(20),
-    stmnt_status VARCHAR(20),
-    session_id INTEGER REFERENCES legislative_sessions(session_id),
-    user_id VARCHAR(30),
-    special_audit BOOLEAN DEFAULT FALSE,
-    fine_audit BOOLEAN DEFAULT FALSE,
-    rpt_start DATE,
-    rpt_end DATE,
-    rpt_date DATE
-);
-CREATE INDEX idx_filings_filer_id ON filings(filer_id);
-CREATE INDEX idx_filings_filing_date ON filings(filing_date);
-CREATE INDEX idx_filings_election_date ON filings(election_date);
-CREATE INDEX idx_filings_filing_type ON filings(filing_type);
-CREATE INDEX idx_filings_session ON filings(session_id);
-COMMENT ON TABLE filings IS 'Cover sheets / filings';
-
--- E-filing log
-CREATE TABLE efs_filing_log (
-    filing_date DATE,
-    filing_status VARCHAR(20),
-    vendor VARCHAR(50),
-    filer_id VARCHAR(20) REFERENCES filers(filer_id),
-    form_type VARCHAR(30),
-    error_no INTEGER,
-    PRIMARY KEY (filer_id, filing_date)
-);
-CREATE INDEX idx_efs_log_filer_id ON efs_filing_log(filer_id);
-CREATE INDEX idx_efs_log_date ON efs_filing_log(filing_date);
-COMMENT ON TABLE efs_filing_log IS 'E-filing submission log';
-
--- Received filings tracker
-CREATE TABLE received_filings (
-    filer_id VARCHAR(20) REFERENCES filers(filer_id),
-    filing_file_name VARCHAR(200),
-    received_date DATE,
-    filing_directory VARCHAR(200),
-    filing_id VARCHAR(30) REFERENCES filings(filing_id),
-    form_id VARCHAR(30),
-    receive_comment TEXT
-);
-CREATE INDEX idx_received_filings_filer ON received_filings(filer_id);
-CREATE INDEX idx_received_filings_filing ON received_filings(filing_id);
-COMMENT ON TABLE received_filings IS 'SOS receipt tracking';
-
--- Header records (filing header)
-CREATE TABLE hdr (
-    filing_id VARCHAR(30) NOT NULL REFERENCES filings(filing_id),
-    amend_id VARCHAR(30),
-    rec_type VARCHAR(10),
-    ef_type VARCHAR(10),
-    state_cd VARCHAR(10),
-    cal_ver VARCHAR(10),
-    soft_name VARCHAR(50),
-    soft_ver VARCHAR(20),
-    hdrcomment TEXT,
-    PRIMARY KEY (filing_id, amend_id, rec_type)
+-- CalAccess/DATA/ADDRESS_CD.TSV  (doc table: ADDRESS)
+CREATE TABLE IF NOT EXISTS address_cd (
+    adrid INTEGER,
+    city TEXT,
+    st TEXT,
+    zip4 TEXT,
+    phon TEXT,
+    fax TEXT,
+    email TEXT,
+    PRIMARY KEY (adrid)
 );
 
--- Form header definitions
-CREATE TABLE header_defs (
-    line_number SMALLINT,
-    form_id VARCHAR(30),
-    rec_type VARCHAR(10),
-    section_label VARCHAR(100),
-    comments1 TEXT,
-    comments2 TEXT,
-    label VARCHAR(100),
-    column_a VARCHAR(50),
-    column_b VARCHAR(50),
-    column_c VARCHAR(50),
-    show_c VARCHAR(10),
-    show_b VARCHAR(10),
-    PRIMARY KEY (form_id, line_number, rec_type)
+-- CalAccess/DATA/BALLOT_MEASURES_CD.TSV  (doc table: BALLOT_MEASURES)
+CREATE TABLE IF NOT EXISTS ballot_measures_cd (
+    election_date TIMESTAMP,
+    filer_id INTEGER,
+    measure_no TEXT,
+    measure_name TEXT,
+    measure_short_name TEXT,
+    jurisdiction TEXT,
+    PRIMARY KEY (filer_id)
 );
-COMMENT ON TABLE header_defs IS 'Form header definitions for report parsing';
 
--- Image links
-CREATE TABLE image_links (
-    img_link_id VARCHAR(30) NOT NULL PRIMARY KEY,
-    img_link_type VARCHAR(20),
-    img_id VARCHAR(30),
-    img_type VARCHAR(10),
-    img_dt DATE
-);
-COMMENT ON TABLE image_links IS 'Document image links';
-
--- ============================================================================
--- 4. Core Fact Tables (PARTITIONED BY YEAR)
--- ============================================================================
-
--- RCPT_CD — Receipts (Contributions, Expenditures, Refunds)
--- PRIMARY FACT TABLE — largest single table (~3.8 GB, ~50M+ rows estimated)
-CREATE TABLE rcpt_cd (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
+-- CalAccess/DATA/CVR2_CAMPAIGN_DISCLOSURE_CD.TSV  (doc table: CVR2_CAMPAIGN_DISCLOSURE)
+CREATE TABLE IF NOT EXISTS cvr2_campaign_disclosure_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
     line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    entity_cd VARCHAR(10),
-    ctrib_naml VARCHAR(120),
-    ctrib_namf VARCHAR(30),
-    ctrib_namt VARCHAR(40),
-    ctrib_nams VARCHAR(30),
-    ctrib_city VARCHAR(40),
-    ctrib_st CHAR(2),
-    ctrib_zip4 VARCHAR(10),
-    ctrib_emp VARCHAR(120),
-    ctrib_occ VARCHAR(70),
-    amount NUMERIC(15,2),
-    payd_by VARCHAR(10),
-    payment_description TEXT,
-    receipt_dt DATE,
-    disc_dtype VARCHAR(10),
-    indemp VARCHAR(10),
-    indocc VARCHAR(70),
-    memo_code VARCHAR(10),
-    memo_refno VARCHAR(30),
-    disp_first VARCHAR(30),
-    disp_last VARCHAR(120),
-    d_c_d_a DATE,
-    d_c_d_b DATE,
-    d_c_d_c DATE,
-    d_c_d_d DATE,
-    filer_id VARCHAR(20),
-    cand_naml VARCHAR(120),
-    cand_namf VARCHAR(30),
-    cand_namt VARCHAR(40),
-    cand_nams VARCHAR(30),
-    cand_city VARCHAR(40),
-    cand_st CHAR(2),
-    cand_zip4 VARCHAR(10),
-    committee_id VARCHAR(20),
-    comm_naml VARCHAR(120),
-    comm_namf VARCHAR(30),
-    comm_namt VARCHAR(40),
-    comm_nams VARCHAR(30),
-    mail_addr VARCHAR(80),
-    mail_city VARCHAR(40),
-    mail_st CHAR(2),
-    mail_zip4 VARCHAR(10),
-    phone VARCHAR(20),
-    consp_code VARCHAR(10),
-    office_sought VARCHAR(60),
-    office_dist INTEGER,
-    election_type VARCHAR(30),
-    election_date DATE,
-    ballot_issue TEXT,
-    jurisdiction VARCHAR(60),
-    ballot_sub_jurisdiction VARCHAR(60),
-    PRIMARY KEY (filing_id, amend_id, line_item)
-) PARTITION BY RANGE (receipt_dt);
-
--- Create partition stubs for current and future years
--- These will be created dynamically during ETL as new data arrives
--- For now, create partitions for years 2018-2027
-CREATE TABLE rcpt_cd_y2018 PARTITION OF rcpt_cd
-    FOR VALUES FROM ('2018-01-01') TO ('2019-01-01');
-CREATE TABLE rcpt_cd_y2019 PARTITION OF rcpt_cd
-    FOR VALUES FROM ('2019-01-01') TO ('2020-01-01');
-CREATE TABLE rcpt_cd_y2020 PARTITION OF rcpt_cd
-    FOR VALUES FROM ('2020-01-01') TO ('2021-01-01');
-CREATE TABLE rcpt_cd_y2021 PARTITION OF rcpt_cd
-    FOR VALUES FROM ('2021-01-01') TO ('2022-01-01');
-CREATE TABLE rcpt_cd_y2022 PARTITION OF rcpt_cd
-    FOR VALUES FROM ('2022-01-01') TO ('2023-01-01');
-CREATE TABLE rcpt_cd_y2023 PARTITION OF rcpt_cd
-    FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
-CREATE TABLE rcpt_cd_y2024 PARTITION OF rcpt_cd
-    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
-CREATE TABLE rcpt_cd_y2025 PARTITION OF rcpt_cd
-    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
-CREATE TABLE rcpt_cd_y2026 PARTITION OF rcpt_cd
-    FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
-CREATE TABLE rcpt_cd_y2027 PARTITION OF rcpt_cd
-    FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');
-
-CREATE INDEX idx_rcpt_cd_filing_id ON rcpt_cd(filing_id);
-CREATE INDEX idx_rcpt_cd_filer_id ON rcpt_cd(filer_id);
-CREATE INDEX idx_rcpt_cd_committee_id ON rcpt_cd(committee_id);
-CREATE INDEX idx_rcpt_cd_receipt_dt ON rcpt_cd(receipt_dt);
-CREATE INDEX idx_rcpt_cd_amount ON rcpt_cd(amount) WHERE amount > 0;
-CREATE INDEX idx_rcpt_cd_cand_naml ON rcpt_cd(cand_naml) WHERE cand_naml IS NOT NULL;
-CREATE INDEX idx_rcpt_cd_crib_naml ON rcpt_cd(ctrib_naml) WHERE ctrib_naml IS NOT NULL;
-CREATE INDEX idx_rcpt_cd_election_date ON rcpt_cd(election_date);
-CREATE INDEX idx_rcpt_cd_office_sought ON rcpt_cd(office_sought);
-COMMENT ON TABLE rcpt_cd IS 'Receipts: contributions, expenditures, refunds — PARTITIONED BY receipt_dt';
-
--- CNTRB_CD — Contributors
-CREATE TABLE cntrb_cd (
-    ctrib_id VARCHAR(30) NOT NULL PRIMARY KEY,
-    ctrib_naml VARCHAR(120),
-    ctrib_namf VARCHAR(30),
-    ctrib_namt VARCHAR(40),
-    ctrib_nams VARCHAR(30),
-    ctrib_city VARCHAR(40),
-    ctrib_st CHAR(2),
-    ctrib_zip4 VARCHAR(10),
-    ctrib_emp VARCHAR(120),
-    ctrib_occ VARCHAR(70),
-    total_gives NUMERIC(15,2),
-    total_year NUMERIC(15,2),
-    memo_code VARCHAR(10),
-    memo_refno VARCHAR(30),
-    filer_id VARCHAR(20),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    rec_type TEXT,
+    form_type TEXT,
+    tran_id TEXT,
+    entity_cd TEXT,
+    title TEXT,
+    mail_city TEXT,
+    mail_st TEXT,
+    mail_zip4 TEXT,
+    f460_part TEXT,
+    cmte_id TEXT,
+    enty_naml TEXT,
+    enty_namf TEXT,
+    enty_namt TEXT,
+    enty_nams TEXT,
+    enty_city TEXT,
+    enty_st TEXT,
+    enty_zip4 TEXT,
+    enty_phon TEXT,
+    enty_fax TEXT,
+    enty_email TEXT,
+    tres_naml TEXT,
+    tres_namf TEXT,
+    tres_namt TEXT,
+    tres_nams TEXT,
+    control_yn TEXT,
+    office_cd TEXT,
+    offic_dscr TEXT,
+    juris_cd TEXT,
+    juris_dscr TEXT,
+    dist_no TEXT,
+    off_s_h_cd TEXT,
+    bal_name TEXT,
+    bal_num TEXT,
+    bal_juris TEXT,
+    sup_opp_cd TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
 );
-CREATE INDEX idx_cntrb_cd_filer_id ON cntrb_cd(filer_id);
-CREATE INDEX idx_cntrb_cd_naml ON cntrb_cd(ctrib_naml) WHERE ctrib_naml IS NOT NULL;
-COMMENT ON TABLE cntrb_cd IS 'Contributor master — aggregated contribution totals';
 
--- EXPN_CD — Expenditures
-CREATE TABLE exppd_cd (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
+-- CalAccess/DATA/CVR2_LOBBY_DISCLOSURE_CD.TSV  (doc table: CVR2_LOBBY_DISCLOSURE)
+CREATE TABLE IF NOT EXISTS cvr2_lobby_disclosure_cd (
+    amend_id INTEGER,
+    entity_cd TEXT,
+    entity_id TEXT,
+    enty_namf TEXT,
+    enty_naml TEXT,
+    enty_nams TEXT,
+    enty_namt TEXT,
+    enty_title TEXT,
+    filing_id INTEGER,
+    form_type TEXT,
     line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    entity_cd VARCHAR(10),
-    payee_naml VARCHAR(120),
-    payee_namf VARCHAR(30),
-    payee_namt VARCHAR(40),
-    payee_nams VARCHAR(30),
-    payee_city VARCHAR(40),
-    payee_st CHAR(2),
-    payee_zip4 VARCHAR(10),
-    expn_date DATE,
+    rec_type TEXT,
+    tran_id TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+
+-- CalAccess/DATA/CVR2_REGISTRATION_CD.TSV  (doc table: CVR2_REGISTRATION)
+CREATE TABLE IF NOT EXISTS cvr2_registration_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    tran_id TEXT,
+    entity_cd TEXT,
+    entity_id TEXT,
+    enty_naml TEXT,
+    enty_namf TEXT,
+    enty_namt TEXT,
+    enty_nams TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+
+-- CalAccess/DATA/CVR2_SO_CD.TSV  (doc table: CVR2_SO)
+CREATE TABLE IF NOT EXISTS cvr2_so_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    tran_id TEXT,
+    entity_cd TEXT,
+    enty_naml TEXT,
+    enty_namf TEXT,
+    enty_namt TEXT,
+    enty_nams TEXT,
+    item_cd TEXT,
+    mail_city TEXT,
+    mail_st TEXT,
+    mail_zip4 TEXT,
+    day_phone TEXT,
+    fax_phone TEXT,
+    email_adr TEXT,
+    cmte_id TEXT,
+    ind_group TEXT,
+    office_cd TEXT,
+    offic_dscr TEXT,
+    juris_cd TEXT,
+    juris_dscr TEXT,
+    dist_no TEXT,
+    off_s_h_cd TEXT,
+    non_pty_cb TEXT,
+    party_name TEXT,
+    bal_num TEXT,
+    bal_juris TEXT,
+    sup_opp_cd TEXT,
+    year_elect TEXT,
+    pof_title TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+
+-- CalAccess/DATA/CVR3_VERIFICATION_INFO_CD.TSV  (doc table: CVR3_VERIFICATION_INFO)
+CREATE TABLE IF NOT EXISTS cvr3_verification_info_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    tran_id TEXT,
+    entity_cd TEXT,
+    sig_date TIMESTAMP,
+    sig_loc TEXT,
+    sig_naml TEXT,
+    sig_namf TEXT,
+    sig_namt TEXT,
+    sig_nams TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+
+-- CalAccess/DATA/CVR_CAMPAIGN_DISCLOSURE_CD.TSV  (doc table: CVR_CAMPAIGN_DISCLOSURE)
+CREATE TABLE IF NOT EXISTS cvr_campaign_disclosure_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    filer_id TEXT,
+    entity_cd TEXT,
+    filer_naml TEXT,
+    filer_namf TEXT,
+    filer_namt TEXT,
+    filer_nams TEXT,
+    report_num TEXT,
+    rpt_date TIMESTAMP,
+    stmt_type TEXT,
+    late_rptno TEXT,
+    from_date TIMESTAMP,
+    thru_date TIMESTAMP,
+    elect_date TIMESTAMP,
+    filer_city TEXT,
+    filer_st TEXT,
+    filer_zip4 TEXT,
+    filer_phon TEXT,
+    filer_fax TEXT,
+    file_email TEXT,
+    mail_city TEXT,
+    mail_st TEXT,
+    mail_zip4 TEXT,
+    tres_naml TEXT,
+    tres_namf TEXT,
+    tres_namt TEXT,
+    tres_nams TEXT,
+    tres_city TEXT,
+    tres_st TEXT,
+    tres_zip4 TEXT,
+    tres_phon TEXT,
+    tres_fax TEXT,
+    tres_email TEXT,
+    cmtte_type TEXT,
+    control_yn TEXT,
+    sponsor_yn TEXT,
+    primfrm_yn TEXT,
+    brdbase_yn TEXT,
+    amendexp_1 TEXT,
+    amendexp_2 TEXT,
+    amendexp_3 TEXT,
+    rpt_att_cb TEXT,
+    cmtte_id TEXT,
+    reportname TEXT,
+    rptfromdt TIMESTAMP,
+    rptthrudt TIMESTAMP,
+    emplbus_cb TEXT,
+    bus_name TEXT,
+    bus_city TEXT,
+    bus_st TEXT,
+    bus_zip4 TEXT,
+    bus_inter TEXT,
+    busact_cb TEXT,
+    busactvity TEXT,
+    assoc_cb TEXT,
+    assoc_int TEXT,
+    other_cb TEXT,
+    other_int TEXT,
+    cand_naml TEXT,
+    cand_namf TEXT,
+    cand_namt TEXT,
+    cand_nams TEXT,
+    cand_city TEXT,
+    cand_st TEXT,
+    cand_zip4 TEXT,
+    cand_phon TEXT,
+    cand_fax TEXT,
+    cand_email TEXT,
+    bal_name TEXT,
+    bal_num TEXT,
+    bal_juris TEXT,
+    office_cd TEXT,
+    offic_dscr TEXT,
+    juris_cd TEXT,
+    juris_dscr TEXT,
+    dist_no TEXT,
+    off_s_h_cd TEXT,
+    sup_opp_cd TEXT,
+    employer TEXT,
+    occupation TEXT,
+    selfemp_cb TEXT,
+    bal_id TEXT,
+    cand_id TEXT,
+    PRIMARY KEY (amend_id, filing_id)
+);
+
+-- CalAccess/DATA/CVR_E530_CD.TSV  (doc table: CVR_E530)
+CREATE TABLE IF NOT EXISTS cvr_e530_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    entity_cd TEXT,
+    filer_naml TEXT,
+    filer_namf TEXT,
+    filer_namt TEXT,
+    filer_nams TEXT,
+    report_num TEXT,
+    rpt_date TIMESTAMP,
+    filer_city TEXT,
+    filer_st TEXT,
+    filer_zip4 TEXT,
+    occupation TEXT,
+    employer TEXT,
+    cand_naml TEXT,
+    cand_namf TEXT,
+    cand_namt TEXT,
+    cand_nams TEXT,
+    district_cd INTEGER,
+    office_cd INTEGER,
+    pmnt_dt TIMESTAMP,
+    pmnt_amount NUMERIC(12,2),
+    type_literature TEXT,
+    type_printads TEXT,
+    type_radio TEXT,
+    type_tv TEXT,
+    type_it TEXT,
+    type_billboards TEXT,
+    type_other TEXT,
+    other_desc TEXT,
+    PRIMARY KEY (amend_id, filing_id)
+);
+
+-- CalAccess/DATA/CVR_F470_CD.TSV  (doc table: CVR_F470)
+CREATE TABLE IF NOT EXISTS cvr_f470_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    filer_id TEXT,
+    entity_cd TEXT,
+    filer_naml TEXT,
+    filer_namf TEXT,
+    filer_namt TEXT,
+    filer_nams TEXT,
+    report_num TEXT,
+    rpt_date TIMESTAMP,
+    cand_city TEXT,
+    cand_st TEXT,
+    cand_zip4 TEXT,
+    cand_phon TEXT,
+    cand_fax TEXT,
+    cand_email TEXT,
+    office_cd TEXT,
+    offic_dscr TEXT,
+    juris_cd TEXT,
+    juris_dscr TEXT,
+    dist_no TEXT,
+    off_s_h_cd TEXT,
+    elect_date TIMESTAMP,
+    date_1000 TIMESTAMP,
+    PRIMARY KEY (amend_id, filing_id, form_type, rec_type)
+);
+
+-- CalAccess/DATA/CVR_LOBBY_DISCLOSURE_CD.TSV  (doc table: CVR_LOBBY_DISCLOSURE)
+CREATE TABLE IF NOT EXISTS cvr_lobby_disclosure_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    sender_id TEXT,
+    filer_id TEXT,
+    entity_cd TEXT,
+    filer_naml TEXT,
+    filer_namf TEXT,
+    filer_namt TEXT,
+    filer_nams TEXT,
+    report_num TEXT,
+    rpt_date TIMESTAMP,
+    from_date TIMESTAMP,
+    thru_date TIMESTAMP,
+    cum_beg_dt TIMESTAMP,
+    firm_id TEXT,
+    firm_name TEXT,
+    firm_city TEXT,
+    firm_st TEXT,
+    firm_zip4 TEXT,
+    firm_phon TEXT,
+    mail_city TEXT,
+    mail_st TEXT,
+    mail_zip4 TEXT,
+    mail_phon TEXT,
+    sig_date TIMESTAMP,
+    sig_loc TEXT,
+    sig_naml TEXT,
+    sig_namf TEXT,
+    sig_namt TEXT,
+    sig_nams TEXT,
+    prn_naml TEXT,
+    prn_namf TEXT,
+    prn_namt TEXT,
+    prn_nams TEXT,
+    sig_title TEXT,
+    nopart1_cb TEXT,
+    nopart2_cb TEXT,
+    part1_1_cb TEXT,
+    part1_2_cb TEXT,
+    ctrib_n_cb TEXT,
+    ctrib_y_cb TEXT,
+    lby_actvty TEXT,
+    lobby_n_cb TEXT,
+    lobby_y_cb TEXT,
+    major_naml TEXT,
+    major_namf TEXT,
+    major_namt TEXT,
+    major_nams TEXT,
+    rcpcmte_nm TEXT,
+    rcpcmte_id TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, rec_type)
+);
+
+-- CalAccess/DATA/CVR_REGISTRATION_CD.TSV  (doc table: CVR_REGISTRATION)
+CREATE TABLE IF NOT EXISTS cvr_registration_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    sender_id TEXT,
+    filer_id TEXT,
+    entity_cd TEXT,
+    filer_naml TEXT,
+    filer_namf TEXT,
+    filer_namt TEXT,
+    filer_nams TEXT,
+    report_num TEXT,
+    rpt_date TIMESTAMP,
+    ls_beg_yr TEXT,
+    ls_end_yr TEXT,
+    qual_date TIMESTAMP,
+    eff_date TIMESTAMP,
+    bus_city TEXT,
+    bus_st TEXT,
+    bus_zip4 TEXT,
+    bus_phon TEXT,
+    bus_fax TEXT,
+    bus_email TEXT,
+    mail_city TEXT,
+    mail_st TEXT,
+    mail_zip4 TEXT,
+    mail_phon TEXT,
+    sig_date TIMESTAMP,
+    sig_loc TEXT,
+    sig_naml TEXT,
+    sig_namf TEXT,
+    sig_namt TEXT,
+    sig_nams TEXT,
+    prn_naml TEXT,
+    prn_namf TEXT,
+    prn_namt TEXT,
+    prn_nams TEXT,
+    sig_title TEXT,
+    stmt_firm TEXT,
+    ind_cb TEXT,
+    bus_cb TEXT,
+    trade_cb TEXT,
+    oth_cb TEXT,
+    a_b_name TEXT,
+    a_b_city TEXT,
+    a_b_st TEXT,
+    a_b_zip4 TEXT,
+    descrip_1 TEXT,
+    descrip_2 TEXT,
+    c_less50 TEXT,
+    c_more50 TEXT,
+    ind_class TEXT,
+    ind_descr TEXT,
+    bus_class TEXT,
+    bus_descr TEXT,
+    auth_name TEXT,
+    auth_city TEXT,
+    auth_st TEXT,
+    auth_zip4 TEXT,
+    lobby_int TEXT,
+    influen_yn TEXT,
+    firm_name TEXT,
+    newcert_cb TEXT,
+    rencert_cb TEXT,
+    complet_dt TIMESTAMP,
+    lby_reg_cb TEXT,
+    lby_604_cb TEXT,
+    st_leg_yn TEXT,
+    st_agency TEXT,
+    lobby_cb TEXT,
+    l_firm_cb TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, rec_type)
+);
+
+-- CalAccess/DATA/CVR_SO_CD.TSV  (doc table: CVR_SO)
+CREATE TABLE IF NOT EXISTS cvr_so_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    filer_id TEXT,
+    entity_cd TEXT,
+    filer_naml TEXT,
+    filer_namf TEXT,
+    filer_namt TEXT,
+    filer_nams TEXT,
+    report_num TEXT,
+    rpt_date TIMESTAMP,
+    qual_cb TEXT,
+    qualfy_dt TIMESTAMP,
+    term_date TIMESTAMP,
+    city TEXT,
+    st TEXT,
+    zip4 TEXT,
+    phone TEXT,
+    county_res TEXT,
+    county_act TEXT,
+    mail_city TEXT,
+    mail_st TEXT,
+    mail_zip4 TEXT,
+    cmte_fax TEXT,
+    cmte_email TEXT,
+    tres_naml TEXT,
+    tres_namf TEXT,
+    tres_namt TEXT,
+    tres_nams TEXT,
+    tres_city TEXT,
+    tres_st TEXT,
+    tres_zip4 TEXT,
+    tres_phon TEXT,
+    actvty_lvl TEXT,
+    com82013yn TEXT,
+    com82013nm TEXT,
+    com82013id TEXT,
+    control_cb TEXT,
+    bank_nam TEXT,
+    bank_adr1 TEXT,
+    bank_adr2 TEXT,
+    bank_city TEXT,
+    bank_st TEXT,
+    bank_zip4 TEXT,
+    bank_phon TEXT,
+    acct_opendt TIMESTAMP,
+    surplusdsp TEXT,
+    primfc_cb TEXT,
+    genpurp_cb TEXT,
+    gpc_descr TEXT,
+    sponsor_cb TEXT,
+    brdbase_cb TEXT,
+    smcont_qualdt TIMESTAMP,
+    PRIMARY KEY (amend_id, filing_id, form_type, rec_type)
+);
+
+-- CalAccess/DATA/DEBT_CD.TSV  (doc table: DEBT)
+CREATE TABLE IF NOT EXISTS debt_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    tran_id TEXT,
+    entity_cd TEXT,
+    payee_naml TEXT,
+    payee_namf TEXT,
+    payee_namt TEXT,
+    payee_nams TEXT,
+    payee_city TEXT,
+    payee_st TEXT,
+    payee_zip4 TEXT,
+    beg_bal NUMERIC(12,2),
+    amt_incur NUMERIC(12,2),
+    amt_paid NUMERIC(12,2),
+    end_bal NUMERIC(12,2),
+    expn_code TEXT,
     expn_dscr TEXT,
-    amount NUMERIC(15,2),
-    loan_id VARCHAR(30),
-    memo_code VARCHAR(10),
-    memo_refno VARCHAR(30),
-    payor_naml VARCHAR(120),
-    payor_namf VARCHAR(30),
-    payor_namt VARCHAR(40),
-    payor_nams VARCHAR(30),
-    payor_city VARCHAR(40),
-    payor_st CHAR(2),
-    payor_zip4 VARCHAR(10),
-    refund_to_naml VARCHAR(120),
-    refund_to_namf VARCHAR(30),
-    refund_to_namt VARCHAR(40),
-    refund_to_nams VARCHAR(30),
-    refund_to_city VARCHAR(40),
-    refund_to_st CHAR(2),
-    refund_to_zip4 VARCHAR(10),
-    filer_id VARCHAR(20),
-    PRIMARY KEY (filing_id, amend_id, line_item)
-) PARTITION BY RANGE (exppn_date);
+    cmte_id TEXT,
+    tres_naml TEXT,
+    tres_namf TEXT,
+    tres_namt TEXT,
+    tres_nams TEXT,
+    tres_city TEXT,
+    tres_st TEXT,
+    tres_zip4 TEXT,
+    memo_code TEXT,
+    memo_refno TEXT,
+    bakref_tid TEXT,
+    xref_schnm TEXT,
+    xref_match TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
 
-CREATE TABLE exppd_cd_y2018 PARTITION OF exppd_cd
-    FOR VALUES FROM ('2018-01-01') TO ('2019-01-01');
-CREATE TABLE exppd_cd_y2019 PARTITION OF exppd_cd
-    FOR VALUES FROM ('2019-01-01') TO ('2020-01-01');
-CREATE TABLE exppd_cd_y2020 PARTITION OF exppd_cd
-    FOR VALUES FROM ('2020-01-01') TO ('2021-01-01');
-CREATE TABLE exppd_cd_y2021 PARTITION OF exppd_cd
-    FOR VALUES FROM ('2021-01-01') TO ('2022-01-01');
-CREATE TABLE exppd_cd_y2022 PARTITION OF exppd_cd
-    FOR VALUES FROM ('2022-01-01') TO ('2023-01-01');
-CREATE TABLE exppd_cd_y2023 PARTITION OF exppd_cd
-    FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
-CREATE TABLE exppd_cd_y2024 PARTITION OF exppd_cd
-    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
-CREATE TABLE exppd_cd_y2025 PARTITION OF exppd_cd
-    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
-CREATE TABLE exppd_cd_y2026 PARTITION OF exppd_cd
-    FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
-CREATE TABLE exppd_cd_y2027 PARTITION OF exppd_cd
-    FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');
+-- CalAccess/DATA/EFS_FILING_LOG_CD.TSV  (doc table: EFS_FILING_LOG)
+CREATE TABLE IF NOT EXISTS efs_filing_log_cd (
+    id BIGSERIAL,
+    filing_date TIMESTAMP,
+    filingstatus TEXT,
+    vendor TEXT,
+    filer_id TEXT,
+    form_type TEXT,
+    error_no TEXT,
+    PRIMARY KEY (id)
+);
 
-CREATE INDEX idx_exppd_cd_filing_id ON exppd_cd(filing_id);
-CREATE INDEX idx_exppd_cd_filer_id ON exppd_cd(filer_id);
-CREATE INDEX idx_exppd_cd_payee_naml ON exppd_cd(payee_naml) WHERE payee_naml IS NOT NULL;
-CREATE INDEX idx_exppd_cd_payor_naml ON exppd_cd(payor_naml) WHERE payor_naml IS NOT NULL;
-CREATE INDEX idx_exppd_cd_amount ON exppd_cd(amount) WHERE amount > 0;
-COMMENT ON TABLE exppd_cd IS 'Expenditures — PARTITIONED BY expn_date';
-
--- LOAN_CD — Loans Received/Made
-CREATE TABLE loans_cd (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
+-- CalAccess/DATA/EXPN_CD.TSV  (doc table: EXPN)
+CREATE TABLE IF NOT EXISTS expn_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
     line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    loan_type VARCHAR(10),
-    entity_cd VARCHAR(10),
-    lnr_naml VARCHAR(120),
-    lnr_namf VARCHAR(30),
-    lnr_namt VARCHAR(40),
-    lnr_nams VARCHAR(30),
-    loan_city VARCHAR(40),
-    loan_st CHAR(2),
-    loan_zip4 VARCHAR(10),
-    loan_amt NUMERIC(15,2),
-    loan_dt DATE,
-    interest_rt NUMERIC(7,4),
-    interest_yn BOOLEAN,
-    repmt_amt NUMERIC(15,2),
-    repmt_dt DATE,
-    loan_purpose TEXT,
-    balance_due NUMERIC(15,2),
-    repmt_schedule TEXT,
-    memo_code VARCHAR(10),
-    memo_refno VARCHAR(30),
-    filer_id VARCHAR(20),
-    cmte_id VARCHAR(20),
-    payor_naml VARCHAR(120),
-    payor_namf VARCHAR(30),
-    payor_namt VARCHAR(40),
-    payor_nams VARCHAR(30),
-    payor_city VARCHAR(40),
-    payor_st CHAR(2),
-    payor_zip4 VARCHAR(10),
-    PRIMARY KEY (filing_id, amend_id, line_item)
-) PARTITION BY RANGE (loan_dt);
-
-CREATE TABLE loans_cd_y2018 PARTITION OF loans_cd
-    FOR VALUES FROM ('2018-01-01') TO ('2019-01-01');
-CREATE TABLE loans_cd_y2019 PARTITION OF loans_cd
-    FOR VALUES FROM ('2019-01-01') TO ('2020-01-01');
-CREATE TABLE loans_cd_y2020 PARTITION OF loans_cd
-    FOR VALUES FROM ('2020-01-01') TO ('2021-01-01');
-CREATE TABLE loans_cd_y2021 PARTITION OF loans_cd
-    FOR VALUES FROM ('2021-01-01') TO ('2022-01-01');
-CREATE TABLE loans_cd_y2022 PARTITION OF loans_cd
-    FOR VALUES FROM ('2022-01-01') TO ('2023-01-01');
-CREATE TABLE loans_cd_y2023 PARTITION OF loans_cd
-    FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
-CREATE TABLE loans_cd_y2024 PARTITION OF loans_cd
-    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
-CREATE TABLE loans_cd_y2025 PARTITION OF loans_cd
-    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
-CREATE TABLE loans_cd_y2026 PARTITION OF loans_cd
-    FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
-CREATE TABLE loans_cd_y2027 PARTITION OF loans_cd
-    FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');
-
-CREATE INDEX idx_loans_cd_filing_id ON loans_cd(filing_id);
-CREATE INDEX idx_loans_cd_cmte_id ON loans_cd(cmte_id);
-CREATE INDEX idx_loans_cd_loan_dt ON loans_cd(loan_dt);
-CREATE INDEX idx_loans_cd_loan_amt ON loans_cd(loan_amt) WHERE loan_amt > 0;
-COMMENT ON TABLE loans_cd IS 'Loans received/made — PARTITIONED BY loan_dt';
-
--- INTTRF_CD — Inter-Committee Transfers
-CREATE TABLE inttrf_cd (
-    tran_id VARCHAR(30) NOT NULL PRIMARY KEY,
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    entitty_cd VARCHAR(10),
-    tran_dt DATE,
-    amount NUMERIC(15,2),
-    tran_type VARCHAR(10),
-    cmte_id VARCHAR(20) REFERENCES filers(filer_id),
-    cmte_name VARCHAR(120),
-    cmte_addr VARCHAR(80),
-    cmte_city VARCHAR(40),
-    cmte_st CHAR(2),
-    cmte_zip4 VARCHAR(10),
-    ref_dt DATE,
-    ref_amt NUMERIC(15,2),
-    memo_code VARCHAR(10),
-    memo_refno VARCHAR(30),
-    filer_id VARCHAR(20) REFERENCES filers(filer_id)
-);
-CREATE INDEX idx_inttrf_cd_filing_id ON inttrf_cd(filing_id);
-CREATE INDEX idx_inttrf_cd_tran_dt ON inttrf_cd(tran_dt);
-CREATE INDEX idx_inttrf_cd_amount ON inttrf_cd(amount) WHERE amount > 0;
-COMMENT ON TABLE inttrf_cd IS 'Inter-committee transfers';
-
--- DEBT_CD — Debts Owed
-CREATE TABLE debt_cd (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    entity_cd VARCHAR(10),
-    payee_naml VARCHAR(120),
-    payee_namf VARCHAR(30),
-    payee_namt VARCHAR(40),
-    payee_nams VARCHAR(30),
-    payee_city VARCHAR(40),
-    payee_st CHAR(2),
-    payee_zip4 VARCHAR(10),
-    beg_bal NUMERIC(15,2),
-    debts_inc NUMERIC(15,2),
-    debts_paid NUMERIC(15,2),
-    end_bal NUMERIC(15,2),
-    memo_code VARCHAR(10),
-    memo_refno VARCHAR(30),
-    filer_id VARCHAR(20),
-    PRIMARY KEY (filing_id, amend_id, line_item)
-);
-
-CREATE INDEX idx_debt_cd_filing_id ON debt_cd(filing_id);
-CREATE INDEX idx_debt_cd_filer_id ON debt_cd(filer_id);
-CREATE INDEX idx_debt_cd_end_bal ON debt_cd(end_bal) WHERE end_bal > 0;
-COMMENT ON TABLE debt_cd IS 'Debts owed';
-
--- ============================================================================
--- 5. Supporting Fact Tables (non-partitioned)
--- ============================================================================
-
--- SMRY_CD — Summary Records (per-filing totals)
-CREATE TABLE smry_cd (
-    filing_id VARCHAR(30) NOT NULL REFERENCES filings(filing_id),
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    amount_a NUMERIC(15,2),
-    amount_b NUMERIC(15,2),
-    amount_c NUMERIC(15,2),
-    elec_dt DATE,
-    PRIMARY KEY (filing_id, amend_id, line_item)
-);
-CREATE INDEX idx_smry_cd_elec_dt ON smry_cd(elec_dt);
-COMMENT ON TABLE smry_cd IS 'Filing summary totals';
-
--- SPLT_CD — Split Records
-CREATE TABLE splts_cd (
-    filing_id VARCHAR(30) NOT NULL REFERENCES filings(filing_id),
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    pform_type VARCHAR(10),
-    ptran_id VARCHAR(30),
-    elec_date DATE,
-    elec_amount NUMERIC(15,2),
-    elec_code VARCHAR(10),
-    PRIMARY KEY (filing_id, amend_id, line_item)
-);
-COMMENT ON TABLE splts_cd IS 'Split records (allocations across candidates/measures)';
-
--- TEXT_MEMO_CD — Text Memos
-CREATE TABLE text_memo (
-    filing_id VARCHAR(30) NOT NULL REFERENCES filings(filing_id),
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    ref_no VARCHAR(30),
-    text4000 TEXT,
-    PRIMARY KEY (filing_id, amend_id, line_item)
-);
-COMMENT ON TABLE text_memo IS 'Text memo descriptions (up to 4000 chars)';
-
--- ============================================================================
--- 6. Disclosure Reports (CVR)
--- ============================================================================
-
--- CVR Campaign Disclosure (F496)
-CREATE TABLE cvr_campaign_disclosure (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    filer_id VARCHAR(20) REFERENCES filers(filer_id),
-    entity_cd VARCHAR(10),
-    filer_naml VARCHAR(120),
-    filer_namf VARCHAR(30),
-    filer_namt VARCHAR(40),
-    filer_nams VARCHAR(30),
-    report_num INTEGER,
-    rpt_date DATE,
-    stmt_type VARCHAR(20),
-    late_rptno INTEGER,
-    from_date DATE,
-    thru_date DATE,
-    elect_date DATE,
-    cash_on_hand NUMERIC(15,2),
-    total_contributions NUMERIC(15,2),
-    total_expenditures NUMERIC(15,2),
-    loans_received NUMERIC(15,2),
-    loan_repayments NUMERIC(15,2),
-    other_loans NUMERIC(15,2),
-    other_payments NUMERIC(15,2),
-    debts_owed NUMERIC(15,2),
-    net_change NUMERIC(15,2),
-    coverage_type VARCHAR(20),
-    filing_status VARCHAR(20),
-    signatory_name VARCHAR(120),
-    signatory_title VARCHAR(60),
-    prepared_by VARCHAR(120),
-    prepared_phone VARCHAR(20),
-    PRIMARY KEY (filing_id, amend_id, rec_type)
-);
-CREATE INDEX idx_cvr_cd_filer_id ON cvr_campaign_disclosure(filer_id);
-CREATE INDEX idx_cvr_cd_rpt_date ON cvr_campaign_disclosure(rpt_date);
-CREATE INDEX idx_cvr_cd_elect_date ON cvr_campaign_disclosure(elect_date);
-COMMENT ON TABLE cvr_campaign_disclosure IS 'F496 Campaign Disclosure Reports';
-
--- CVR Registration (F400)
-CREATE TABLE cvr_registration (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    sender_id VARCHAR(20),
-    filer_id VARCHAR(20) REFERENCES filers(filer_id),
-    entity_cd VARCHAR(10),
-    filer_naml VARCHAR(120),
-    filer_namf VARCHAR(30),
-    filer_namt VARCHAR(40),
-    filer_nams VARCHAR(30),
-    report_num INTEGER,
-    rpt_date DATE,
-    ls_beg_yr SMALLINT,
-    ls_end_yr SMALLINT,
-    committee_type VARCHAR(20),
-    cand_id VARCHAR(20),
-    cand_name VARCHAR(120),
-    cand_office VARCHAR(60),
-    cand_dist INTEGER,
-    cand_county VARCHAR(30),
-    cand_party VARCHAR(10),
-    cand_election_type VARCHAR(30),
-    cand_yr SMALLINT,
-    party VARCHAR(10),
-    auth_name VARCHAR(120),
-    auth_phone VARCHAR(20),
-    auth_address VARCHAR(80),
-    auth_city VARCHAR(40),
-    auth_st CHAR(2),
-    auth_zip4 VARCHAR(10),
-    mail_addr VARCHAR(80),
-    mail_city VARCHAR(40),
-    mail_st CHAR(2),
-    mail_zip4 VARCHAR(10),
-    incrb_dt DATE,
-    incrb_state VARCHAR(20),
-    treas_name VARCHAR(120),
-    treas_phone VARCHAR(20),
-    treas_address VARCHAR(80),
-    treas_city VARCHAR(40),
-    treas_st CHAR(2),
-    treas_zip4 VARCHAR(10),
-    filing_sequence INTEGER,
-    coverage_type VARCHAR(20),
-    filing_status VARCHAR(20),
-    signatory_name VARCHAR(120),
-    signatory_title VARCHAR(60),
-    PRIMARY KEY (filing_id, amend_id, rec_type)
-);
-CREATE INDEX idx_cvr_reg_filer_id ON cvr_registration(filer_id);
-COMMENT ON TABLE cvr_registration IS 'F400 Committee Registration';
-
--- CVR Statement of Organization (F460)
-CREATE TABLE cvr_so (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    filer_id VARCHAR(20) REFERENCES filers(filer_id),
-    entity_cd VARCHAR(10),
-    filer_naml VARCHAR(120),
-    filer_namf VARCHAR(30),
-    filer_namt VARCHAR(40),
-    filer_nams VARCHAR(30),
-    report_num INTEGER,
-    rpt_date DATE,
-    qual_cb BOOLEAN,
-    qualfy_dt DATE,
-    term_date DATE,
-    term_code VARCHAR(20),
-    filing_sequence INTEGER,
-    coverage_type VARCHAR(20),
-    filing_status VARCHAR(20),
-    PRIMARY KEY (filing_id, amend_id, rec_type)
-);
-CREATE INDEX idx_cvr_so_filer_id ON cvr_so(filer_id);
-COMMENT ON TABLE cvr_so IS 'F460 Statement of Organization';
-
--- CVR Lobbying Disclosure (F455)
-CREATE TABLE cvr_lobby_disclosure (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    sender_id VARCHAR(20),
-    filer_id VARCHAR(20) REFERENCES filers(filer_id),
-    entity_cd VARCHAR(10),
-    filer_naml VARCHAR(120),
-    filer_namf VARCHAR(30),
-    filer_namt VARCHAR(40),
-    filer_nams VARCHAR(30),
-    report_num INTEGER,
-    rpt_date DATE,
-    from_date DATE,
-    thru_date DATE,
-    lby_orgn_naml VARCHAR(120),
-    lby_orgn_namf VARCHAR(30),
-    lby_orgn_namt VARCHAR(40),
-    lby_orgn_nams VARCHAR(30),
-    lby_orgn_adr VARCHAR(80),
-    lby_orgn_city VARCHAR(40),
-    lby_orgn_st CHAR(2),
-    lby_orgn_zip4 VARCHAR(10),
-    lby_orgn_phon VARCHAR(20),
-    lby_orgn_fax VARCHAR(20),
-    lby_orgn_email VARCHAR(100),
-    principal_id VARCHAR(20),
-    principal_name VARCHAR(120),
-    principal_adr VARCHAR(80),
-    principal_city VARCHAR(40),
-    principal_st CHAR(2),
-    principal_zip4 VARCHAR(10),
-    lby_reg_id VARCHAR(30),
-    lby_reg_name VARCHAR(120),
-    filing_sequence INTEGER,
-    coverage_type VARCHAR(20),
-    filing_status VARCHAR(20),
-    PRIMARY KEY (filing_id, amend_id, rec_type)
-);
-CREATE INDEX idx_cvr_ld_filer_id ON cvr_lobby_disclosure(filer_id);
-CREATE INDEX idx_cvr_ld_lby_reg_id ON cvr_lobby_disclosure(lby_reg_id);
-COMMENT ON TABLE cvr_lobby_disclosure IS 'F455 Lobbying Disclosure Reports';
-
--- CVR2 Campaign Disclosure (Compact)
-CREATE TABLE cvr2_campaign_disclosure (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    entity_cd VARCHAR(10),
-    title VARCHAR(60),
-    mail_city VARCHAR(40),
-    mail_st CHAR(2),
-    mail_zip4 VARCHAR(10),
-    f460_part VARCHAR(10),
-    cmte_id VARCHAR(20),
-    enty_naml VARCHAR(120),
-    enty_namf VARCHAR(30),
-    enty_naml_search VARCHAR(200),
-    enty_namf_search VARCHAR(200),
-    enty_city VARCHAR(40),
-    enty_st CHAR(2),
-    enty_zip4 VARCHAR(10),
-    enty_phone VARCHAR(20),
-    enty_fax VARCHAR(20),
-    enty_email VARCHAR(100),
-    item_amt NUMERIC(15,2),
-    item_dt DATE,
-    item_desc TEXT,
-    PRIMARY KEY (filing_id, amend_id, line_item)
-);
-CREATE INDEX idx_cvr2_cd_cmte_id ON cvr2_campaign_disclosure(cmte_id);
-CREATE INDEX idx_cvr2_cd_item_dt ON cvr2_campaign_disclosure(item_dt);
-COMMENT ON TABLE cvr2_campaign_disclosure IS 'Compact campaign disclosure (F496 Part 2)';
-
--- CVR2 Lobbying Disclosure (Compact)
-CREATE TABLE cvr2_lobby_disclosure (
-    amend_id VARCHAR(30),
-    entity_cd VARCHAR(10),
-    entity_id VARCHAR(30),
-    enty_namf VARCHAR(30),
-    enty_naml VARCHAR(120),
-    enty_nams VARCHAR(30),
-    enty_namt VARCHAR(40),
-    enty_title VARCHAR(60),
-    filing_id VARCHAR(30),
-    form_type VARCHAR(10),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    PRIMARY KEY (filing_id, amend_id, line_item)
-);
-COMMENT ON TABLE cvr2_lobby_disclosure IS 'Compact lobbying disclosure';
-
--- CVR2 Registration (Compact)
-CREATE TABLE cvr2_registration (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    entity_cd VARCHAR(10),
-    entity_id VARCHAR(30),
-    enty_naml VARCHAR(120),
-    enty_namf VARCHAR(30),
-    enty_namt VARCHAR(40),
-    enty_nams VARCHAR(30),
-    PRIMARY KEY (filing_id, amend_id, line_item)
-);
-COMMENT ON TABLE cvr2_registration IS 'Compact registration';
-
--- CVR2 SO (Compact)
-CREATE TABLE cvr2_so (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    entity_cd VARCHAR(10),
-    enty_naml VARCHAR(120),
-    enty_namf VARCHAR(30),
-    enty_namt VARCHAR(40),
-    enty_nams VARCHAR(30),
-    item_cd VARCHAR(10),
-    mail_city VARCHAR(40),
-    mail_st CHAR(2),
-    mail_zip4 VARCHAR(10),
-    PRIMARY KEY (filing_id, amend_id, line_item)
-);
-COMMENT ON TABLE cvr2_so IS 'Compact statement of organization';
-
--- CVR3 Verification Info
-CREATE TABLE cvr3_verification_info (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    entity_cd VARCHAR(10),
-    sig_date DATE,
-    sig_loc VARCHAR(80),
-    sig_naml VARCHAR(120),
-    sig_namf VARCHAR(30),
-    sig_namt VARCHAR(40),
-    sig_nams VARCHAR(30),
-    PRIMARY KEY (filing_id, amend_id, line_item)
-);
-COMMENT ON TABLE cvr3_verification_info IS 'E-filing verification signatures';
-
--- CVR E-530 (Political Candidate Statements)
-CREATE TABLE cvr_e530 (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    entity_cd VARCHAR(10),
-    filer_naml VARCHAR(120),
-    filer_namf VARCHAR(30),
-    filer_namt VARCHAR(40),
-    filer_nams VARCHAR(30),
-    report_num INTEGER,
-    rpt_date DATE,
-    filer_city VARCHAR(40),
-    filer_st CHAR(2),
-    filer_zip4 VARCHAR(10),
-    occupation VARCHAR(70),
-    employer VARCHAR(120),
-    cand_id VARCHAR(20),
-    cand_naml VARCHAR(120),
-    cand_namf VARCHAR(30),
-    cand_namt VARCHAR(40),
-    cand_nams VARCHAR(30),
-    cand_office VARCHAR(60),
-    cand_dist INTEGER,
-    cand_county VARCHAR(30),
-    cand_party VARCHAR(10),
-    cand_election_type VARCHAR(30),
-    cand_yr SMALLINT,
-    cash_on_hand NUMERIC(15,2),
-    contributions NUMERIC(15,2),
-    expenditures NUMERIC(15,2),
-    debts_owed NUMERIC(15,2),
-    coverage_type VARCHAR(20),
-    filing_status VARCHAR(20),
-    PRIMARY KEY (filing_id, amend_id, rec_type)
-);
-CREATE INDEX idx_cvr_e530_cand_id ON cvr_e530(cand_id);
-CREATE INDEX idx_cvr_e530_cand_office ON cvr_e530(cand_office);
-COMMENT ON TABLE cvr_e530 IS 'E-530 Political Candidate Statements';
-
--- CVR F-470 (Contribution/Expenditure Schedule)
-CREATE TABLE cvr_f470 (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    filer_id VARCHAR(20),
-    entity_cd VARCHAR(10),
-    filer_naml VARCHAR(120),
-    filer_namf VARCHAR(30),
-    filer_namt VARCHAR(40),
-    filer_nams VARCHAR(30),
-    report_num INTEGER,
-    rpt_date DATE,
-    cand_city VARCHAR(40),
-    cand_st CHAR(2),
-    cand_zip4 VARCHAR(10),
-    occupation VARCHAR(70),
-    employer VARCHAR(120),
-    cand_office VARCHAR(60),
-    cand_dist INTEGER,
-    cand_county VARCHAR(30),
-    cand_party VARCHAR(10),
-    cand_election_type VARCHAR(30),
-    cand_yr SMALLINT,
-    PRIMARY KEY (filing_id, amend_id, rec_type)
-);
-CREATE INDEX idx_cvr_f470_filer_id ON cvr_f470(filer_id);
-COMMENT ON TABLE cvr_f470 IS 'F-470 Contribution/Expenditure Schedule';
-
--- ============================================================================
--- 7. Schedule Tables (Form-Specific)
--- ============================================================================
-
--- S401_CD — Schedule S401 (Independent Expenditures)
-CREATE TABLE s401_cd (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    agent_naml VARCHAR(120),
-    agent_namf VARCHAR(30),
-    agent_namt VARCHAR(40),
-    agent_nams VARCHAR(30),
-    payee_naml VARCHAR(120),
-    payee_namf VARCHAR(30),
-    payee_namt VARCHAR(40),
-    payee_nams VARCHAR(30),
-    payee_city VARCHAR(40),
-    payee_st CHAR(2),
-    payee_zip4 VARCHAR(10),
-    expn_date DATE,
-    expn_amt NUMERIC(15,2),
+    rec_type TEXT,
+    form_type TEXT,
+    tran_id TEXT,
+    entity_cd TEXT,
+    payee_naml TEXT,
+    payee_namf TEXT,
+    payee_namt TEXT,
+    payee_nams TEXT,
+    payee_city TEXT,
+    payee_st TEXT,
+    payee_zip4 TEXT,
+    expn_date TIMESTAMP,
+    amount NUMERIC(12,2),
+    cum_ytd NUMERIC(12,2),
+    cum_oth NUMERIC(12,2),
+    expn_chkno TEXT,
+    expn_code TEXT,
     expn_dscr TEXT,
-    memo_code VARCHAR(10),
-    memo_refno VARCHAR(30),
-    filer_id VARCHAR(20),
-    cmte_id VARCHAR(20),
-    coverage_type VARCHAR(20),
-    filing_status VARCHAR(20),
-    PRIMARY KEY (filing_id, amend_id, line_item)
+    agent_naml TEXT,
+    agent_namf TEXT,
+    agent_namt TEXT,
+    agent_nams TEXT,
+    cmte_id TEXT,
+    tres_naml TEXT,
+    tres_namf TEXT,
+    tres_namt TEXT,
+    tres_nams TEXT,
+    tres_city TEXT,
+    tres_st TEXT,
+    tres_zip4 TEXT,
+    cand_naml TEXT,
+    cand_namf TEXT,
+    cand_namt TEXT,
+    cand_nams TEXT,
+    office_cd TEXT,
+    offic_dscr TEXT,
+    juris_cd TEXT,
+    juris_dscr TEXT,
+    dist_no TEXT,
+    off_s_h_cd TEXT,
+    bal_name TEXT,
+    bal_num TEXT,
+    bal_juris TEXT,
+    sup_opp_cd TEXT,
+    memo_code TEXT,
+    memo_refno TEXT,
+    bakref_tid TEXT,
+    g_from_e_f TEXT,
+    xref_schnm TEXT,
+    xref_match TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
 );
-CREATE INDEX idx_s401_filer_id ON s401_cd(filer_id);
-CREATE INDEX idx_s401_cmte_id ON s401_cd(cmte_id);
-CREATE INDEX idx_s401_expn_date ON s401_cd(expn_date);
-CREATE INDEX idx_s401_expn_amt ON s401_cd(expn_amt) WHERE expn_amt > 0;
-COMMENT ON TABLE s401_cd IS 'Schedule S401 — Independent Expenditures';
+CREATE INDEX IF NOT EXISTS idx_expn_cd_cmte_id ON expn_cd (cmte_id);
+CREATE INDEX IF NOT EXISTS idx_expn_cd_payee_naml ON expn_cd (payee_naml);
 
--- S496_CD — Schedule S496 (Small Contributions/Expenditures)
-CREATE TABLE s496_cd (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
+-- CalAccess/DATA/F495P2_CD.TSV  (doc table: F495P2)
+CREATE TABLE IF NOT EXISTS f495p2_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
     line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    amount NUMERIC(15,2),
-    exp_date DATE,
-    expn_dscr TEXT,
-    memo_code VARCHAR(10),
-    memo_refno VARCHAR(30),
-    date_thru DATE,
-    PRIMARY KEY (filing_id, amend_id, line_item)
+    rec_type TEXT,
+    form_type TEXT,
+    elect_date TIMESTAMP,
+    electjuris TEXT,
+    contribamt NUMERIC(12,2),
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
 );
-CREATE INDEX idx_s496_exp_date ON s496_cd(exp_date);
-COMMENT ON TABLE s496_cd IS 'Schedule S496 — Small Contributions/Expenditures';
 
--- S497_CD — Schedule S497 (Large Contributions)
-CREATE TABLE s497_cd (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
+-- CalAccess/DATA/F501_502_CD.TSV  (doc table: F501_502)
+CREATE TABLE IF NOT EXISTS f501_502_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    filer_id TEXT,
+    committee_id TEXT,
+    entity_cd INTEGER,
+    report_num TEXT,
+    rpt_date TIMESTAMP,
+    stmt_type INTEGER,
+    from_date TIMESTAMP,
+    thru_date TIMESTAMP,
+    elect_date TIMESTAMP,
+    cand_naml TEXT,
+    cand_namf TEXT,
+    can_namm TEXT,
+    cand_namt TEXT,
+    cand_nams TEXT,
+    moniker_pos INTEGER,
+    moniker TEXT,
+    cand_city TEXT,
+    cand_st TEXT,
+    cand_zip4 TEXT,
+    cand_phon TEXT,
+    cand_fax TEXT,
+    cand_email TEXT,
+    fin_naml TEXT,
+    fin_namf TEXT,
+    fin_namt TEXT,
+    fin_nams TEXT,
+    fin_city TEXT,
+    fin_st TEXT,
+    fin_zip4 TEXT,
+    fin_phon TEXT,
+    fin_fax TEXT,
+    fin_email TEXT,
+    office_cd INTEGER,
+    offic_dscr TEXT,
+    agency_nam TEXT,
+    juris_cd INTEGER,
+    juris_dscr TEXT,
+    dist_no TEXT,
+    party TEXT,
+    yr_of_elec INTEGER,
+    elec_type INTEGER,
+    execute_dt TIMESTAMP,
+    can_sig TEXT,
+    account_no TEXT,
+    acct_op_dt TIMESTAMP,
+    party_cd INTEGER,
+    district_cd INTEGER,
+    accept_limit_yn TEXT,
+    did_exceed_dt TIMESTAMP,
+    cntrb_prsnl_fnds_dt TEXT,
+    PRIMARY KEY (amend_id, filing_id)
+);
+
+-- CalAccess/DATA/F690P2_CD.TSV  (doc table: F690P2)
+CREATE TABLE IF NOT EXISTS f690p2_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
     line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    entity_cd VARCHAR(10),
-    enty_naml VARCHAR(120),
-    enty_namf VARCHAR(30),
-    enty_namt VARCHAR(40),
-    enty_nams VARCHAR(30),
-    enty_city VARCHAR(40),
-    enty_st CHAR(2),
-    enty_zip4 VARCHAR(10),
-    ctrib_emp VARCHAR(120),
-    ctrib_occ VARCHAR(70),
-    amount NUMERIC(15,2),
-    receipt_dt DATE,
-    memo_code VARCHAR(10),
-    memo_refno VARCHAR(30),
-    filer_id VARCHAR(20),
-    coverage_type VARCHAR(20),
-    filing_status VARCHAR(20),
-    PRIMARY KEY (filing_id, amend_id, line_item)
-);
-CREATE INDEX idx_s497_filer_id ON s497_cd(filer_id);
-CREATE INDEX idx_s497_receipt_dt ON s497_cd(receipt_dt);
-CREATE INDEX idx_s497_amount ON s497_cd(amount) WHERE amount > 1000;
-COMMENT ON TABLE s497_cd IS 'Schedule S497 — Large Contributions (> $1,000)';
-
--- S498_CD — Schedule S498 (Large Expenditures)
-CREATE TABLE s498_cd (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    entity_cd VARCHAR(10),
-    cmte_id VARCHAR(20),
-    payor_naml VARCHAR(120),
-    payor_namf VARCHAR(30),
-    payor_namt VARCHAR(40),
-    payor_nams VARCHAR(30),
-    payor_city VARCHAR(40),
-    payor_st CHAR(2),
-    payor_zip4 VARCHAR(10),
-    expn_date DATE,
-    expn_amt NUMERIC(15,2),
-    expn_dscr TEXT,
-    memo_code VARCHAR(10),
-    memo_refno VARCHAR(30),
-    filer_id VARCHAR(20),
-    coverage_type VARCHAR(20),
-    filing_status VARCHAR(20),
-    PRIMARY KEY (filing_id, amend_id, line_item)
-);
-CREATE INDEX idx_s498_filer_id ON s498_cd(filer_id);
-CREATE INDEX idx_s498_cmte_id ON s498_cd(cmte_id);
-CREATE INDEX idx_s498_expn_date ON s498_cd(expn_date);
-CREATE INDEX idx_s498_expn_amt ON s498_cd(expn_amt) WHERE expn_amt > 10000;
-COMMENT ON TABLE s498_cd IS 'Schedule S498 — Large Expenditures (> $10,000)';
-
--- F-495 Part 2 (Candidate Contributions)
-CREATE TABLE f495p2 (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    elect_date DATE,
-    electjuris VARCHAR(30),
-    contribamt NUMERIC(15,2),
-    PRIMARY KEY (filing_id, amend_id, line_item)
-);
-CREATE INDEX idx_f495p2_elect_date ON f495p2(elect_date);
-COMMENT ON TABLE f495p2 IS 'F-495 Part 2 — Candidate Contributions';
-
--- F-501/F-502 (Report of Organization/Candidate)
-CREATE TABLE f501_502 (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    filer_id VARCHAR(20),
-    committee_id VARCHAR(20),
-    entity_cd VARCHAR(10),
-    report_num INTEGER,
-    rpt_date DATE,
-    stmt_type VARCHAR(20),
-    from_date DATE,
-    thru_date DATE,
-    elect_date DATE,
-    cand_naml VARCHAR(120),
-    cand_namf VARCHAR(30),
-    cand_namt VARCHAR(40),
-    cand_nams VARCHAR(30),
-    cand_city VARCHAR(40),
-    cand_st CHAR(2),
-    cand_zip4 VARCHAR(10),
-    cand_office VARCHAR(60),
-    cand_dist INTEGER,
-    cand_county VARCHAR(30),
-    cand_party VARCHAR(10),
-    cand_election_type VARCHAR(30),
-    cand_yr SMALLINT,
-    party VARCHAR(10),
-    treas_naml VARCHAR(120),
-    treas_namf VARCHAR(30),
-    treas_namt VARCHAR(40),
-    treas_nams VARCHAR(30),
-    treas_city VARCHAR(40),
-    treas_st CHAR(2),
-    treas_zip4 VARCHAR(10),
-    treas_phone VARCHAR(20),
-    incrb_dt DATE,
-    incrb_state VARCHAR(20),
-    auth_naml VARCHAR(120),
-    auth_namf VARCHAR(30),
-    auth_namt VARCHAR(40),
-    auth_nams VARCHAR(30),
-    auth_city VARCHAR(40),
-    auth_st CHAR(2),
-    auth_zip4 VARCHAR(10),
-    auth_phone VARCHAR(20),
-    coverage_type VARCHAR(20),
-    filing_status VARCHAR(20),
-    PRIMARY KEY (filing_id, amend_id, rec_type)
-);
-CREATE INDEX idx_f501_502_filer_id ON f501_502(filer_id);
-CREATE INDEX idx_f501_502_cand_office ON f501_502(cand_office);
-COMMENT ON TABLE f501_502 IS 'F-501/F-502 Report of Organization/Candidate';
-
--- F-690 Part 2 (Lobbying Amendments)
-CREATE TABLE f690p2 (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    exec_date DATE,
-    from_date DATE,
-    thru_date DATE,
+    rec_type TEXT,
+    form_type TEXT,
+    exec_date TIMESTAMP,
+    from_date TIMESTAMP,
+    thru_date TIMESTAMP,
     chg_parts TEXT,
     chg_sects TEXT,
     amend_txt1 TEXT,
-    PRIMARY KEY (filing_id, amend_id, line_item)
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
 );
-COMMENT ON TABLE f690p2 IS 'F-690 Part 2 — Lobbying Amendments';
 
--- ============================================================================
--- 8. Expenditure & Payment Tables
--- ============================================================================
-
--- LATT_CD — Late-Attest Payments
-CREATE TABLE latt_cd (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    entity_cd VARCHAR(10),
-    recip_naml VARCHAR(120),
-    recip_namf VARCHAR(30),
-    recip_namt VARCHAR(40),
-    recip_nams VARCHAR(30),
-    recip_city VARCHAR(40),
-    recip_st CHAR(2),
-    recip_zip4 VARCHAR(10),
-    pmt_date DATE,
-    pmt_amt NUMERIC(15,2),
-    pmt_type VARCHAR(10),
-    memo_code VARCHAR(10),
-    memo_refno VARCHAR(30),
-    filer_id VARCHAR(20),
-    PRIMARY KEY (filing_id, amend_id, line_item)
+-- CalAccess/DATA/FILERNAME_CD.TSV  (doc table: FILER_NAMES)
+CREATE TABLE IF NOT EXISTS filername_cd (
+    id BIGSERIAL,
+    xref_filer_id TEXT,
+    filer_id INTEGER,
+    filer_type TEXT,
+    status TEXT,
+    effect_dt TIMESTAMP,
+    naml TEXT,
+    namf TEXT,
+    namt TEXT,
+    nams TEXT,
+    adr1 TEXT,
+    adr2 TEXT,
+    city TEXT,
+    st TEXT,
+    zip4 TEXT,
+    phon TEXT,
+    fax TEXT,
+    email TEXT,
+    PRIMARY KEY (id)
 );
-CREATE INDEX idx_latt_filer_id ON latt_cd(filer_id);
-CREATE INDEX idx_latt_pmt_date ON latt_cd(pmt_date);
-COMMENT ON TABLE latt_cd IS 'Late-Attest Payments';
 
--- LPAY_CD — Loan Payments
-CREATE TABLE lpay_cd (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    entity_cd VARCHAR(10),
-    emplr_naml VARCHAR(120),
-    emplr_namf VARCHAR(30),
-    emplr_namt VARCHAR(40),
-    emplr_nams VARCHAR(30),
-    emplr_city VARCHAR(40),
-    emplr_st CHAR(2),
-    emplr_zip4 VARCHAR(10),
-    emplr_phon VARCHAR(20),
-    loan_id VARCHAR(30),
-    repmt_amt NUMERIC(15,2),
-    repmt_dt DATE,
-    memo_code VARCHAR(10),
-    memo_refno VARCHAR(30),
-    filer_id VARCHAR(20),
-    PRIMARY KEY (filing_id, amend_id, line_item)
+-- CalAccess/DATA/FILERS_CD.TSV  (doc table: FILERS)
+CREATE TABLE IF NOT EXISTS filers_cd (
+    filer_id INTEGER,
+    PRIMARY KEY (filer_id)
 );
-CREATE INDEX idx_lpay_filer_id ON lpay_cd(filer_id);
-CREATE INDEX idx_lpay_loan_id ON lpay_cd(loan_id);
-CREATE INDEX idx_lpay_repmt_dt ON lpay_cd(repmt_dt);
-COMMENT ON TABLE lpay_cd IS 'Loan Payments';
 
--- LCCM_CD — Campaign Committee Memo Payments
-CREATE TABLE lccm_cd (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    entity_cd VARCHAR(10),
-    recip_naml VARCHAR(120),
-    recip_namf VARCHAR(30),
-    recip_namt VARCHAR(40),
-    recip_nams VARCHAR(30),
-    recip_city VARCHAR(40),
-    recip_st CHAR(2),
-    recip_zip4 VARCHAR(10),
-    recip_id VARCHAR(30),
-    pmt_date DATE,
-    pmt_amt NUMERIC(15,2),
-    pmt_type VARCHAR(10),
-    memo_code VARCHAR(10),
-    memo_refno VARCHAR(30),
-    filer_id VARCHAR(20),
-    PRIMARY KEY (filing_id, amend_id, line_item)
+-- CalAccess/DATA/FILER_ACRONYMS_CD.TSV  (doc table: FILER_ACRONYMS)
+CREATE TABLE IF NOT EXISTS filer_acronyms_cd (
+    acronym TEXT,
+    filer_id INTEGER,
+    PRIMARY KEY (acronym, filer_id)
 );
-CREATE INDEX idx_lccm_filer_id ON lccm_cd(filer_id);
-CREATE INDEX idx_lccm_recip_id ON lccm_cd(recip_id);
-COMMENT ON TABLE lccm_cd IS 'Campaign Committee Memo Payments';
 
--- LEXP_CD — Lobbying Expenditures
-CREATE TABLE lexp_cd (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    recsubtype VARCHAR(10),
-    entity_cd VARCHAR(10),
-    payee_naml VARCHAR(120),
-    payee_namf VARCHAR(30),
-    payee_namt VARCHAR(40),
-    payee_nams VARCHAR(30),
-    payee_city VARCHAR(40),
-    payee_st CHAR(2),
-    payee_zip4 VARCHAR(10),
-    payee_phon VARCHAR(20),
-    payee_fax VARCHAR(20),
-    payee_email VARCHAR(100),
-    expn_date DATE,
-    expn_amt NUMERIC(15,2),
-    memo_code VARCHAR(10),
-    memo_refno VARCHAR(30),
-    filer_id VARCHAR(20),
-    PRIMARY KEY (filing_id, amend_id, line_item)
+-- CalAccess/DATA/FILER_ADDRESS_CD.TSV  (doc table: FILER_ADDRESS)
+CREATE TABLE IF NOT EXISTS filer_address_cd (
+    filer_id INTEGER,
+    adrid INTEGER,
+    effect_dt TIMESTAMP,
+    add_type INTEGER,
+    session_id INTEGER,
+    PRIMARY KEY (adrid, filer_id)
 );
-CREATE INDEX idx_lexp_filer_id ON lexp_cd(filer_id);
-CREATE INDEX idx_lexp_expn_date ON lexp_cd(expn_date);
-COMMENT ON TABLE lexp_cd IS 'Lobbying Expenditures';
 
--- LOTH_CD — Lobbyist Other Transactions
-CREATE TABLE loth_cd (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    tran_id VARCHAR(30),
-    firm_name VARCHAR(120),
-    firm_city VARCHAR(40),
-    firm_st CHAR(2),
-    firm_zip4 VARCHAR(10),
-    firm_phon VARCHAR(20),
-    subj_naml VARCHAR(120),
-    subj_namf VARCHAR(30),
-    subj_namt VARCHAR(40),
-    subj_nams VARCHAR(30),
-    subj_city VARCHAR(40),
-    subj_st CHAR(2),
-    subj_zip4 VARCHAR(10),
-    subj_phon VARCHAR(20),
-    subj_fax VARCHAR(20),
-    subj_email VARCHAR(100),
-    amount NUMERIC(15,2),
-    actv_dt DATE,
-    memo_code VARCHAR(10),
-    memo_refno VARCHAR(30),
-    filer_id VARCHAR(20),
-    PRIMARY KEY (filing_id, amend_id, line_item)
+-- CalAccess/DATA/FILER_ETHICS_CLASS_CD.TSV  (doc table: FILER_ETHICS_CLASS)
+CREATE TABLE IF NOT EXISTS filer_ethics_class_cd (
+    filer_id INTEGER,
+    session_id INTEGER,
+    ethics_date TIMESTAMP,
+    PRIMARY KEY (ethics_date, filer_id, session_id)
 );
-CREATE INDEX idx_loth_filer_id ON loth_cd(filer_id);
-CREATE INDEX idx_loth_actv_dt ON loth_cd(actv_dt);
-COMMENT ON TABLE loth_cd IS 'Lobbyist Other Transactions';
 
--- ============================================================================
--- 9. Lobbying Tables
--- ============================================================================
-
--- LEMP_CD — Lobbyist Employment/Activities
-CREATE TABLE lemp_cd (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    line_item INTEGER,
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    client_id VARCHAR(20),
-    cli_naml VARCHAR(120),
-    cli_namf VARCHAR(30),
-    cli_namt VARCHAR(40),
-    cli_nams VARCHAR(30),
-    cli_city VARCHAR(40),
-    cli_st CHAR(2),
-    cli_zip4 VARCHAR(10),
-    cli_phon VARCHAR(20),
-    eff_date DATE,
-    termination_dt DATE,
-    lby_reg_id VARCHAR(30),
-    lby_reg_name VARCHAR(120),
-    lby_firm_id VARCHAR(20),
-    lby_firm_name VARCHAR(120),
-    lby_firm_city VARCHAR(40),
-    lby_firm_st CHAR(2),
-    lby_firm_zip4 VARCHAR(10),
-    lby_firm_phon VARCHAR(20),
-    lby_firm_fax VARCHAR(20),
-    lby_firm_email VARCHAR(100),
-    activities_desc TEXT,
-    memo_code VARCHAR(10),
-    memo_refno VARCHAR(30),
-    filer_id VARCHAR(20),
-    PRIMARY KEY (filing_id, amend_id, line_item)
-);
-CREATE INDEX idx_lemp_filer_id ON lemp_cd(filer_id);
-CREATE INDEX idx_lemp_lby_reg_id ON lemp_cd(lby_reg_id);
-CREATE INDEX idx_lemp_lby_firm_id ON lemp_cd(lby_firm_id);
-CREATE INDEX idx_lemp_eff_date ON lemp_cd(eff_date);
-COMMENT ON TABLE lemp_cd IS 'Lobbyist Employment/Activities';
-
--- LOBBY_AMENDMENTS_CD — Lobbying Amendment Log
-CREATE TABLE lobby_amendments (
-    filing_id VARCHAR(30) NOT NULL,
-    amend_id VARCHAR(30),
-    rec_type VARCHAR(10),
-    form_type VARCHAR(10),
-    exec_date DATE,
-    from_date DATE,
-    thru_date DATE,
-    add_l_cb VARCHAR(5),
-    add_l_eff VARCHAR(10),
-    a_l_naml VARCHAR(120),
-    a_l_namf VARCHAR(30),
-    a_l_namt VARCHAR(40),
-    a_l_nams VARCHAR(30),
-    del_l_cb VARCHAR(5),
-    del_l_eff VARCHAR(10),
-    d_l_naml VARCHAR(120),
-    d_l_namf VARCHAR(30),
-    d_l_namt VARCHAR(40),
-    d_l_nams VARCHAR(30),
-    mod_l_cb VARCHAR(5),
-    mod_l_eff VARCHAR(10),
-    m_l_naml VARCHAR(120),
-    m_l_namf VARCHAR(30),
-    m_l_namt VARCHAR(40),
-    m_l_nams VARCHAR(30),
-    amend_desc TEXT,
-    filer_id VARCHAR(20),
-    principal_id VARCHAR(20),
-    principal_name VARCHAR(120),
-    PRIMARY KEY (filing_id, amend_id, rec_type)
-);
-CREATE INDEX idx_lobby_amend_filer_id ON lobby_amendments(filer_id);
-COMMENT ON TABLE lobby_amendments IS 'Lobbying amendment log';
-
--- LOBBYING_CHG_LOG_CD — Lobbying Change Log
-CREATE TABLE lobbying_chg_log (
-    filer_id VARCHAR(20) NOT NULL,
-    change_no INTEGER NOT NULL,
-    session_id INTEGER REFERENCES legislative_sessions(session_id),
-    log_dt TIMESTAMPTZ,
-    filer_type VARCHAR(20),
-    correction_flg BOOLEAN,
-    action VARCHAR(30),
-    attribute_changed VARCHAR(60),
-    ethics_dt DATE,
-    interests TEXT,
-    filer_full_name VARCHAR(120),
-    filer_city VARCHAR(40),
-    filer_st CHAR(2),
-    filer_zip VARCHAR(10),
-    filer_phone VARCHAR(20),
-    PRIMARY KEY (filer_id, change_no)
-);
-CREATE INDEX idx_lobby_chg_log_filer_id ON lobbying_chg_log(filer_id);
-CREATE INDEX idx_lobby_chg_log_session ON lobbying_chg_log(session_id);
-COMMENT ON TABLE lobbying_chg_log IS 'Lobbying change history log';
-
--- LOBBYIST_CONTRIBUTIONS tables (3 periods — merged into one)
-CREATE TABLE lobbyist_contributions (
-    filer_id VARCHAR(20) NOT NULL,
-    filing_period_start_dt DATE,
-    filing_period_end_dt DATE,
-    contribution_dt DATE,
-    recipient_name VARCHAR(120),
-    recipient_id VARCHAR(30),
-    amount NUMERIC(15,2),
-    source_period VARCHAR(10), -- '1', '2', or '3'
-    PRIMARY KEY (filer_id, contribution_dt, recipient_id, source_period)
-);
-CREATE INDEX idx_lob_contrib_filer ON lobbyist_contributions(filer_id);
-CREATE INDEX idx_lob_contrib_recipient ON lobbyist_contributions(recipient_id);
-CREATE INDEX idx_lob_contrib_period ON lobbyist_contributions(filing_period_start_dt);
-COMMENT ON TABLE lobbyist_contributions IS 'Lobbyist contributions (all periods merged)';
-
--- LOBBYIST_EMPLOYER tables (merged)
-CREATE TABLE lobbyist_employers (
-    employer_id VARCHAR(30) NOT NULL,
-    session_id INTEGER REFERENCES legislative_sessions(session_id),
-    employer_name VARCHAR(120),
-    current_qtr_amt NUMERIC(15,2),
-    session_total_amt NUMERIC(15,2),
-    contributor_id VARCHAR(30),
-    interest_cd VARCHAR(20),
-    interest_name VARCHAR(120),
-    session_yr_1 NUMERIC(15,2),
-    session_yr_2 NUMERIC(15,2),
-    yr_1_ytd_amt NUMERIC(15,2),
-    yr_2_ytd_amt NUMERIC(15,2),
-    qtr_1 NUMERIC(15,2),
-    qtr_2 NUMERIC(15,2),
-    qtr_3 NUMERIC(15,2),
-    qtr_4 NUMERIC(15,2),
-    qtr_5 NUMERIC(15,2),
-    yr_1_amt NUMERIC(15,2),
-    yr_2_amt NUMERIC(15,2),
-    total_amt NUMERIC(15,2),
-    termination_dt DATE,
-    PRIMARY KEY (employer_id)
-);
-CREATE INDEX idx_lob_emp_session ON lobbyist_employers(session_id);
-COMMENT ON TABLE lobbyist_employers IS 'Lobbyist employer records';
-
--- LOBBYIST_EMPLOYER_FIRMS tables (merged)
-CREATE TABLE lobbyist_employer_firms (
-    employer_id VARCHAR(30) NOT NULL,
-    firm_id VARCHAR(20) NOT NULL,
-    firm_name VARCHAR(120),
-    session_id INTEGER REFERENCES legislative_sessions(session_id),
-    termination_dt DATE,
-    PRIMARY KEY (employer_id, firm_id)
-);
-CREATE INDEX idx_lob_emp_firm ON lobbyist_employer_firms(firm_id);
-COMMENT ON TABLE lobbyist_employer_firms IS 'Lobbyist employer-firm relationships';
-
--- LOBBYIST_EMP_LOBBYIST tables (merged)
-CREATE TABLE lobbyist_employer_lobbyist (
-    lobbyist_id VARCHAR(20) NOT NULL,
-    employer_id VARCHAR(30) NOT NULL,
-    lobbyist_last_name VARCHAR(60),
-    lobbyist_first_name VARCHAR(60),
-    employer_name VARCHAR(120),
-    session_id INTEGER REFERENCES legislative_sessions(session_id),
-    PRIMARY KEY (lobbyist_id, employer_id)
-);
-CREATE INDEX idx_lob_emp_lob_employer ON lobbyist_employer_lobbyist(employer_id);
-COMMENT ON TABLE lobbyist_employer_lobbyist IS 'Lobbyist-employer relationships';
-
--- LOBBYIST_FIRM tables (merged)
-CREATE TABLE lobbyist_firms (
-    firm_id VARCHAR(20) NOT NULL PRIMARY KEY,
-    session_id INTEGER REFERENCES legislative_sessions(session_id),
-    firm_name VARCHAR(120),
-    current_qtr_amt NUMERIC(15,2),
-    session_total_amt NUMERIC(15,2),
-    contributor_id VARCHAR(30),
-    session_yr_1 NUMERIC(15,2),
-    session_yr_2 NUMERIC(15,2),
-    yr_1_ytd_amt NUMERIC(15,2),
-    yr_2_ytd_amt NUMERIC(15,2),
-    qtr_1 NUMERIC(15,2),
-    qtr_2 NUMERIC(15,2),
-    qtr_3 NUMERIC(15,2),
-    qtr_4 NUMERIC(15,2),
-    qtr_5 NUMERIC(15,2),
-    yr_1_amt NUMERIC(15,2),
-    yr_2_amt NUMERIC(15,2),
-    total_amt NUMERIC(15,2)
-);
-CREATE INDEX idx_lob_firm_session ON lobbyist_firms(session_id);
-COMMENT ON TABLE lobbyist_firms IS 'Lobbyist firm records';
-
--- LOBBYIST_FIRM_EMPLOYER tables (merged)
-CREATE TABLE lobbyist_firm_employer (
-    firm_id VARCHAR(20) NOT NULL,
-    filing_id VARCHAR(30) NOT NULL,
+-- CalAccess/DATA/FILER_FILINGS_CD.TSV  (doc table: FILER_FILINGS)
+CREATE TABLE IF NOT EXISTS filer_filings_cd (
+    filer_id INTEGER,
+    filing_id INTEGER,
+    period_id INTEGER,
+    form_id TEXT,
     filing_sequence INTEGER,
-    firm_name VARCHAR(120),
-    employer_name VARCHAR(120),
-    rpt_start DATE,
-    rpt_end DATE,
-    per_total NUMERIC(15,2),
-    cum_total NUMERIC(15,2),
+    filing_date TIMESTAMP,
+    stmnt_type INTEGER,
+    stmnt_status INTEGER,
+    session_id INTEGER,
+    user_id TEXT,
+    special_audit INTEGER,
+    fine_audit INTEGER,
+    rpt_start TIMESTAMP,
+    rpt_end TIMESTAMP,
+    rpt_date TIMESTAMP,
+    filing_type TEXT,
+    PRIMARY KEY (filer_id, filing_id, filing_sequence, form_id)
+);
+
+-- CalAccess/DATA/FILER_INTERESTS_CD.TSV  (doc table: FILER_INTERESTS)
+CREATE TABLE IF NOT EXISTS filer_interests_cd (
+    filer_id INTEGER,
+    session_id INTEGER,
+    interest_cd INTEGER,
+    effect_date TIMESTAMP,
+    PRIMARY KEY (effect_date, filer_id, interest_cd, session_id)
+);
+
+-- CalAccess/DATA/FILER_LINKS_CD.TSV  (doc table: FILER_LINKS)
+CREATE TABLE IF NOT EXISTS filer_links_cd (
+    filer_id_a INTEGER,
+    filer_id_b INTEGER,
+    active_flg TEXT,
+    session_id INTEGER,
+    link_type INTEGER,
+    link_desc TEXT,
+    effect_dt TIMESTAMP,
+    dominate_filer TEXT,
+    termination_dt TIMESTAMP,
+    PRIMARY KEY (active_flg, filer_id_a, filer_id_b, link_type, session_id)
+);
+
+-- CalAccess/DATA/FILER_STATUS_TYPES_CD.TSV  (doc table: FILER_STATUS_TYPES)
+CREATE TABLE IF NOT EXISTS filer_status_types_cd (
+    status_type TEXT,
+    status_desc TEXT,
+    PRIMARY KEY (status_type)
+);
+
+-- CalAccess/DATA/FILER_TO_FILER_TYPE_CD.TSV  (doc table: FILER_TO_FILER_TYPE)
+CREATE TABLE IF NOT EXISTS filer_to_filer_type_cd (
+    filer_id INTEGER,
+    filer_type INTEGER,
+    active TEXT,
+    race INTEGER,
+    session_id INTEGER,
+    category INTEGER,
+    category_type INTEGER,
+    sub_category INTEGER,
+    effect_dt TIMESTAMP,
+    sub_category_type INTEGER,
+    election_type INTEGER,
+    sub_category_a TEXT,
+    nyq_dt TIMESTAMP,
+    party_cd INTEGER,
+    county_cd INTEGER,
+    district_cd INTEGER,
+    PRIMARY KEY (effect_dt, filer_id, filer_type, session_id)
+);
+
+-- CalAccess/DATA/FILER_TYPES_CD.TSV  (doc table: FILER_TYPES)
+CREATE TABLE IF NOT EXISTS filer_types_cd (
+    filer_type INTEGER,
+    description TEXT,
+    grp_type INTEGER,
+    calc_use TEXT,
+    grace_period INTEGER,
+    PRIMARY KEY (filer_type)
+);
+
+-- CalAccess/DATA/FILER_TYPE_PERIODS_CD.TSV  (doc table: FILER_TYPE_PERIODS)
+CREATE TABLE IF NOT EXISTS filer_type_periods_cd (
+    election_type INTEGER,
+    filer_type INTEGER,
+    period_id INTEGER,
+    PRIMARY KEY (election_type, filer_type, period_id)
+);
+
+-- CalAccess/DATA/FILER_XREF_CD.TSV  (doc table: FILER_XREF)
+CREATE TABLE IF NOT EXISTS filer_xref_cd (
+    filer_id INTEGER,
+    xref_id TEXT,
+    effect_dt TIMESTAMP,
+    migration_source TEXT,
+    PRIMARY KEY (filer_id, xref_id)
+);
+
+-- CalAccess/DATA/FILINGS_CD.TSV  (doc table: FILINGS)
+CREATE TABLE IF NOT EXISTS filings_cd (
+    filing_id INTEGER,
+    filing_type INTEGER,
+    PRIMARY KEY (filing_id)
+);
+
+-- CalAccess/DATA/FILING_PERIOD_CD.TSV  (doc table: FILING_PERIOD)
+CREATE TABLE IF NOT EXISTS filing_period_cd (
+    period_id INTEGER,
+    start_date TIMESTAMP,
+    end_date TIMESTAMP,
+    period_type INTEGER,
+    per_grp_type INTEGER,
+    period_desc TEXT,
+    deadline TIMESTAMP,
+    PRIMARY KEY (period_id)
+);
+
+-- CalAccess/DATA/GROUP_TYPES_CD.TSV  (doc table: GROUP_TYPES)
+CREATE TABLE IF NOT EXISTS group_types_cd (
+    grp_id INTEGER,
+    grp_name TEXT,
+    grp_desc TEXT,
+    PRIMARY KEY (grp_id)
+);
+
+-- CalAccess/DATA/HDR_CD.TSV  (doc table: HDR)
+CREATE TABLE IF NOT EXISTS hdr_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    rec_type TEXT,
+    ef_type TEXT,
+    state_cd TEXT,
+    cal_ver TEXT,
+    soft_name TEXT,
+    soft_ver TEXT,
+    hdrcomment TEXT,
+    PRIMARY KEY (amend_id, filing_id)
+);
+
+-- CalAccess/DATA/HEADER_CD.TSV  (doc table: HEADER)
+CREATE TABLE IF NOT EXISTS header_cd (
+    line_number INTEGER,
+    form_id TEXT,
+    rec_type TEXT,
+    section_label TEXT,
+    comments1 TEXT,
+    comments2 TEXT,
+    label TEXT,
+    column_a NUMERIC(12,2),
+    column_b NUMERIC(12,2),
+    column_c NUMERIC(12,2),
+    show_c INTEGER,
+    show_b INTEGER,
+    PRIMARY KEY (form_id, line_number, rec_type)
+);
+
+-- CalAccess/DATA/IMAGE_LINKS_CD.TSV  (doc table: IMAGE_LINKS)
+CREATE TABLE IF NOT EXISTS image_links_cd (
+    img_link_id INTEGER,
+    img_link_type INTEGER,
+    img_id INTEGER,
+    img_type INTEGER,
+    img_dt TIMESTAMP,
+    PRIMARY KEY (img_id, img_link_id)
+);
+
+-- CalAccess/DATA/LATT_CD.TSV  (doc table: LATT)
+CREATE TABLE IF NOT EXISTS latt_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    tran_id TEXT,
+    entity_cd TEXT,
+    recip_naml TEXT,
+    recip_namf TEXT,
+    recip_namt TEXT,
+    recip_nams TEXT,
+    recip_city TEXT,
+    recip_st TEXT,
+    recip_zip4 TEXT,
+    pmt_date TIMESTAMP,
+    amount NUMERIC(12,2),
+    cum_amt NUMERIC(12,2),
+    cumbeg_dt TIMESTAMP,
+    memo_code TEXT,
+    memo_refno TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+
+-- CalAccess/DATA/LCCM_CD.TSV  (doc table: LCCM)
+CREATE TABLE IF NOT EXISTS lccm_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    tran_id TEXT,
+    entity_cd TEXT,
+    recip_naml TEXT,
+    recip_namf TEXT,
+    recip_namt TEXT,
+    recip_nams TEXT,
+    recip_city TEXT,
+    recip_st TEXT,
+    recip_zip4 TEXT,
+    recip_id TEXT,
+    ctrib_naml TEXT,
+    ctrib_namf TEXT,
+    ctrib_namt TEXT,
+    ctrib_nams TEXT,
+    ctrib_date TIMESTAMP,
+    amount NUMERIC(12,2),
+    memo_code TEXT,
+    memo_refno TEXT,
+    bakref_tid TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+
+-- CalAccess/DATA/LEGISLATIVE_SESSIONS_CD.TSV  (doc table: LEGISLATIVE_SESSIONS)
+CREATE TABLE IF NOT EXISTS legislative_sessions_cd (
+    session_id INTEGER,
+    begin_date TIMESTAMP,
+    end_date TIMESTAMP,
+    PRIMARY KEY (session_id)
+);
+
+-- CalAccess/DATA/LEMP_CD.TSV  (doc table: LEMP)
+CREATE TABLE IF NOT EXISTS lemp_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    client_id TEXT,
+    cli_naml TEXT,
+    cli_namf TEXT,
+    cli_namt TEXT,
+    cli_nams TEXT,
+    cli_city TEXT,
+    cli_st TEXT,
+    cli_zip4 TEXT,
+    cli_phon TEXT,
+    eff_date TIMESTAMP,
+    con_period TEXT,
+    agencylist TEXT,
+    descrip TEXT,
+    subfirm_id TEXT,
+    sub_name TEXT,
+    sub_city TEXT,
+    sub_st TEXT,
+    sub_zip4 TEXT,
+    sub_phon TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+
+-- CalAccess/DATA/LEXP_CD.TSV  (doc table: LEXP)
+CREATE TABLE IF NOT EXISTS lexp_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    tran_id TEXT,
+    recsubtype TEXT,
+    entity_cd TEXT,
+    payee_naml TEXT,
+    payee_namf TEXT,
+    payee_namt TEXT,
+    payee_nams TEXT,
+    payee_city TEXT,
+    payee_st TEXT,
+    payee_zip4 TEXT,
+    credcardco TEXT,
+    bene_name TEXT,
+    bene_posit TEXT,
+    bene_amt TEXT,
+    expn_dscr TEXT,
+    expn_date TIMESTAMP,
+    amount NUMERIC(12,2),
+    memo_code TEXT,
+    memo_refno TEXT,
+    bakref_tid TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+
+-- CalAccess/DATA/LOAN_CD.TSV  (doc table: LOAN)
+CREATE TABLE IF NOT EXISTS loan_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    tran_id TEXT,
+    loan_type TEXT,
+    entity_cd TEXT,
+    lndr_naml TEXT,
+    lndr_namf TEXT,
+    lndr_namt TEXT,
+    lndr_nams TEXT,
+    loan_city TEXT,
+    loan_st TEXT,
+    loan_zip4 TEXT,
+    loan_date1 TIMESTAMP,
+    loan_date2 TIMESTAMP,
+    loan_amt1 NUMERIC(12,2),
+    loan_amt2 NUMERIC(12,2),
+    loan_amt3 NUMERIC(12,2),
+    loan_amt4 NUMERIC(12,2),
+    loan_rate TEXT,
+    loan_emp TEXT,
+    loan_occ TEXT,
+    loan_self TEXT,
+    cmte_id TEXT,
+    tres_naml TEXT,
+    tres_namf TEXT,
+    tres_namt TEXT,
+    tres_nams TEXT,
+    tres_city TEXT,
+    tres_st TEXT,
+    tres_zip4 TEXT,
+    intr_naml TEXT,
+    intr_namf TEXT,
+    intr_namt TEXT,
+    intr_nams TEXT,
+    intr_city TEXT,
+    intr_st TEXT,
+    intr_zip4 TEXT,
+    memo_code TEXT,
+    memo_refno TEXT,
+    bakref_tid TEXT,
+    xref_schnm TEXT,
+    xref_match TEXT,
+    loan_amt5 NUMERIC(12,2),
+    loan_amt6 NUMERIC(12,2),
+    loan_amt7 NUMERIC(12,2),
+    loan_amt8 NUMERIC(12,2),
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+
+-- CalAccess/DATA/LOBBYING_CHG_LOG_CD.TSV  (doc table: LOBBYING_CHG_LOG)
+CREATE TABLE IF NOT EXISTS lobbying_chg_log_cd (
+    filer_id INTEGER,
+    change_no INTEGER,
+    session_id INTEGER,
+    log_dt TIMESTAMP,
+    filer_type INTEGER,
+    correction_flg TEXT,
+    action TEXT,
+    attribute_changed TEXT,
+    ethics_dt TIMESTAMP,
+    interests TEXT,
+    filer_full_name TEXT,
+    filer_city TEXT,
+    filer_st TEXT,
+    filer_zip TEXT,
+    filer_phone TEXT,
+    entity_type INTEGER,
+    entity_name TEXT,
+    entity_city TEXT,
+    entity_st TEXT,
+    entity_zip TEXT,
+    entity_phone TEXT,
+    entity_id INTEGER,
+    responsible_officer TEXT,
+    effect_dt TIMESTAMP,
+    PRIMARY KEY (change_no, filer_id)
+);
+
+-- CalAccess/DATA/LOBBYIST_CONTRIBUTIONS1_CD.TSV  (doc table: LOBBYIST_CONTRIBUTIONS1)
+CREATE TABLE IF NOT EXISTS lobbyist_contributions1_cd (
+    id BIGSERIAL,
+    filer_id INTEGER,
+    filing_period_start_dt TIMESTAMP,
+    filing_period_end_dt TIMESTAMP,
+    contribution_dt TIMESTAMP,
+    recipient_name TEXT,
+    recipient_id INTEGER,
+    amount NUMERIC(12,2),
+    PRIMARY KEY (id)
+);
+CREATE INDEX IF NOT EXISTS idx_lobbyist_contributions1_cd_recipient_id ON lobbyist_contributions1_cd (recipient_id);
+CREATE INDEX IF NOT EXISTS idx_lobbyist_contributions1_cd_filer_id ON lobbyist_contributions1_cd (filer_id);
+
+-- CalAccess/DATA/LOBBYIST_CONTRIBUTIONS2_CD.TSV  (doc table: LOBBYIST_CONTRIBUTIONS2)
+CREATE TABLE IF NOT EXISTS lobbyist_contributions2_cd (
+    id BIGSERIAL,
+    filer_id INTEGER,
+    filing_period_start_dt TIMESTAMP,
+    filing_period_end_dt TIMESTAMP,
+    contribution_dt TIMESTAMP,
+    recipient_name TEXT,
+    recipient_id INTEGER,
+    amount NUMERIC(12,2),
+    PRIMARY KEY (id)
+);
+CREATE INDEX IF NOT EXISTS idx_lobbyist_contributions2_cd_recipient_id ON lobbyist_contributions2_cd (recipient_id);
+CREATE INDEX IF NOT EXISTS idx_lobbyist_contributions2_cd_filer_id ON lobbyist_contributions2_cd (filer_id);
+
+-- CalAccess/DATA/LOBBYIST_CONTRIBUTIONS3_CD.TSV  (doc table: LOBBYIST_CONTRIBUTIONS3)
+CREATE TABLE IF NOT EXISTS lobbyist_contributions3_cd (
+    id BIGSERIAL,
+    filer_id INTEGER,
+    filing_period_start_dt TIMESTAMP,
+    filing_period_end_dt TIMESTAMP,
+    contribution_dt TIMESTAMP,
+    recipient_name TEXT,
+    recipient_id INTEGER,
+    amount NUMERIC(12,2),
+    PRIMARY KEY (id)
+);
+CREATE INDEX IF NOT EXISTS idx_lobbyist_contributions3_cd_recipient_id ON lobbyist_contributions3_cd (recipient_id);
+CREATE INDEX IF NOT EXISTS idx_lobbyist_contributions3_cd_filer_id ON lobbyist_contributions3_cd (filer_id);
+
+-- CalAccess/DATA/LOBBYIST_EMPLOYER1_CD.TSV  (doc table: LOBBYIST_EMPLOYER1)
+CREATE TABLE IF NOT EXISTS lobbyist_employer1_cd (
+    id BIGSERIAL,
+    employer_id INTEGER,
+    session_id INTEGER,
+    employer_name TEXT,
+    current_qtr_amt NUMERIC(12,2),
+    session_total_amt NUMERIC(12,2),
+    contributor_id INTEGER,
+    interest_cd INTEGER,
+    interest_name TEXT,
+    session_yr_1 INTEGER,
+    session_yr_2 INTEGER,
+    yr_1_ytd_amt NUMERIC(12,2),
+    yr_2_ytd_amt NUMERIC(12,2),
+    qtr_1 NUMERIC(12,2),
+    qtr_2 NUMERIC(12,2),
+    qtr_3 NUMERIC(12,2),
+    qtr_4 NUMERIC(12,2),
+    qtr_5 NUMERIC(12,2),
+    qtr_6 NUMERIC(12,2),
+    qtr_7 NUMERIC(12,2),
+    qtr_8 NUMERIC(12,2),
+    PRIMARY KEY (id)
+);
+
+-- CalAccess/DATA/LOBBYIST_EMPLOYER2_CD.TSV  (doc table: LOBBYIST_EMPLOYER2)
+CREATE TABLE IF NOT EXISTS lobbyist_employer2_cd (
+    id BIGSERIAL,
+    employer_id INTEGER,
+    session_id INTEGER,
+    employer_name TEXT,
+    current_qtr_amt NUMERIC(12,2),
+    session_total_amt NUMERIC(12,2),
+    contributor_id INTEGER,
+    interest_cd INTEGER,
+    interest_name TEXT,
+    session_yr_1 INTEGER,
+    session_yr_2 INTEGER,
+    yr_1_ytd_amt NUMERIC(12,2),
+    yr_2_ytd_amt NUMERIC(12,2),
+    qtr_1 NUMERIC(12,2),
+    qtr_2 NUMERIC(12,2),
+    qtr_3 NUMERIC(12,2),
+    qtr_4 NUMERIC(12,2),
+    qtr_5 NUMERIC(12,2),
+    qtr_6 NUMERIC(12,2),
+    qtr_7 NUMERIC(12,2),
+    qtr_8 NUMERIC(12,2),
+    PRIMARY KEY (id)
+);
+
+-- CalAccess/DATA/LOBBYIST_EMPLOYER3_CD.TSV  (doc table: LOBBYIST_EMPLOYER3)
+CREATE TABLE IF NOT EXISTS lobbyist_employer3_cd (
+    id BIGSERIAL,
+    employer_id INTEGER,
+    session_id INTEGER,
+    employer_name TEXT,
+    current_qtr_amt NUMERIC(12,2),
+    session_total_amt NUMERIC(12,2),
+    contributor_id INTEGER,
+    interest_cd INTEGER,
+    interest_name TEXT,
+    session_yr_1 INTEGER,
+    session_yr_2 INTEGER,
+    yr_1_ytd_amt NUMERIC(12,2),
+    yr_2_ytd_amt NUMERIC(12,2),
+    qtr_1 NUMERIC(12,2),
+    qtr_2 NUMERIC(12,2),
+    qtr_3 NUMERIC(12,2),
+    qtr_4 NUMERIC(12,2),
+    qtr_5 NUMERIC(12,2),
+    qtr_6 NUMERIC(12,2),
+    qtr_7 NUMERIC(12,2),
+    qtr_8 NUMERIC(12,2),
+    PRIMARY KEY (id)
+);
+
+-- CalAccess/DATA/LOBBYIST_EMPLOYER_FIRMS1_CD.TSV  (doc table: LOBBYIST_EMPLOYER_FIRMS1)
+CREATE TABLE IF NOT EXISTS lobbyist_employer_firms1_cd (
+    id BIGSERIAL,
+    employer_id INTEGER,
+    firm_id INTEGER,
+    firm_name TEXT,
+    session_id INTEGER,
+    termination_dt TIMESTAMP,
+    PRIMARY KEY (id)
+);
+
+-- CalAccess/DATA/LOBBYIST_EMPLOYER_FIRMS2_CD.TSV  (doc table: LOBBYIST_EMPLOYER_FIRMS2)
+CREATE TABLE IF NOT EXISTS lobbyist_employer_firms2_cd (
+    id BIGSERIAL,
+    employer_id INTEGER,
+    firm_id INTEGER,
+    firm_name TEXT,
+    session_id INTEGER,
+    termination_dt TIMESTAMP,
+    PRIMARY KEY (id)
+);
+
+-- CalAccess/DATA/LOBBYIST_EMPLOYER_HISTORY_CD.TSV  (doc table: LOBBYIST_EMPLOYER_HISTORY)
+CREATE TABLE IF NOT EXISTS lobbyist_employer_history_cd (
+    id BIGSERIAL,
+    contributor_id INTEGER,
+    current_qtr_amt NUMERIC(12,2),
+    employer_id INTEGER,
+    employer_name TEXT,
+    interest_cd INTEGER,
+    interest_name TEXT,
+    qtr_1 NUMERIC(12,2),
+    qtr_2 NUMERIC(12,2),
+    qtr_3 NUMERIC(12,2),
+    qtr_4 NUMERIC(12,2),
+    qtr_5 NUMERIC(12,2),
+    qtr_6 NUMERIC(12,2),
+    qtr_7 NUMERIC(12,2),
+    qtr_8 NUMERIC(12,2),
+    session_id INTEGER,
+    session_total_amt NUMERIC(12,2),
+    session_yr_1 INTEGER,
+    session_yr_2 INTEGER,
+    yr_1_ytd_amt NUMERIC(12,2),
+    yr_2_ytd_amt NUMERIC(12,2),
+    PRIMARY KEY (id)
+);
+
+-- CalAccess/DATA/LOBBYIST_EMP_LOBBYIST1_CD.TSV  (doc table: LOBBYIST_EMP_LOBBYIST1)
+CREATE TABLE IF NOT EXISTS lobbyist_emp_lobbyist1_cd (
+    id BIGSERIAL,
+    lobbyist_id INTEGER,
+    employer_id INTEGER,
+    lobbyist_last_name TEXT,
+    lobbyist_first_name TEXT,
+    employer_name TEXT,
+    session_id INTEGER,
+    PRIMARY KEY (id)
+);
+
+-- CalAccess/DATA/LOBBYIST_EMP_LOBBYIST2_CD.TSV  (doc table: LOBBYIST_EMP_LOBBYIST2)
+CREATE TABLE IF NOT EXISTS lobbyist_emp_lobbyist2_cd (
+    id BIGSERIAL,
+    lobbyist_id INTEGER,
+    employer_id INTEGER,
+    lobbyist_last_name TEXT,
+    lobbyist_first_name TEXT,
+    employer_name TEXT,
+    session_id INTEGER,
+    PRIMARY KEY (id)
+);
+
+-- CalAccess/DATA/LOBBYIST_FIRM1_CD.TSV  (doc table: LOBBYIST_FIRM1)
+CREATE TABLE IF NOT EXISTS lobbyist_firm1_cd (
+    id BIGSERIAL,
+    firm_id INTEGER,
+    session_id INTEGER,
+    firm_name TEXT,
+    current_qtr_amt NUMERIC(12,2),
+    session_total_amt NUMERIC(12,2),
+    contributor_id INTEGER,
+    session_yr_1 INTEGER,
+    session_yr_2 INTEGER,
+    yr_1_ytd_amt NUMERIC(12,2),
+    yr_2_ytd_amt NUMERIC(12,2),
+    qtr_1 NUMERIC(12,2),
+    qtr_2 NUMERIC(12,2),
+    qtr_3 NUMERIC(12,2),
+    qtr_4 NUMERIC(12,2),
+    qtr_5 NUMERIC(12,2),
+    qtr_6 NUMERIC(12,2),
+    qtr_7 NUMERIC(12,2),
+    qtr_8 NUMERIC(12,2),
+    PRIMARY KEY (id)
+);
+
+-- CalAccess/DATA/LOBBYIST_FIRM2_CD.TSV  (doc table: LOBBYIST_FIRM2)
+CREATE TABLE IF NOT EXISTS lobbyist_firm2_cd (
+    id BIGSERIAL,
+    firm_id INTEGER,
+    session_id INTEGER,
+    firm_name TEXT,
+    current_qtr_amt NUMERIC(12,2),
+    session_total_amt NUMERIC(12,2),
+    contributor_id INTEGER,
+    session_yr_1 INTEGER,
+    session_yr_2 INTEGER,
+    yr_1_ytd_amt NUMERIC(12,2),
+    yr_2_ytd_amt NUMERIC(12,2),
+    qtr_1 NUMERIC(12,2),
+    qtr_2 NUMERIC(12,2),
+    qtr_3 NUMERIC(12,2),
+    qtr_4 NUMERIC(12,2),
+    qtr_5 NUMERIC(12,2),
+    qtr_6 NUMERIC(12,2),
+    qtr_7 NUMERIC(12,2),
+    qtr_8 NUMERIC(12,2),
+    PRIMARY KEY (id)
+);
+
+-- CalAccess/DATA/LOBBYIST_FIRM3_CD.TSV  (doc table: LOBBYIST_FIRM3)
+CREATE TABLE IF NOT EXISTS lobbyist_firm3_cd (
+    id BIGSERIAL,
+    firm_id INTEGER,
+    session_id INTEGER,
+    firm_name TEXT,
+    current_qtr_amt NUMERIC(12,2),
+    session_total_amt NUMERIC(12,2),
+    contributor_id INTEGER,
+    session_yr_1 INTEGER,
+    session_yr_2 INTEGER,
+    yr_1_ytd_amt NUMERIC(12,2),
+    yr_2_ytd_amt NUMERIC(12,2),
+    qtr_1 NUMERIC(12,2),
+    qtr_2 NUMERIC(12,2),
+    qtr_3 NUMERIC(12,2),
+    qtr_4 NUMERIC(12,2),
+    qtr_5 NUMERIC(12,2),
+    qtr_6 NUMERIC(12,2),
+    qtr_7 NUMERIC(12,2),
+    qtr_8 NUMERIC(12,2),
+    PRIMARY KEY (id)
+);
+
+-- CalAccess/DATA/LOBBYIST_FIRM_EMPLOYER1_CD.TSV  (doc table: LOBBYIST_FIRM_EMPLOYER1)
+CREATE TABLE IF NOT EXISTS lobbyist_firm_employer1_cd (
+    id BIGSERIAL,
+    firm_id INTEGER,
+    filing_id INTEGER,
+    filing_sequence INTEGER,
+    firm_name TEXT,
+    employer_name TEXT,
+    rpt_start TIMESTAMP,
+    rpt_end TIMESTAMP,
+    per_total NUMERIC(12,2),
+    cum_total NUMERIC(12,2),
     lby_actvty TEXT,
     ext_lby_actvty TEXT,
-    PRIMARY KEY (firm_id, filing_id)
-);
-COMMENT ON TABLE lobbyist_firm_employer IS 'Lobbyist firm-employer relationships';
-
--- LOBBYIST_FIRM_LOBBYIST tables (merged)
-CREATE TABLE lobbyist_firm_lobbyist (
-    lobbyist_id VARCHAR(20) NOT NULL,
-    firm_id VARCHAR(20) NOT NULL,
-    lobbyist_last_name VARCHAR(60),
-    lobbyist_first_name VARCHAR(60),
-    firm_name VARCHAR(120),
-    session_id INTEGER REFERENCES legislative_sessions(session_id),
-    PRIMARY KEY (lobbyist_id, firm_id)
-);
-CREATE INDEX idx_lob_firm_lob_firm ON lobbyist_firm_lobbyist(firm_id);
-COMMENT ON TABLE lobbyist_firm_lobbyist IS 'Lobbyist-firm relationships';
-
--- ============================================================================
--- 10. Ballot Measure Tables
--- ============================================================================
--- Source: SOS BALLOT_MEASURES_CD.TSV (calaccess.cdn.sos.ca.gov/dbwebexport.zip)
--- 6 columns, ~110 rows in historical data
-
-CREATE TABLE ballot_measures (
-    election_date DATE NOT NULL,
-    filer_id VARCHAR(20) NOT NULL,
-    measure_no VARCHAR(20) NOT NULL,
-    measure_name TEXT NOT NULL,
-    measure_short_name VARCHAR(200),
-    jurisdiction VARCHAR(60) NOT NULL,
-    PRIMARY KEY (election_date, measure_no)
+    PRIMARY KEY (id)
 );
 
-CREATE INDEX idx_ballot_msr_election ON ballot_measures(election_date);
-CREATE INDEX idx_ballot_msr_jurisdiction ON ballot_measures(jurisdiction);
-CREATE INDEX idx_ballot_msr_filer ON ballot_measures(filer_id);
+-- CalAccess/DATA/LOBBYIST_FIRM_EMPLOYER2_CD.TSV  (doc table: LOBBYIST_FIRM_EMPLOYER2)
+CREATE TABLE IF NOT EXISTS lobbyist_firm_employer2_cd (
+    id BIGSERIAL,
+    firm_id INTEGER,
+    filing_id INTEGER,
+    filing_sequence INTEGER,
+    firm_name TEXT,
+    employer_name TEXT,
+    rpt_start TIMESTAMP,
+    rpt_end TIMESTAMP,
+    per_total NUMERIC(12,2),
+    cum_total NUMERIC(12,2),
+    lby_actvty TEXT,
+    ext_lby_actvty TEXT,
+    PRIMARY KEY (id)
+);
 
+-- CalAccess/DATA/LOBBYIST_FIRM_HISTORY_CD.TSV  (doc table: LOBBYIST_FIRM_HISTORY)
+CREATE TABLE IF NOT EXISTS lobbyist_firm_history_cd (
+    id BIGSERIAL,
+    contributor_id INTEGER,
+    current_qtr_amt NUMERIC(12,2),
+    firm_id INTEGER,
+    firm_name TEXT,
+    qtr_1 NUMERIC(12,2),
+    qtr_2 NUMERIC(12,2),
+    qtr_3 NUMERIC(12,2),
+    qtr_4 NUMERIC(12,2),
+    qtr_5 NUMERIC(12,2),
+    qtr_6 NUMERIC(12,2),
+    qtr_7 NUMERIC(12,2),
+    qtr_8 NUMERIC(12,2),
+    session_id INTEGER,
+    session_total_amt NUMERIC(12,2),
+    session_yr_1 INTEGER,
+    session_yr_2 INTEGER,
+    yr_1_ytd_amt NUMERIC(12,2),
+    yr_2_ytd_amt NUMERIC(12,2),
+    PRIMARY KEY (id)
+);
 
-COMMENT ON COLUMN ballot_measures.election_date IS 'Date of the election (from real TSV: MM/DD/YYYY HH:MM:SS AM/PM)';
-COMMENT ON COLUMN ballot_measures.filer_id IS 'Filer ID associated with the measure';
-COMMENT ON COLUMN ballot_measures.measure_no IS 'Measure number (e.g., 1A, 1B, 5)';
-COMMENT ON COLUMN ballot_measures.measure_name IS 'Full measure name/description';
-COMMENT ON COLUMN ballot_measures.measure_short_name IS 'Short title (nullable)';
-COMMENT ON COLUMN ballot_measures.jurisdiction IS 'Geographic scope (Statewide, County, City, etc.)';
+-- CalAccess/DATA/LOBBYIST_FIRM_LOBBYIST1_CD.TSV  (doc table: LOBBYIST_FIRM_LOBBYIST1)
+CREATE TABLE IF NOT EXISTS lobbyist_firm_lobbyist1_cd (
+    id BIGSERIAL,
+    lobbyist_id INTEGER,
+    firm_id INTEGER,
+    lobbyist_last_name TEXT,
+    lobbyist_first_name TEXT,
+    firm_name TEXT,
+    session_id INTEGER,
+    PRIMARY KEY (id)
+);
 
--- 11. Election & Filing Calendar
+-- CalAccess/DATA/LOBBYIST_FIRM_LOBBYIST2_CD.TSV  (doc table: LOBBYIST_FIRM_LOBBYIST2)
+CREATE TABLE IF NOT EXISTS lobbyist_firm_lobbyist2_cd (
+    id BIGSERIAL,
+    lobbyist_id INTEGER,
+    firm_id INTEGER,
+    lobbyist_last_name TEXT,
+    lobbyist_first_name TEXT,
+    firm_name TEXT,
+    session_id INTEGER,
+    PRIMARY KEY (id)
+);
+
+-- CalAccess/DATA/LOBBY_AMENDMENTS_CD.TSV  (doc table: LOBBY_AMENDMENTS)
+CREATE TABLE IF NOT EXISTS lobby_amendments_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    exec_date TIMESTAMP,
+    from_date TIMESTAMP,
+    thru_date TIMESTAMP,
+    add_l_cb TEXT,
+    add_l_eff TIMESTAMP,
+    a_l_naml TEXT,
+    a_l_namf TEXT,
+    a_l_namt TEXT,
+    a_l_nams TEXT,
+    del_l_cb TEXT,
+    del_l_eff TIMESTAMP,
+    d_l_naml TEXT,
+    d_l_namf TEXT,
+    d_l_namt TEXT,
+    d_l_nams TEXT,
+    add_le_cb TEXT,
+    add_le_eff TIMESTAMP,
+    a_le_naml TEXT,
+    a_le_namf TEXT,
+    a_le_namt TEXT,
+    a_le_nams TEXT,
+    del_le_cb TEXT,
+    del_le_eff TIMESTAMP,
+    d_le_naml TEXT,
+    d_le_namf TEXT,
+    d_le_namt TEXT,
+    d_le_nams TEXT,
+    add_lf_cb TEXT,
+    add_lf_eff TIMESTAMP,
+    a_lf_name TEXT,
+    del_lf_cb TEXT,
+    del_lf_eff TIMESTAMP,
+    d_lf_name TEXT,
+    other_cb TEXT,
+    other_eff TIMESTAMP,
+    other_desc TEXT,
+    f606_yes TEXT,
+    f606_no TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, rec_type)
+);
+
+-- CalAccess/DATA/LOOKUP_CODES_CD.TSV  (doc table: LOOKUP_CODES)
+CREATE TABLE IF NOT EXISTS lookup_codes_cd (
+    code_type INTEGER,
+    code_id INTEGER,
+    code_desc TEXT,
+    PRIMARY KEY (code_id, code_type)
+);
+
+-- CalAccess/DATA/LOTH_CD.TSV  (doc table: LOTH)
+CREATE TABLE IF NOT EXISTS loth_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    tran_id TEXT,
+    firm_name TEXT,
+    firm_city TEXT,
+    firm_st TEXT,
+    firm_zip4 TEXT,
+    firm_phon TEXT,
+    subj_naml TEXT,
+    subj_namf TEXT,
+    subj_namt TEXT,
+    subj_nams TEXT,
+    pmt_date TIMESTAMP,
+    amount NUMERIC(12,2),
+    cum_amt NUMERIC(12,2),
+    memo_code TEXT,
+    memo_refno TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+
+-- CalAccess/DATA/LPAY_CD.TSV  (doc table: LPAY)
+CREATE TABLE IF NOT EXISTS lpay_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    tran_id TEXT,
+    entity_cd TEXT,
+    emplr_naml TEXT,
+    emplr_namf TEXT,
+    emplr_namt TEXT,
+    emplr_nams TEXT,
+    emplr_city TEXT,
+    emplr_st TEXT,
+    emplr_zip4 TEXT,
+    emplr_phon TEXT,
+    lby_actvty TEXT,
+    fees_amt NUMERIC(12,2),
+    reimb_amt NUMERIC(12,2),
+    advan_amt NUMERIC(12,2),
+    advan_dscr TEXT,
+    per_total NUMERIC(12,2),
+    cum_total NUMERIC(12,2),
+    memo_code TEXT,
+    memo_refno TEXT,
+    bakref_tid TEXT,
+    emplr_id TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+
+-- CalAccess/DATA/NAMES_CD.TSV  (doc table: NAMES)
+CREATE TABLE IF NOT EXISTS names_cd (
+    id BIGSERIAL,
+    namid INTEGER,
+    naml TEXT,
+    namf TEXT,
+    namt TEXT,
+    nams TEXT,
+    moniker TEXT,
+    moniker_pos INTEGER,
+    namm TEXT,
+    fullname TEXT,
+    naml_search TEXT,
+    PRIMARY KEY (id)
+);
+
+-- CalAccess/DATA/RCPT_CD.TSV  (doc table: RCPT)
+CREATE TABLE IF NOT EXISTS rcpt_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    tran_id TEXT,
+    entity_cd TEXT,
+    ctrib_naml TEXT,
+    ctrib_namf TEXT,
+    ctrib_namt TEXT,
+    ctrib_nams TEXT,
+    ctrib_city TEXT,
+    ctrib_st TEXT,
+    ctrib_zip4 TEXT,
+    ctrib_emp TEXT,
+    ctrib_occ TEXT,
+    ctrib_self TEXT,
+    tran_type TEXT,
+    rcpt_date TIMESTAMP,
+    date_thru TIMESTAMP,
+    amount NUMERIC(12,2),
+    cum_ytd NUMERIC(12,2),
+    cum_oth NUMERIC(12,2),
+    ctrib_dscr TEXT,
+    cmte_id TEXT,
+    tres_naml TEXT,
+    tres_namf TEXT,
+    tres_namt TEXT,
+    tres_nams TEXT,
+    tres_city TEXT,
+    tres_st TEXT,
+    tres_zip4 TEXT,
+    intr_naml TEXT,
+    intr_namf TEXT,
+    intr_namt TEXT,
+    intr_nams TEXT,
+    intr_city TEXT,
+    intr_st TEXT,
+    intr_zip4 TEXT,
+    intr_emp TEXT,
+    intr_occ TEXT,
+    intr_self TEXT,
+    cand_naml TEXT,
+    cand_namf TEXT,
+    cand_namt TEXT,
+    cand_nams TEXT,
+    office_cd TEXT,
+    offic_dscr TEXT,
+    juris_cd TEXT,
+    juris_dscr TEXT,
+    dist_no TEXT,
+    off_s_h_cd TEXT,
+    bal_name TEXT,
+    bal_num TEXT,
+    bal_juris TEXT,
+    sup_opp_cd TEXT,
+    memo_code TEXT,
+    memo_refno TEXT,
+    bakref_tid TEXT,
+    xref_schnm TEXT,
+    xref_match TEXT,
+    int_rate TEXT,
+    intr_cmteid TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+CREATE INDEX IF NOT EXISTS idx_rcpt_cd_cmte_id ON rcpt_cd (cmte_id);
+CREATE INDEX IF NOT EXISTS idx_rcpt_cd_ctrib_naml ON rcpt_cd (ctrib_naml);
+CREATE INDEX IF NOT EXISTS idx_rcpt_cd_rcpt_date ON rcpt_cd (rcpt_date);
+
+-- CalAccess/DATA/RECEIVED_FILINGS_CD.TSV  (doc table: RECEIVED_FILINGS)
+CREATE TABLE IF NOT EXISTS received_filings_cd (
+    id BIGSERIAL,
+    filer_id INTEGER,
+    filing_file_name TEXT,
+    received_date TIMESTAMP,
+    filing_directory TEXT,
+    filing_id INTEGER,
+    form_id TEXT,
+    receive_comment TEXT,
+    PRIMARY KEY (id)
+);
+
+-- CalAccess/DATA/REPORTS_CD.TSV  (doc table: REPORTS)
+CREATE TABLE IF NOT EXISTS reports_cd (
+    rpt_id INTEGER,
+    rpt_name TEXT,
+    rpt_desc_ TEXT,
+    path TEXT,
+    data_object TEXT,
+    parms_flg_y_n TEXT,
+    rpt_type INTEGER,
+    parm_definition INTEGER,
+    PRIMARY KEY (rpt_id)
+);
+
+-- CalAccess/DATA/S401_CD.TSV  (doc table: S401)
+CREATE TABLE IF NOT EXISTS s401_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    tran_id TEXT,
+    agent_naml TEXT,
+    agent_namf TEXT,
+    agent_namt TEXT,
+    agent_nams TEXT,
+    payee_naml TEXT,
+    payee_namf TEXT,
+    payee_namt TEXT,
+    payee_nams TEXT,
+    payee_city TEXT,
+    payee_st TEXT,
+    payee_zip4 TEXT,
+    amount NUMERIC(12,2),
+    aggregate NUMERIC(12,2),
+    expn_dscr TEXT,
+    cand_naml TEXT,
+    cand_namf TEXT,
+    cand_namt TEXT,
+    cand_nams TEXT,
+    office_cd TEXT,
+    offic_dscr TEXT,
+    juris_cd TEXT,
+    juris_dscr TEXT,
+    dist_no TEXT,
+    off_s_h_cd TEXT,
+    bal_name TEXT,
+    bal_num TEXT,
+    bal_juris TEXT,
+    sup_opp_cd TEXT,
+    memo_code TEXT,
+    memo_refno TEXT,
+    bakref_tid TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+
+-- CalAccess/DATA/S496_CD.TSV  (doc table: S496)
+CREATE TABLE IF NOT EXISTS s496_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    tran_id TEXT,
+    amount NUMERIC(12,2),
+    exp_date TIMESTAMP,
+    expn_dscr TEXT,
+    memo_code TEXT,
+    memo_refno TEXT,
+    date_thru TIMESTAMP,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+
+-- CalAccess/DATA/S497_CD.TSV  (doc table: S497)
+CREATE TABLE IF NOT EXISTS s497_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    tran_id TEXT,
+    entity_cd TEXT,
+    enty_naml TEXT,
+    enty_namf TEXT,
+    enty_namt TEXT,
+    enty_nams TEXT,
+    enty_city TEXT,
+    enty_st TEXT,
+    enty_zip4 TEXT,
+    ctrib_emp TEXT,
+    ctrib_occ TEXT,
+    ctrib_self TEXT,
+    elec_date TIMESTAMP,
+    ctrib_date TIMESTAMP,
+    date_thru TIMESTAMP,
+    amount NUMERIC(12,2),
+    cmte_id TEXT,
+    cand_naml TEXT,
+    cand_namf TEXT,
+    cand_namt TEXT,
+    cand_nams TEXT,
+    office_cd TEXT,
+    offic_dscr TEXT,
+    juris_cd TEXT,
+    juris_dscr TEXT,
+    dist_no TEXT,
+    off_s_h_cd TEXT,
+    bal_name TEXT,
+    bal_num TEXT,
+    bal_juris TEXT,
+    memo_code TEXT,
+    memo_refno TEXT,
+    bal_id TEXT,
+    cand_id TEXT,
+    sup_off_cd TEXT,
+    sup_opp_cd TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+
+-- CalAccess/DATA/S498_CD.TSV  (doc table: S498)
+CREATE TABLE IF NOT EXISTS s498_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    tran_id TEXT,
+    entity_cd TEXT,
+    cmte_id TEXT,
+    payor_naml TEXT,
+    payor_namf TEXT,
+    payor_namt TEXT,
+    payor_nams TEXT,
+    payor_city TEXT,
+    payor_st TEXT,
+    payor_zip4 TEXT,
+    date_rcvd TIMESTAMP,
+    amt_rcvd NUMERIC(12,2),
+    cand_naml TEXT,
+    cand_namf TEXT,
+    cand_namt TEXT,
+    cand_nams TEXT,
+    office_cd TEXT,
+    offic_dscr TEXT,
+    juris_cd TEXT,
+    juris_dscr TEXT,
+    dist_no TEXT,
+    off_s_h_cd TEXT,
+    bal_name TEXT,
+    bal_num TEXT,
+    bal_juris TEXT,
+    sup_opp_cd TEXT,
+    amt_attrib NUMERIC(12,2),
+    memo_code TEXT,
+    memo_refno TEXT,
+    employer TEXT,
+    occupation TEXT,
+    selfemp_cb TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+
+-- CalAccess/DATA/SMRY_CD.TSV  (doc table: SMRY)
+CREATE TABLE IF NOT EXISTS smry_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item TEXT,
+    rec_type TEXT,
+    form_type TEXT,
+    amount_a NUMERIC(12,2),
+    amount_b NUMERIC(12,2),
+    amount_c NUMERIC(12,2),
+    elec_dt TIMESTAMP,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+
+-- CalAccess/DATA/SPLT_CD.TSV  (doc table: SPLT)
+CREATE TABLE IF NOT EXISTS splt_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    pform_type TEXT,
+    ptran_id TEXT,
+    elec_date TIMESTAMP,
+    elec_amount NUMERIC(12,2),
+    elec_code TEXT,
+    PRIMARY KEY (amend_id, filing_id, line_item, pform_type)
+);
+
+-- CalAccess/DATA/TEXT_MEMO_CD.TSV  (doc table: TEXT_MEMO)
+CREATE TABLE IF NOT EXISTS text_memo_cd (
+    filing_id INTEGER,
+    amend_id INTEGER,
+    line_item INTEGER,
+    rec_type TEXT,
+    form_type TEXT,
+    ref_no TEXT,
+    text4000 TEXT,
+    PRIMARY KEY (amend_id, filing_id, form_type, line_item, rec_type)
+);
+
 -- ============================================================================
--- Filing calendar tracks official deadlines for campaign finance reports.
--- Populated from SOS publications and cross-referenced with report types.
-
-CREATE TABLE filing_calendar (
+-- Scraper-owned tables (NOT CAL-ACCESS sourced — used by scraper workflows
+-- and the filing-deadline MCP tools)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS filing_calendar (
     calendar_id SERIAL PRIMARY KEY,
     election_date DATE NOT NULL,
     report_type VARCHAR(50) NOT NULL,
@@ -1795,23 +1952,7 @@ CREATE TABLE filing_calendar (
     notes TEXT
 );
 
-CREATE INDEX idx_filing_cal_election ON filing_calendar(election_date);
-CREATE INDEX idx_filing_cal_report ON filing_calendar(report_type);
-
-COMMENT ON TABLE filing_calendar IS 'Official filing deadlines cross-referenced with election dates';
-COMMENT ON COLUMN filing_calendar.report_type IS 'e.g., PRE-Qualification, QUARTERLY, YEAR-END, 48-HOUR, TERMINAL';
-COMMENT ON COLUMN filing_calendar.deadline_date IS 'Filing deadline date';
-COMMENT ON COLUMN filing_calendar.grace_period_days IS 'Grace period after deadline (if any)';
-
--- ============================================================================
--- 11. Election Results (PDF discovery from SOS Elections Division)
--- ============================================================================
--- Source: SOS Elections Division website
--- URL: https://www.sos.ca.gov/elections/election-data-and-reports/
--- The SOS publishes election results as PDF reports; this table tracks
--- discovered PDFs for downstream parsing.
-
-CREATE TABLE election_results (
+CREATE TABLE IF NOT EXISTS election_results (
     election_id SERIAL PRIMARY KEY,
     election_date DATE NOT NULL,
     election_type VARCHAR(30) NOT NULL,
@@ -1824,47 +1965,7 @@ CREATE TABLE election_results (
     notes TEXT
 );
 
-CREATE INDEX idx_election_results_date ON election_results(election_date);
-CREATE INDEX idx_election_results_type ON election_results(election_type);
-CREATE INDEX idx_election_results_jurisdiction ON election_results(jurisdiction);
-
-COMMENT ON TABLE election_results IS 'SOS Elections Division results PDF discovery metadata';
-COMMENT ON COLUMN election_results.election_type IS 'General, Primary, Special, Consolidated, etc.';
-COMMENT ON COLUMN election_results.jurisdiction IS 'Statewide, County, City';
-COMMENT ON COLUMN election_results.sub_jurisdiction IS 'e.g., "District 35", "Los Angeles County"';
-COMMENT ON COLUMN election_results.pdf_url IS 'Full URL to the PDF report';
-
--- ============================================================================
--- 12. Filer Filings History
--- ============================================================================
-
-CREATE TABLE filer_filings (
-    filer_id VARCHAR(20) NOT NULL REFERENCES filers(filer_id),
-    filing_id VARCHAR(30) NOT NULL REFERENCES filings(filing_id),
-    period_id VARCHAR(30) REFERENCES filing_periods(period_id),
-    form_id VARCHAR(30),
-    filing_sequence INTEGER,
-    filing_date DATE,
-    stmnt_type VARCHAR(20),
-    stmnt_status VARCHAR(20),
-    session_id INTEGER REFERENCES legislative_sessions(session_id),
-    user_id VARCHAR(30),
-    special_audit BOOLEAN DEFAULT FALSE,
-    fine_audit BOOLEAN DEFAULT FALSE,
-    rpt_start DATE,
-    rpt_end DATE,
-    rpt_date DATE,
-    PRIMARY KEY (filer_id, filing_id)
-);
-CREATE INDEX idx_filer_filings_filing_id ON filer_filings(filing_id);
-CREATE INDEX idx_filer_filings_date ON filer_filings(filing_date);
-CREATE INDEX idx_filer_filings_session ON filer_filings(session_id);
-COMMENT ON TABLE filer_filings IS 'Filer filing history';
-
--- 13. Entity Resolution Tables
--- ============================================================================
-
-CREATE TABLE entity (
+CREATE TABLE IF NOT EXISTS entity (
     entity_id BIGSERIAL NOT NULL PRIMARY KEY,
     naml VARCHAR(120) NOT NULL,
     namf VARCHAR(30),
@@ -1879,12 +1980,8 @@ CREATE TABLE entity (
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     resolved_by BIGINT REFERENCES entity(entity_id) -- self-ref: merged into this entity
 );
-CREATE INDEX idx_entity_naml ON entity(naml) WHERE naml IS NOT NULL;
-CREATE INDEX idx_entity_fullname ON entity(fullname) WHERE fullname IS NOT NULL;
-CREATE INDEX idx_entity_type ON entity(entity_type);
-COMMENT ON TABLE entity IS 'Resolved entity master';
 
-CREATE TABLE entity_alias (
+CREATE TABLE IF NOT EXISTS entity_alias (
     alias_id BIGSERIAL NOT NULL PRIMARY KEY,
     entity_id BIGINT NOT NULL REFERENCES entity(entity_id) ON DELETE CASCADE,
     alias_name VARCHAR(300) NOT NULL,
@@ -1892,11 +1989,8 @@ CREATE TABLE entity_alias (
     source_table VARCHAR(30), -- e.g., 'filername', 'cntrb_cd', 'names_master'
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE INDEX idx_entity_alias_entity ON entity_alias(entity_id);
-CREATE INDEX idx_entity_alias_name ON entity_alias(alias_name) WHERE alias_name IS NOT NULL;
-COMMENT ON TABLE entity_alias IS 'Entity aliases for fuzzy matching';
 
-CREATE TABLE entity_merge_queue (
+CREATE TABLE IF NOT EXISTS entity_merge_queue (
     queue_id BIGSERIAL NOT NULL PRIMARY KEY,
     entity_a_id BIGINT NOT NULL REFERENCES entity(entity_id),
     entity_b_id BIGINT NOT NULL REFERENCES entity(entity_id),
@@ -1908,16 +2002,8 @@ CREATE TABLE entity_merge_queue (
     notes TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE INDEX idx_entity_merge_status ON entity_merge_queue(status);
-CREATE INDEX idx_entity_merge_entity_a ON entity_merge_queue(entity_a_id);
-CREATE INDEX idx_entity_merge_entity_b ON entity_merge_queue(entity_b_id);
-COMMENT ON TABLE entity_merge_queue IS 'Pending entity merges for review';
 
--- ============================================================================
--- 14. ETL Infrastructure Tables
--- ============================================================================
-
-CREATE TABLE source_info (
+CREATE TABLE IF NOT EXISTS source_info (
     source_id SERIAL NOT NULL PRIMARY KEY,
     source VARCHAR(30) NOT NULL DEFAULT 'calaccess',
     zip_checksum VARCHAR(64) NOT NULL, -- SHA-256 of dbwebexport.zip
@@ -1929,10 +2015,8 @@ CREATE TABLE source_info (
     rows_loaded BIGINT,
     notes TEXT
 );
-CREATE INDEX idx_source_info_load_date ON source_info(load_date);
-COMMENT ON TABLE source_info IS 'Data source metadata (zip checksum, load date)';
 
-CREATE TABLE load_checkpoint (
+CREATE TABLE IF NOT EXISTS load_checkpoint (
     checkpoint_id SERIAL NOT NULL PRIMARY KEY,
     table_name VARCHAR(50) NOT NULL,
     source VARCHAR(30) NOT NULL DEFAULT 'calaccess',
@@ -1942,11 +2026,8 @@ CREATE TABLE load_checkpoint (
     rows_processed INTEGER,
     notes TEXT
 );
-CREATE UNIQUE INDEX idx_load_checkpoint_table_hash ON load_checkpoint(table_name, source, file_hash);
-CREATE INDEX idx_load_checkpoint_date ON load_checkpoint(processed_date);
-COMMENT ON TABLE load_checkpoint IS 'ETL load checkpoints (idempotent re-runs)';
 
-CREATE TABLE etl_dead_letter (
+CREATE TABLE IF NOT EXISTS etl_dead_letter (
     dead_letter_id BIGSERIAL NOT NULL PRIMARY KEY,
     table_name VARCHAR(50) NOT NULL,
     source_file VARCHAR(200),
@@ -1957,125 +2038,14 @@ CREATE TABLE etl_dead_letter (
     resolved_at TIMESTAMPTZ,
     resolved_by VARCHAR(100)
 );
-CREATE INDEX idx_dead_letter_table ON etl_dead_letter(table_name);
-CREATE INDEX idx_dead_letter_created ON etl_dead_letter(created_at);
-CREATE INDEX idx_dead_letter_resolved ON etl_dead_letter(resolved_at) WHERE resolved_at IS NOT NULL;
-COMMENT ON TABLE etl_dead_letter IS 'Bad row quarantine';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_load_checkpoint_table_hash
+    ON load_checkpoint(table_name, source, file_hash);
 
 -- ============================================================================
--- 15. Indexes for performance on analytical queries
+-- Grant permissions (read-only role for MCP server)
 -- ============================================================================
 
--- Composite indexes for common analytical queries
-CREATE INDEX idx_rcpt_cd_filer_receipt ON rcpt_cd(filer_id, receipt_dt);
-CREATE INDEX idx_rcpt_cd_committee_receipt ON rcpt_cd(committee_id, receipt_dt);
-CREATE INDEX idx_rcpt_cd_amount_dt ON rcpt_cd(amount DESC, receipt_dt) WHERE amount > 0;
-CREATE INDEX idx_rcpt_cd_cand_election ON rcpt_cd(cand_office, election_date) WHERE cand_office IS NOT NULL;
-
-CREATE INDEX idx_exppd_cd_filer_date ON exppd_cd(filer_id, expn_date);
-CREATE INDEX idx_exppd_cd_amount_date ON exppd_cd(amount DESC, expn_date) WHERE amount > 0;
-CREATE INDEX idx_exppd_cd_payee ON exppd_cd(payee_naml, expn_date) WHERE payee_naml IS NOT NULL;
-
-CREATE INDEX idx_s401_filer_date ON s401_cd(filer_id, expn_date);
-CREATE INDEX idx_s401_amount ON s401_cd(expn_amt DESC) WHERE expn_amt > 0;
-
-CREATE INDEX idx_s497_filer_date ON s497_cd(filer_id, receipt_dt);
-CREATE INDEX idx_s497_amount ON s497_cd(amount DESC) WHERE amount > 1000;
-
-CREATE INDEX idx_s498_filer_date ON s498_cd(filer_id, expn_date);
-CREATE INDEX idx_s498_amount ON s498_cd(expn_amt DESC) WHERE expn_amt > 10000;
-
--- Entity resolution indexes (fuzzy matching)
-CREATE INDEX idx_entity_naml_gin ON entity USING gin(to_tsvector('simple', naml)) WHERE naml IS NOT NULL;
-CREATE INDEX idx_entity_fullname_gin ON entity USING gin(to_tsvector('simple', fullname)) WHERE fullname IS NOT NULL;
-CREATE INDEX idx_entity_alias_name_gin ON entity_alias USING gin(to_tsvector('simple', alias_name));
-
--- ============================================================================
--- 16. Views for common analytical queries
--- ============================================================================
-
--- Total contributions by candidate (all years)
-CREATE OR REPLACE VIEW v_candidate_contributions AS
-SELECT
-    r.cand_naml || COALESCE(' ' || r.cand_namf, '') AS candidate_name,
-    r.cand_office,
-    r.election_date,
-    r.election_type,
-    COUNT(*) AS contribution_count,
-    COALESCE(SUM(r.amount), 0) AS total_amount,
-    MIN(r.amount) AS min_amount,
-    MAX(r.amount) AS max_amount
-FROM rcpt_cd r
-WHERE r.cand_naml IS NOT NULL
-    AND r.amount IS NOT NULL
-    AND r.amount > 0
-GROUP BY r.cand_naml, r.cand_namf, r.cand_office, r.election_date, r.election_type;
-
-COMMENT ON VIEW v_candidate_contributions IS 'Total contributions by candidate and election';
-
--- Committee financial summary (latest filing)
-CREATE OR REPLACE VIEW v_committee_summary AS
-SELECT
-    f.filer_id,
-    fn.naml AS committee_name,
-    ft.filer_type,
-    r.election_date,
-    cv.cash_on_hand,
-    cv.total_contributions,
-    cv.total_expenditures,
-    cv.loans_received,
-    cv.debts_owed,
-    cv.total_contributions - cv.total_expenditures - cv.loans_received + cv.loan_repayments AS net_position
-FROM filings f
-JOIN filername fn ON f.filer_id = fn.filer_id
-JOIN filer_type_assignments ft ON f.filer_id = ft.filer_id AND ft.active = TRUE
-JOIN cvr_campaign_disclosure cv ON f.filing_id = cv.filing_id
-WHERE fn.effect_dt = (
-    SELECT MAX(fn2.effect_dt) FROM filername fn2 WHERE fn2.filer_id = fn.filer_id
-);
-
-COMMENT ON VIEW v_committee_summary IS 'Latest filing summary per committee';
-
--- Top contributors (by total amount given)
-CREATE OR REPLACE VIEW v_top_contributors AS
-SELECT
-    c.ctrib_naml || COALESCE(' ' || c.ctrib_namf, '') AS contributor_name,
-    c.ctrib_emp,
-    c.ctrib_occ,
-    c.total_gives,
-    c.total_year,
-    COUNT(DISTINCT r.committee_id) AS committees_contributed_to
-FROM cntrb_cd c
-LEFT JOIN rcpt_cd r ON c.ctrib_id = r.ctrib_id
-GROUP BY c.ctrib_id, c.ctrib_naml, c.ctrib_namf, c.ctrib_emp, c.ctrib_occ, c.total_gives, c.total_year
-ORDER BY c.total_gives DESC NULLS LAST
-LIMIT 1000;
-
-COMMENT ON VIEW v_top_contributors IS 'Top 1000 contributors by lifetime giving';
-
--- Lobbying activity summary
-CREATE OR REPLACE VIEW v_lobbying_activity AS
-SELECT
-    ld.lby_reg_id,
-    ld.lby_reg_name,
-    ld.principal_id,
-    ld.principal_name,
-    ld.from_date,
-    ld.thru_date,
-    COUNT(lemp.filing_id) AS filings_count,
-    COUNT(CASE WHEN lemp.activities_desc IS NOT NULL THEN 1 END) AS activity_descriptions
-FROM cvr_lobby_disclosure ld
-LEFT JOIN lemp_cd lemp ON ld.filer_id = lemp.filer_id
-GROUP BY ld.lby_reg_id, ld.lby_reg_name, ld.principal_id, ld.principal_name,
-         ld.from_date, ld.thru_date;
-
-COMMENT ON VIEW v_lobbying_activity IS 'Lobbying activity per registered lobbyist';
-
--- ============================================================================
--- 17. Grant permissions (if needed for MCP reader role)
--- ============================================================================
-
--- Create read-only role for MCP server
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cfdb_reader') THEN

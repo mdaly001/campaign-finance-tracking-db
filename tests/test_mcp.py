@@ -2,14 +2,18 @@
 
 Tests cover:
 - DB engine creation and execute_read (mocked Postgres)
-- All 9 MCP tool functions: contributions_by_donor,
-  top_donors_for_committee_or_candidate, committee_outlays_to,
-  vendor_revenue, committee_profile, measure_spending,
-  donor_watch_since, upcoming_filings, filing_due_soon
+- All 9 MCP tool functions against the real CAL-ACCESS schema
+  (rcpt_cd / expn_cd / smry_cd / cvr_campaign_disclosure_cd /
+  filername_cd / filer_xref_cd / filing_period_cd / filing_calendar /
+  entity_alias)
 - MCP server creation and tool registration
 - Tool parameter validation (type hints / Pydantic coercion)
+
+The mock DB dispatches on normalized SQL patterns matching the real
+column names, so a regression to an invented column name fails loudly.
 """
 
+from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -26,175 +30,143 @@ def _mock_row(columns, values):
     return dict(zip(columns, values))
 
 
+def _soon(days: int) -> str:
+    """ISO date N days from today (inside the default look-ahead windows)."""
+    return (date.today() + timedelta(days=days)).isoformat()
+
+
 class MockDB:
-    """Deterministic mock of execute_read that returns canned data."""
+    """Deterministic mock of execute_read returning canned real-schema rows."""
 
     def __init__(self):
-        self.calls = []
+        self.calls: list[dict] = []
 
-    def _normalize_sql(self, sql):
-        """Normalize SQL for pattern matching."""
+    def _normalize_sql(self, sql: str) -> str:
         sql = sql.upper().strip()
-        sql = " ".join(sql.split())
-        return sql
+        return " ".join(sql.split())
 
     def query(self, sql, params=None):
         """Return canned results based on SQL pattern matching."""
         norm = self._normalize_sql(sql)
         self.calls.append({"sql": norm, "params": params})
 
-        # contributions_by_donor: FROM RCPT_CD with ctrib_naml ILIKE AND cycle = :cycle
-        if "FROM RCPT_CD RC" in norm and "CTRIB_NAML ILIKE" in norm and ":CYCLE" in norm:
+        # -- alias lookup (entity_alias, scraper-owned) --------------- #
+        if "FROM ENTITY_ALIAS" in norm:
+            return [_mock_row(["alias_name"], ["A. Smith Inc"])]
+
+        # -- committee name resolution (filer_xref -> filername) ------ #
+        if "FROM FILER_XREF_CD X" in norm:
             return [
                 _mock_row(
-                    [
-                        "tran_id",
-                        "filing_id",
-                        "amend_id",
-                        "amount",
-                        "date",
-                        "purpose",
-                        "cmte_id",
-                        "memo_refno",
-                        "cycle",
-                    ],
-                    ["T1", "F1", "A1", 100.5, "2024-01-15", "CONTRIBUTION", "C1", None, 2024],
-                ),
-                _mock_row(
-                    [
-                        "tran_id",
-                        "filing_id",
-                        "amend_id",
-                        "amount",
-                        "date",
-                        "purpose",
-                        "cmte_id",
-                        "memo_refno",
-                        "cycle",
-                    ],
-                    ["T2", "F1", "A1", 50.0, "2024-02-01", "CONTRIBUTION", "C1", None, 2024],
-                ),
+                    ["naml", "namf", "namt", "nams", "city", "st", "filer_type", "status"],
+                    ["Test", "Jane", "M", "", "Los Angeles", "CA", "PC", "Active"],
+                )
             ]
 
-        # top_donors: GROUP BY + TOTAL_AMOUNT
-        if "GROUP BY" in norm and "TOTAL_AMOUNT" in norm:
+        # -- measure metadata (ballot_measures_cd) -------------------- #
+        if "FROM BALLOT_MEASURES_CD" in norm:
             return [
                 _mock_row(
-                    ["donor_name", "total_amount", "contribution_count", "first_date", "last_date"],
-                    ["Alice", 300.0, 2, "2024-01-01", "2024-02-01"],
+                    ["measure_no", "measure_name", "measure_short_name",
+                     "election_date", "jurisdiction"],
+                    ["65", "California Environmental Protection Act",
+                     "Prop 65", "2026-11-03", "Statewide"],
+                )
+            ]
+
+        # -- measure spenders (cvr_campaign_disclosure ⋈ smry) -------- #
+        if "FROM CVR_CAMPAIGN_DISCLOSURE_CD C" in norm:
+            return [
+                _mock_row(
+                    ["candidate", "committee_name", "sup_opp_cd", "total", "filings"],
+                    ["", "Yes on Prop 65", "S", 5000.0, 3],
                 ),
                 _mock_row(
-                    ["donor_name", "total_amount", "contribution_count", "first_date", "last_date"],
-                    ["Bob", 50.0, 1, "2024-03-01", "2024-03-01"],
+                    ["candidate", "committee_name", "sup_opp_cd", "total", "filings"],
+                    ["Doe, Jane", "No on Prop 65", "O", 3000.0, 2],
                 ),
             ]
 
-        # committee_outlays_to: FROM EXPPD_CD with filer_id = :cid
-        if "FROM EXPPD_CD E" in norm and "E.FILER_ID = :CID" in norm:
+        # -- filing period deadlines (filing_period_cd) --------------- #
+        if "FROM FILING_PERIOD_CD" in norm:
             return [
                 _mock_row(
-                    ["tran_id", "filing_id", "amount", "date", "purpose", "memo_refno"],
-                    ["T1", "F1", 500.0, "2024-01-15", "Office rent", None],
+                    ["period_id", "period_desc", "start_date", "end_date", "deadline"],
+                    [1450, "Quarterly Report Period", "2026-04-01", "2026-06-30", _soon(10)],
                 )
             ]
 
-        # vendor_revenue: ARRAY_AGG (receipts query)
-        if "ARRAY_AGG" in norm:
-            return [
-                _mock_row(["total_received", "transaction_count", "cycles"], [500.0, 2, [2024]])
-            ]
-
-        # vendor_revenue expenditures: SUM + EXPPD_CD
-        if "SUM(AMOUNT)" in norm and "EXPPD_CD" in norm:
-            return [_mock_row(["total_expenditures"], [200.0])]
-
-        # committee_profile: filername query
-        if "FROM FILERNAME FN" in norm and "FILER_ID = :CID" in norm:
+        # -- scraper filing calendar (filing_calendar) ---------------- #
+        if "FROM FILING_CALENDAR" in norm:
             return [
                 _mock_row(
-                    ["filer_id", "committee_name", "committee_type", "city", "state"],
-                    ["C1", "Test Committee", "PC", "Los Angeles", "CA"],
+                    ["report_type", "election_date", "deadline_date",
+                     "grace_period_days", "source_url"],
+                    ["F497", "2026-11-03", _soon(5), 15, "https://sos.ca.gov"],
                 )
             ]
 
-        # committee_profile: financial query with total_receipts
-        if "TOTAL_RECEIPTS" in norm:
-            return [
-                _mock_row(
-                    [
-                        "total_receipts",
-                        "total_disbursements",
-                        "total_contributions",
-                        "total_expenditures",
-                    ],
-                    [1000.0, 500.0, 1000.0, 500.0],
-                )
-            ]
+        # -- rcpt_cd queries (distinguish by shape) ------------------- #
+        if "FROM RCPT_CD" in norm:
+            if "GROUP BY" in norm and ":CMTE" in norm:
+                # top_donors aggregation
+                return [
+                    _mock_row(["donor_name", "contributions", "total"],
+                              ["Alice Smith", 2, 300.0]),
+                    _mock_row(["donor_name", "contributions", "total"],
+                              ["Bob Jones", 1, 50.0]),
+                ]
+            if "SUM(AMOUNT)" in norm and ":CYCLE" not in norm and ":SINCE" not in norm:
+                # committee_profile rcpt totals
+                return [_mock_row(["total", "n"], [1000.0, 7])]
+            if ":SINCE" in norm:
+                # donor_watch_since
+                return [
+                    _mock_row(
+                        ["tran_id", "filing_id", "amend_id", "amount", "rcpt_date",
+                         "purpose", "cmte_id", "memo_refno", "donor_name"],
+                        ["T9", 42, 0, 100.0, "2026-06-01", None, "C1", None, "Alice Smith"],
+                    )
+                ]
+            if ":CYCLE" in norm:
+                # contributions_by_donor
+                return [
+                    _mock_row(
+                        ["tran_id", "filing_id", "amend_id", "cycle", "amount",
+                         "rcpt_date", "purpose", "cmte_id", "memo_refno", "donor_name"],
+                        ["T1", 42, 0, 2026, 100.5, "2026-01-15", "CONTRIBUTION", "C1", None, "Alice Smith"],
+                    ),
+                    _mock_row(
+                        ["tran_id", "filing_id", "amend_id", "cycle", "amount",
+                         "rcpt_date", "purpose", "cmte_id", "memo_refno", "donor_name"],
+                        ["T2", 43, 0, 2026, 50.0, "2026-02-01", None, "C1", "M1", "Acme Corp"],
+                    ),
+                ]
 
-        # committee_profile: cash on hand from smry_cd
-        if "SMRY_CD" in norm:
-            return [_mock_row(["cash_on_hand"], [500.0])]
+        # -- expn_cd queries (distinguish by shape) ------------------- #
+        if "FROM EXPN_CD" in norm:
+            if "GROUP BY" in norm and ":CMTE" not in norm:
+                # vendor_revenue aggregation
+                return [
+                    _mock_row(["vendor_name", "payments", "total"],
+                              ["Acme Consulting", 2, 5000.0]),
+                ]
+            if "SUM(AMOUNT)" in norm and ":CYCLE" not in norm:
+                # committee_profile expn totals
+                return [_mock_row(["total", "n"], [800.0, 4])]
+            if ":CYCLE" in norm:
+                # committee_outlays_to
+                return [
+                    _mock_row(
+                        ["expn_date", "amount", "purpose", "payee_name",
+                         "cmte_id", "tran_id", "memo_refno"],
+                        ["2026-03-10", 500.0, "Office rent", "Acme Consulting", "C1", "E1", None],
+                    )
+                ]
 
-        # committee_profile: no data fallback (returns empty for empty tests)
-        if "FILERNAME" in norm:
-            return []
-
-        # measure_spending: cvr_camp_disc with measure_id
-        if "FROM CVR_CAMP_DISC" in norm and "MEASURE_ID ILIKE" in norm:
-            # Note: tool SQL aliases cmte_id -> committee_id
-            return [
-                _mock_row(
-                    ["committee_id", "committee_name", "total_spent", "support_oppose"],
-                    ["C1", "Yes on Prop 65", 5000.0, "S"],
-                )
-            ]
-
-        # donor_watch_since: FROM RCPT_CD with TRAN_DT >=
-        if "FROM RCPT_CD RC" in norm and "TRAN_DT >=" in norm and ":SINCE" in norm:
-            return [
-                _mock_row(
-                    ["tran_id", "filing_id", "amount", "date", "cmte_id", "cmte_name", "purpose"],
-                    ["T1", "F1", 100.0, "2024-06-01", "C1", "Committee A", None],
-                )
-            ]
-
-        # upcoming_filings: filing_calendar with deadline_date range (no OPEN)
-        if "FROM FILING_CALENDAR" in norm and "DEADLINE_DATE >=" in norm and "'OPEN'" not in norm:
-            return [
-                _mock_row(
-                    [
-                        "calendar_id",
-                        "election_date",
-                        "report_type",
-                        "deadline_date",
-                        "grace_period_days",
-                        "source_url",
-                        "notes",
-                    ],
-                    [1, "2024-11-05", "F496", "2024-10-31", 0, None, None],
-                )
-            ]
-
-        # filing_due_soon: filing_calendar with status = 'OPEN'
-        if "FROM FILING_CALENDAR" in norm and "'OPEN'" in norm:
-            return [
-                _mock_row(
-                    [
-                        "filing_id",
-                        "committee_id",
-                        "committee_name",
-                        "form_type",
-                        "filing_date",
-                        "deadline_date",
-                        "status",
-                    ],
-                    ["F100", "C1", "Test Committee", "F497", "2024-10-31", "2024-10-31", "OPEN"],
-                )
-            ]
-
-        # donor_alias query
-        if "FROM DONOR_ALIAS" in norm:
-            return [_mock_row(["alias_name"], ["A. Smith"])]
+        # -- committee_profile last activity --------------------------- #
+        if "GREATEST(" in norm and "MAX(RCPT_DATE)" in norm:
+            return [_mock_row(["last_activity"], ["2026-05-01"])]
 
         # Fallback: no data
         return []
@@ -213,10 +185,9 @@ def reset_mock():
 
 @pytest.fixture
 def patched_db(reset_mock):
-    """Patch both get_engine and execute_read to use the mock DB."""
+    """Patch execute_read in both db and tools modules to use the mock DB."""
     from core.mcp import db
 
-    # Clear the lru_cache so get_engine returns our mock
     db.get_engine.cache_clear()
 
     mock_engine = MagicMock()
@@ -256,16 +227,17 @@ class TestDB:
             importlib.reload(db)
 
     def test_build_url_from_components(self):
-        """_build_url should compose from DB_PASSWORD + defaults."""
+        """_build_url should compose from DB_* env vars + defaults."""
         import importlib
         import os
 
-        with patch.dict(os.environ, {"DB_PASSWORD": "r", "DB_HOST": "h"}):
+        with patch.dict(os.environ, {"DB_PASSWORD": "pw", "DB_HOST": "h"}):
             from core.mcp import db
 
             importlib.reload(db)
             url = db._build_url()
             assert "h:5432" in url
+            assert "cfdb_reader" in url
             importlib.reload(db)
 
     def test_execute_read_returns_list(self, patched_db):
@@ -288,42 +260,50 @@ class TestContributionsByDonor:
         """No matching rows should return an empty list."""
         from core.mcp.tools import contributions_by_donor
 
-        # Replace the patched function with one that returns []
         with patch("core.mcp.tools.execute_read", return_value=[]):
-            result = contributions_by_donor("Nobody", 2024)
+            result = contributions_by_donor("Nobody", 2026)
             assert result == []
 
     def test_returns_rows_when_match(self, patched_db):
         """Matching donor name should return contribution rows."""
         from core.mcp.tools import contributions_by_donor
 
-        result = contributions_by_donor("Alice", 2024)
-        assert len(result) >= 1
+        result = contributions_by_donor("Smith, Alice", 2026)
+        assert len(result) == 2
         row = result[0]
         assert row["tran_id"] == "T1"
         assert row["amount"] == 100.5
         assert row["purpose"] == "CONTRIBUTION"
+        assert row["cmte_id"] == "C1"
+        assert row["cycle"] == 2026
+        assert row["donor_name"] == "Alice Smith"
 
-    def test_aliases_query_called(self, patched_db):
-        """include_aliases=True should query donor_alias table."""
+    def test_name_patterns_passed(self, patched_db):
+        """The SQL should receive last/first_mid/full LIKE patterns."""
         from core.mcp.tools import contributions_by_donor
 
-        result = contributions_by_donor("Alice", 2024, include_aliases=True)
-        assert len(result) >= 1
+        contributions_by_donor("Smith, Alice M", 2026)
+        rcpt_call = next(c for c in _mock_db.calls if "FROM RCPT_CD" in c["sql"])
+        assert rcpt_call["params"]["last"] == "%Smith%"
+        assert rcpt_call["params"]["first_mid"] == "Alice M %"
+        assert rcpt_call["params"]["full"] == "%Smith, Alice M%"
+
+    def test_aliases_included(self, patched_db):
+        """include_aliases=True should query entity_alias and add alias params."""
+        from core.mcp.tools import contributions_by_donor
+
+        contributions_by_donor("Alice", 2026, include_aliases=True)
+        alias_call = next(c for c in _mock_db.calls if "FROM ENTITY_ALIAS" in c["sql"])
+        assert alias_call is not None
+        rcpt_call = next(c for c in _mock_db.calls if "FROM RCPT_CD" in c["sql"])
+        assert "alias0" in rcpt_call["params"]
 
     def test_include_aliases_false(self, patched_db):
-        """include_aliases=False should not query alias table."""
+        """include_aliases=False should not query the alias table."""
         from core.mcp.tools import contributions_by_donor
 
-        result = contributions_by_donor("Alice", 2024, include_aliases=False)
-        assert len(result) >= 1
-
-    def test_calls_execute_read(self, patched_db):
-        """The tool should call execute_read with the SQL."""
-        from core.mcp.tools import contributions_by_donor
-
-        contributions_by_donor("Alice", 2024)
-        assert len(patched_db.calls) > 0
+        contributions_by_donor("Alice", 2026, include_aliases=False)
+        assert not any("FROM ENTITY_ALIAS" in c["sql"] for c in _mock_db.calls)
 
 
 # ------------------------------------------------------------------ #
@@ -338,17 +318,17 @@ class TestTopDonors:
         from core.mcp.tools import top_donors_for_committee_or_candidate
 
         with patch("core.mcp.tools.execute_read", return_value=[]):
-            result = top_donors_for_committee_or_candidate("C999", 2024)
+            result = top_donors_for_committee_or_candidate("C999", 2026)
             assert result == []
 
     def test_returns_aggregated_rows(self, patched_db):
         from core.mcp.tools import top_donors_for_committee_or_candidate
 
-        result = top_donors_for_committee_or_candidate("C1", 2024, limit=10)
-        assert len(result) >= 2
-        assert result[0]["donor_name"] == "Alice"
-        assert result[0]["total_amount"] == 300.0
-        assert result[0]["contribution_count"] == 2
+        result = top_donors_for_committee_or_candidate("C1", 2026, limit=10)
+        assert len(result) == 2
+        assert result[0]["donor_name"] == "Alice Smith"
+        assert result[0]["total"] == 300.0
+        assert result[0]["contributions"] == 2
 
 
 # ------------------------------------------------------------------ #
@@ -357,22 +337,25 @@ class TestTopDonors:
 
 
 class TestCommitteeOutlaysTo:
-    """Tool: committee_outlays_to(committee_id, cycle)."""
+    """Tool: committee_outlays_to(committee_id, vendor_name, cycle, limit)."""
 
     def test_returns_empty(self, patched_db):
         from core.mcp.tools import committee_outlays_to
 
         with patch("core.mcp.tools.execute_read", return_value=[]):
-            result = committee_outlays_to("C999", 2024)
+            result = committee_outlays_to("C999", "Nobody", 2026)
             assert result == []
 
     def test_returns_expenditures(self, patched_db):
         from core.mcp.tools import committee_outlays_to
 
-        result = committee_outlays_to("C1", 2024)
-        assert len(result) >= 1
-        assert result[0]["amount"] == 500.0
-        assert result[0]["purpose"] == "Office rent"
+        result = committee_outlays_to("C1", "Acme", 2026)
+        assert len(result) == 1
+        row = result[0]
+        assert row["amount"] == 500.0
+        assert row["purpose"] == "Office rent"
+        assert row["payee_name"] == "Acme Consulting"
+        assert row["cmte_id"] == "C1"
 
 
 # ------------------------------------------------------------------ #
@@ -381,26 +364,23 @@ class TestCommitteeOutlaysTo:
 
 
 class TestVendorRevenue:
-    """Tool: vendor_revenue(vendor_name, cycle)."""
+    """Tool: vendor_revenue(vendor_name, limit)."""
 
     def test_returns_empty(self, patched_db):
         from core.mcp.tools import vendor_revenue
 
         with patch("core.mcp.tools.execute_read", return_value=[]):
-            result = vendor_revenue("Nobody", 2024)
-            assert result["total_received"] == 0.0
-            assert result["total_expenditures"] == 0.0
-            assert result["transaction_count"] == 0
-            assert result["cycles"] == []
+            result = vendor_revenue("Nobody")
+            assert result == []
 
-    def test_aggregates_receipts(self, patched_db):
+    def test_aggregates_expenditures(self, patched_db):
         from core.mcp.tools import vendor_revenue
 
-        result = vendor_revenue("Acme", 2024)
-        assert result["vendor_name"] == "Acme"
-        assert result["total_received"] == 500.0
-        assert result["transaction_count"] == 2
-        assert 2024 in result["cycles"]
+        result = vendor_revenue("Acme")
+        assert len(result) == 1
+        assert result[0]["vendor_name"] == "Acme Consulting"
+        assert result[0]["total"] == 5000.0
+        assert result[0]["payments"] == 2
 
 
 # ------------------------------------------------------------------ #
@@ -409,25 +389,54 @@ class TestVendorRevenue:
 
 
 class TestCommitteeProfile:
-    """Tool: committee_profile(committee_id, cycle)."""
+    """Tool: committee_profile(committee_id, as_of_date)."""
 
-    def test_returns_empty(self, patched_db):
+    def test_returns_zero_profile_when_no_data(self, patched_db):
         from core.mcp.tools import committee_profile
 
-        with patch("core.mcp.tools.execute_read", return_value=[]):
+        # Real Postgres: GROUP-BY-less aggregates always return one (zero) row;
+        # only the name-lookup and GREATEST queries can be empty/null.
+        def _zero_aggregates(sql, params=None):
+            s = sql.upper()
+            if "SUM(AMOUNT)" in s:
+                return [{"total": 0, "n": 0}]
+            if "GREATEST(" in s:
+                return [{"last_activity": None}]
+            return []
+
+        with patch("core.mcp.tools.execute_read", side_effect=_zero_aggregates):
             result = committee_profile("C999")
-            assert result["committee_name"] == "Unknown"
-            assert result["total_receipts"] == 0.0
+            assert result is not None
+            assert result["committee_name"] is None
+            assert result["total_contributions"] == 0.0
+            assert result["total_expenditures"] == 0.0
 
     def test_returns_profile(self, patched_db):
         from core.mcp.tools import committee_profile
 
-        result = committee_profile("C1", 2024)
-        assert result["committee_name"] == "Test Committee"
+        result = committee_profile("C1")
+        assert result["committee_name"] == "Test, Jane M"
         assert result["committee_type"] == "PC"
+        assert result["status"] == "Active"
         assert result["city"] == "Los Angeles"
         assert result["state"] == "CA"
-        assert result["total_receipts"] == 1000.0
+        assert result["total_contributions"] == 1000.0
+        assert result["contribution_count"] == 7
+        assert result["total_expenditures"] == 800.0
+        assert result["expenditure_count"] == 4
+        assert result["as_of_date"] is None
+
+    def test_as_of_date_passes_param(self, patched_db):
+        from core.mcp.tools import committee_profile
+
+        result = committee_profile("C1", as_of_date=date(2026, 1, 1))
+        assert result["as_of_date"] == "2026-01-01"
+        rcpt_call = next(
+            c for c in _mock_db.calls
+            if "FROM RCPT_CD" in c["sql"] and "SUM(AMOUNT)" in c["sql"]
+        )
+        assert rcpt_call["params"]["asof"] == date(2026, 1, 1)
+        assert "RCPT_DATE <= :ASOF" in rcpt_call["sql"]
 
 
 # ------------------------------------------------------------------ #
@@ -436,22 +445,28 @@ class TestCommitteeProfile:
 
 
 class TestMeasureSpending:
-    """Tool: measure_spending(measure_id, cycle)."""
+    """Tool: measure_spending(measure_id, limit)."""
 
-    def test_returns_empty(self, patched_db):
+    def test_returns_empty_when_unknown(self, patched_db):
         from core.mcp.tools import measure_spending
 
         with patch("core.mcp.tools.execute_read", return_value=[]):
-            result = measure_spending("PROP 999", 2024)
+            result = measure_spending("999")
             assert result == []
 
-    def test_returns_measure_spending(self, patched_db):
+    def test_returns_measure_totals(self, patched_db):
         from core.mcp.tools import measure_spending
 
-        result = measure_spending("PROP 65", 2024)
-        assert len(result) >= 1
-        assert result[0]["total_spent"] == 5000.0
-        assert result[0]["support_oppose"] == "S"
+        result = measure_spending("65")
+        assert len(result) == 1
+        row = result[0]
+        assert row["measure_no"] == "65"
+        assert row["measure_name"] == "California Environmental Protection Act"
+        assert row["total_reported"] == 8000.0
+        assert len(row["top_committees"]) == 2
+        assert row["top_committees"][0]["committee_name"] == "Yes on Prop 65"
+        assert row["top_committees"][0]["sup_opp"] == "S"
+        assert row["top_committees"][0]["total"] == 5000.0
 
 
 # ------------------------------------------------------------------ #
@@ -460,22 +475,31 @@ class TestMeasureSpending:
 
 
 class TestDonorWatchSince:
-    """Tool: donor_watch_since(since_date, donor_name)."""
+    """Tool: donor_watch_since(donor_name, since_date, include_aliases)."""
 
     def test_returns_empty(self, patched_db):
         from core.mcp.tools import donor_watch_since
 
         with patch("core.mcp.tools.execute_read", return_value=[]):
-            result = donor_watch_since("2020-01-01")
+            result = donor_watch_since("Nobody", date(2026, 1, 1))
             assert result == []
 
     def test_returns_recent_contributions(self, patched_db):
         from core.mcp.tools import donor_watch_since
 
-        result = donor_watch_since("2024-01-01")
-        assert len(result) >= 1
+        result = donor_watch_since("Smith", date(2026, 1, 1))
+        assert len(result) == 1
         assert result[0]["amount"] == 100.0
-        assert result[0]["date"] == "2024-06-01"
+        assert result[0]["date"] == "2026-06-01"
+        assert result[0]["donor_name"] == "Alice Smith"
+
+    def test_since_param_passed(self, patched_db):
+        from core.mcp.tools import donor_watch_since
+
+        donor_watch_since("Smith", date(2026, 1, 1), include_aliases=False)
+        rcpt_call = next(c for c in _mock_db.calls if "FROM RCPT_CD" in c["sql"])
+        assert rcpt_call["params"]["since"] == date(2026, 1, 1)
+        assert "RCPT_DATE >= :SINCE" in rcpt_call["sql"]
 
 
 # ------------------------------------------------------------------ #
@@ -490,15 +514,22 @@ class TestUpcomingFilings:
         from core.mcp.tools import upcoming_filings
 
         with patch("core.mcp.tools.execute_read", return_value=[]):
-            result = upcoming_filings()
+            result = upcoming_filings("C1")
             assert result == []
 
-    def test_returns_deadlines(self, patched_db):
+    def test_returns_period_deadlines(self, patched_db):
         from core.mcp.tools import upcoming_filings
 
-        result = upcoming_filings(days_ahead=30)
-        assert len(result) >= 1
-        assert result[0]["report_type"] == "F496"
+        result = upcoming_filings("C1", days_ahead=30)
+        assert len(result) == 1
+        row = result[0]
+        assert row["period_desc"] == "Quarterly Report Period"
+        assert row["committee_id"] == "C1"
+        assert row["committee_name"] == "Test, Jane M"
+        assert row["days_until"] == 10
+        assert "DEADLINE >= :TODAY" in next(
+            c for c in _mock_db.calls if "FROM FILING_PERIOD_CD" in c["sql"]
+        )["sql"]
 
 
 # ------------------------------------------------------------------ #
@@ -516,13 +547,16 @@ class TestFilingDueSoon:
             result = filing_due_soon()
             assert result == []
 
-    def test_returns_open_deadlines(self, patched_db):
+    def test_returns_calendar_deadlines(self, patched_db):
         from core.mcp.tools import filing_due_soon
 
-        result = filing_due_soon(7)
-        assert len(result) >= 1
-        assert result[0]["committee_id"] == "C1"
-        assert result[0]["status"] == "OPEN"
+        result = filing_due_soon(days_ahead=7)
+        assert len(result) == 1
+        row = result[0]
+        assert row["report_type"] == "F497"
+        assert row["grace_period_days"] == 15
+        assert row["days_until"] == 5
+        assert row["deadline_date"] == _soon(5)
 
 
 # ------------------------------------------------------------------ #
@@ -594,7 +628,7 @@ class TestExports:
         assert callable(measure_spending)
         assert callable(donor_watch_since)
         assert callable(upcoming_filings)
-        assert callable(filing_due_soon)
+        assert callable(vendor_revenue)
 
     def test_db_exports(self):
         """DB helpers should be importable from core.mcp."""

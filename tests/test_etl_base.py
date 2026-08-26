@@ -140,6 +140,43 @@ class TestTSVReader:
         assert result[0]["value"] == "100"
         assert result[1]["name"] == "Bob"
 
+    def test_nul_bytes_stripped(self):
+        """Regression: the real SOS export contains NUL (0x00) bytes in
+        free-text fields; Postgres rejects them in every string type, so
+        the reader must strip them at parse time."""
+        from core.etl.tsv import TSVReader
+
+        tsv_str = "id\tname\n1\tAli\x00ce\n2\tBob\n"
+        result = TSVReader().read_string(tsv_str)
+        assert result[0]["name"] == "Alice"
+        assert result[1]["name"] == "Bob"
+
+    def test_embedded_control_chars_do_not_split_rows(self):
+        """Regression: the real SOS export is CRLF-terminated but free-text
+        fields contain embedded control chars (bare \\r, \\x0b, \\x1c-\\x1e)
+        that str.splitlines() would treat as line boundaries, creating a
+        truncated row plus a garbage fragment row. Parsing must split on
+        LF only, after normalizing CRLF."""
+        from core.etl.tsv import TSVReader
+
+        tsv = "id\tname\tmemo\r\n1\tAlice\thas\x0bVT inside\r\n2\tBob\ttext with\rbare CR\r\n"
+        result = TSVReader().read_string(tsv)
+        assert len(result) == 2
+        assert result[0]["memo"] == "has\x0bVT inside"
+        assert result[1]["memo"] == "text with\rbare CR"
+
+    def test_ragged_wide_row_extras_merged_into_last_column(self):
+        """Regression: rows with MORE fields than the header (unescaped
+        tabs in free text) must not crash; extras are merged into the last
+        column preserving the data. Short rows get None for missing cols."""
+        from core.etl.tsv import TSVReader
+
+        tsv_str = "id\tname\tvalue\n1\tO'Brien\t100\tEXTRA\n2\tBob\n"
+        result = TSVReader().read_string(tsv_str)
+        assert result[0]["value"] == "100\tEXTRA"
+        assert result[1]["name"] == "Bob"
+        assert result[1]["value"] is None
+
     def test_empty_to_none(self):
         from core.etl.tsv import TSVReader
 
@@ -262,6 +299,54 @@ class TestDeadLetterClass:
         assert hasattr(DeadLetter, "__init__")
         assert hasattr(DeadLetter, "quarantine")
         assert hasattr(DeadLetter, "get_dead_letters")
+
+    def test_quarantine_commits_and_handles_decimal(self, tmp_path):
+        """Regression: quarantine must COMMIT (a bare connect() rolls back
+        on close, silently dropping the audit trail) and must serialize
+        Decimal/datetime values (coerced rows are not JSON-native)."""
+        import json
+        from decimal import Decimal
+
+        from sqlalchemy import create_engine, text
+
+        from core.etl.dead_letter import DeadLetter
+
+        db = tmp_path / "dl_test.db"
+        engine = create_engine(f"sqlite:///{db}")
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE etl_dead_letter (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        table_name      TEXT NOT NULL,
+                        row_data        TEXT NOT NULL,
+                        error_message   TEXT NOT NULL,
+                        source_file     TEXT,
+                        created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            )
+
+        dead = DeadLetter(engine)
+        dead.quarantine(
+            "rcpt_cd",
+            {"amount": Decimal("500.00"), "name": "X", "dt": None},
+            "test failure",
+            "RCPT_CD.TSV",
+        )
+
+        # Read back on a FRESH connection: proves the insert was committed.
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT table_name, row_data, error_message FROM etl_dead_letter")
+            ).fetchone()
+        assert row is not None, "dead-letter row was rolled back (missing commit)"
+        assert row[0] == "rcpt_cd"
+        data = json.loads(row[1])
+        assert data["amount"] == "500.00"  # Decimal -> str via default=str
+        assert row[2] == "test failure"
 
 
 class TestSetupLogging:

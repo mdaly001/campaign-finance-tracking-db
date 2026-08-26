@@ -39,54 +39,92 @@ logger = logging.getLogger(__name__)
 #  Load order — dimensions before facts (FK constraints)
 # ------------------------------------------------------------------ #
 LOAD_ORDER: list[str] = [
-    # Dimension / reference tables (loaded first)
-    "LOOKUP_CODES",
+    # Dimension / reference tables first (small, FK targets)
     "ACRONYMS_CD",
-    "FILER_TYPES_CD",
-    "FILER_STATUS_CD",
-    "GROUP_TYPES_CD",
-    "REPORT_TYPES_CD",
-    "LEGISLATIVE_SESSIONS_CD",
-    "FILING_TYPE_CD",
-    "FILING_PERIOD_CD",
-    "FILERNAME_CD",
     "ADDRESS_CD",
-    "FILER_XREF_CD",
-    "FILER_LINKS_CD",
-    "FILER_TYPE_ASSIGN_CD",
-    "FILER_ETHICS_CD",
-    "FILER_INTERESTS_CD",
+    "BALLOT_MEASURES_CD",
+    "EFS_FILING_LOG_CD",
+    "FILERNAME_CD",
+    "FILERS_CD",
     "FILER_ACRONYMS_CD",
     "FILER_ADDRESS_CD",
-    "NAMES_CD",
+    "FILER_ETHICS_CLASS_CD",
+    "FILER_FILINGS_CD",
+    "FILER_INTERESTS_CD",
+    "FILER_LINKS_CD",
+    "FILER_STATUS_TYPES_CD",
+    "FILER_TO_FILER_TYPE_CD",
+    "FILER_TYPES_CD",
+    "FILER_TYPE_PERIODS_CD",
+    "FILER_XREF_CD",
     "FILINGS_CD",
-    "HDR_CD",
-    "HEADER_DEFS_CD",
+    "FILING_PERIOD_CD",
+    "GROUP_TYPES_CD",
+    "HEADER_CD",
     "IMAGE_LINKS_CD",
-    "EFS_FILING_LOG",
+    "LEGISLATIVE_SESSIONS_CD",
+    "LOOKUP_CODES_CD",
+    "NAMES_CD",
     "RECEIVED_FILINGS_CD",
-    # Disclosure reports
-    "CVR_CAMP_DISC",
-    "CVR_REGISTRATION",
-    "CVR_SO",
-    "CVR_LOBBY_DISC",
-    "CVR2_CAMP_DISC",
+    "REPORTS_CD",
+    # Disclosure forms (CVR series + reports)
+    "CVR2_CAMPAIGN_DISCLOSURE_CD",
+    "CVR2_LOBBY_DISCLOSURE_CD",
+    "CVR2_REGISTRATION_CD",
+    "CVR2_SO_CD",
+    "CVR3_VERIFICATION_INFO_CD",
+    "CVR_CAMPAIGN_DISCLOSURE_CD",
+    "CVR_E530_CD",
+    "CVR_F470_CD",
+    "CVR_LOBBY_DISCLOSURE_CD",
+    "CVR_REGISTRATION_CD",
+    "CVR_SO_CD",
     # Lobbying tables
-    "LEMP_CD",
-    "LACT_CD",
-    "LPAY_CD",
+    "LATT_CD",
     "LCCM_CD",
-    # Fact tables (financial records — loaded last)
-    "SMRY_CD",
+    "LEMP_CD",
+    "LEXP_CD",
+    "LOBBYING_CHG_LOG_CD",
+    "LOBBYIST_CONTRIBUTIONS1_CD",
+    "LOBBYIST_CONTRIBUTIONS2_CD",
+    "LOBBYIST_CONTRIBUTIONS3_CD",
+    "LOBBYIST_EMPLOYER1_CD",
+    "LOBBYIST_EMPLOYER2_CD",
+    "LOBBYIST_EMPLOYER3_CD",
+    "LOBBYIST_EMPLOYER_FIRMS1_CD",
+    "LOBBYIST_EMPLOYER_FIRMS2_CD",
+    "LOBBYIST_EMPLOYER_HISTORY_CD",
+    "LOBBYIST_EMP_LOBBYIST1_CD",
+    "LOBBYIST_EMP_LOBBYIST2_CD",
+    "LOBBYIST_FIRM1_CD",
+    "LOBBYIST_FIRM2_CD",
+    "LOBBYIST_FIRM3_CD",
+    "LOBBYIST_FIRM_EMPLOYER1_CD",
+    "LOBBYIST_FIRM_EMPLOYER2_CD",
+    "LOBBYIST_FIRM_HISTORY_CD",
+    "LOBBYIST_FIRM_LOBBYIST1_CD",
+    "LOBBYIST_FIRM_LOBBYIST2_CD",
+    "LOBBY_AMENDMENTS_CD",
+    "LOTH_CD",
+    "LPAY_CD",
+    # Fact tables (financial detail)
+    "DEBT_CD",
+    "F495P2_CD",
+    "F501_502_CD",
+    "F690P2_CD",
+    "HDR_CD",
+    "LOAN_CD",
+    "S401_CD",
+    "S496_CD",
+    "S497_CD",
+    "S498_CD",
     "SPLT_CD",
     "TEXT_MEMO_CD",
-    "CNTRB_CD",
-    "DEBT_CD",
-    "INTTRF_CD",
-    "LOANS_CD",
-    "EXPPD_CD",
+    # Largest fact files last (SMRY ~0.5GB, EXPN ~3GB, RCPT ~3.8GB)
+    "SMRY_CD",
+    "EXPN_CD",
     "RCPT_CD",
-    # Scraper tables (non-TSV — populated via state.scrapers, not dbwebexport.zip)
+    # Scraper-owned tables (non-TSV — populated via state.scrapers)
     "FILING_CALENDAR",
     "ELECTION_RESULTS",
 ]
@@ -185,7 +223,8 @@ class FullLoadRunner:
 
         logger.info("Starting full load: %d tables", len(order))
 
-        # Download fresh data
+        # Get the source archive (reuses the on-disk cache when present;
+        # delete the cache or call adapter.refresh() to force a re-download)
         from state.adapter import StateSourceAdapter
 
         adapter = StateSourceAdapter(cache_dir=self.cache_dir)
@@ -199,21 +238,21 @@ class FullLoadRunner:
         zip_hash = adapter._cached_file.checksum if adapter._cached_file else None
         logger.info("Source checksum: %s (zip level)", zip_hash[:12] if zip_hash else "none")
 
-        # Build table → tsv mapping from adapter
-        table_tsv_map: dict[str, bytes] = {}
+        # Build table → file-info map (metadata only — bytes are fetched
+        # per-table just-in-time so memory stays bounded to one table)
+        info_by_code: dict[str, "SourceFileInfo"] = {}
         for info in file_infos:
             tsv_code = Path(info.name).stem
             if tsv_code in TABLE_DEFINITIONS:
-                raw = adapter.fetch_file(info)
-                table_tsv_map[tsv_code] = raw
-                logger.debug("Mapped %s → %s (%d bytes)", info.name, tsv_code, len(raw))
+                info_by_code[tsv_code] = info
 
         # Load each table
         result.tables = []
         for code in order:
             table_start = time.monotonic()
 
-            if code not in table_tsv_map:
+            info = info_by_code.get(code)
+            if info is None:
                 logger.warning(
                     "Table %s: TSV not found in source zip — skipping", code
                 )
@@ -225,7 +264,7 @@ class FullLoadRunner:
                 result.tables_skipped += 1
                 continue
 
-            tsv_bytes = table_tsv_map[code]
+            tsv_bytes = adapter.fetch_file(info)
             file_hash = hashlib.sha256(tsv_bytes).hexdigest()
 
             # Build LoadConfig and load
@@ -351,28 +390,27 @@ class IncrementalLoadRunner:
 
         adapter = StateSourceAdapter(cache_dir=self.cache_dir)
 
-        # Check if the zip has been updated remotely
-        zip_hash = None
+        # Check whether the remote archive changed since the cached copy.
+        # If so, refresh; otherwise reuse the cache. The per-file content
+        # hash comparison below remains the authoritative load gate.
         try:
-            if adapter._cached_file and adapter._cached_file.path.exists():
-                zip_hash = adapter._cached_file.checksum
-                logger.info("Using cached zip: hash=%s", zip_hash[:12])
+            if adapter.is_up_to_date():
+                logger.info("Cached dbwebexport.zip is current — reusing it")
             else:
-                # Need to download first
-                _files = adapter.get_source_files()
-                zip_hash = adapter._cached_file.checksum if adapter._cached_file else None
-                logger.info("Downloaded new zip: hash=%s", zip_hash[:12] if zip_hash else "none")
+                logger.info("Remote dbwebexport.zip appears newer — downloading")
+                adapter.refresh()
         except Exception as e:
-            logger.warning("Could not verify zip freshness: %s — proceeding anyway", e)
+            logger.warning(
+                "Could not verify zip freshness: %s — using cache as-is", e
+            )
 
-        # Get table → tsv mapping
+        # Build table → file-info map (bytes fetched per-table just-in-time)
         file_infos = adapter.get_source_files()
-        table_tsv_map: dict[str, bytes] = {}
+        info_by_code: dict[str, "SourceFileInfo"] = {}
         for info in file_infos:
             tsv_code = Path(info.name).stem
             if tsv_code in TABLE_DEFINITIONS:
-                raw = adapter.fetch_file(info)
-                table_tsv_map[tsv_code] = raw
+                info_by_code[tsv_code] = info
 
         # Load each table (only if checksum changed)
         result.details = []
@@ -380,7 +418,8 @@ class IncrementalLoadRunner:
             result.tables_checked += 1
             table_start = time.monotonic()
 
-            if code not in table_tsv_map:
+            info = info_by_code.get(code)
+            if info is None:
                 logger.debug("Table %s: TSV not in source — skipping", code)
                 result.tables_skipped += 1
                 result.details.append({
@@ -390,7 +429,7 @@ class IncrementalLoadRunner:
                 })
                 continue
 
-            tsv_bytes = table_tsv_map[code]
+            tsv_bytes = adapter.fetch_file(info)
             file_hash = hashlib.sha256(tsv_bytes).hexdigest()
 
             # Check if already loaded
@@ -663,7 +702,10 @@ def main() -> None:
         )
         result = runner.run(tables_only=args.tables)
         _print_incremental_summary(result)
-        sys.exit(1)
+        failed = sum(
+            1 for d in (result.details or []) if d.get("status") == "failed"
+        )
+        sys.exit(1 if failed > 0 else 0)
 
     elif args.command == "resume":
         runner = ResumeRunner(

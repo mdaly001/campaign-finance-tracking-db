@@ -7,6 +7,7 @@ computes checksums for incremental detection.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import zipfile
@@ -49,22 +50,79 @@ class StateSourceAdapter(SourceAdapter):
 
     source = "state"
 
-    def __init__(self, cache_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        cache_dir: Path | None = None,
+        refresh: bool = False,
+    ) -> None:
+        """
+        Args:
+            cache_dir: Directory for the cached dbwebexport.zip.
+            refresh: If True, always re-download the zip on the first
+                access (ignoring any on-disk cache).
+        """
         self.cache_dir = cache_dir or STATE_CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.reader = TSVReader(has_header=True, empty_to_none=True)
+        self.force_refresh = refresh
         self._cached_file: StateDownload | None = None
 
     # -- cache helpers ----------------------------------------------------- #
 
+    @property
+    def _zip_path(self) -> Path:
+        return self.cache_dir / "dbwebexport.zip"
+
+    @property
+    def _meta_path(self) -> Path:
+        """Sidecar metadata (sha256/size/headers) written on download."""
+        return self.cache_dir / "dbwebexport.zip.meta"
+
     def _get_cached_zip(self) -> Path | None:
         """Return cached zip path if it exists, None otherwise."""
-        zip_path = self.cache_dir / "dbwebexport.zip"
-        return zip_path if zip_path.exists() else None
+        return self._zip_path if self._zip_path.exists() else None
+
+    def _load_cached_state(self) -> StateDownload | None:
+        """Build StateDownload from the on-disk cache + sidecar metadata.
+
+        If the sidecar is missing (e.g. a manually placed zip), computes
+        the checksum once and writes it.
+        """
+        zip_path = self._get_cached_zip()
+        if zip_path is None:
+            return None
+        meta: dict[str, Any] = {}
+        if self._meta_path.exists():
+            try:
+                meta = json.loads(self._meta_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                meta = {}
+        checksum = meta.get("sha256")
+        if not checksum:
+            h = hashlib.sha256()
+            with open(zip_path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            checksum = h.hexdigest()
+            meta["sha256"] = checksum
+            # Record size so is_up_to_date() can make a size-based
+            # freshness judgement even without CDN identity headers.
+            meta.setdefault("content_length", zip_path.stat().st_size)
+            try:
+                self._meta_path.write_text(json.dumps(meta))
+            except OSError:
+                pass
+        return StateDownload(
+            path=zip_path,
+            checksum=checksum,
+            size_bytes=meta.get("size_bytes", zip_path.stat().st_size),
+            last_modified=meta.get("last_modified"),
+        )
 
     def _download_zip(self) -> StateDownload:
         """Download the latest dbwebexport.zip from SOS CDN."""
-        zip_path = self.cache_dir / "dbwebexport.zip"
+        zip_path = self._zip_path
+        meta_path = self._meta_path
 
         with httpx.Client(timeout=300.0) as client:
             response = client.get(SOS_RAW_DATA_URL)
@@ -76,6 +134,17 @@ class StateSourceAdapter(SourceAdapter):
             size = len(raw_bytes)
 
             zip_path.write_bytes(raw_bytes)
+            meta = {
+                "sha256": checksum,
+                "size_bytes": size,
+                "last_modified": last_modified,
+                "etag": response.headers.get("etag"),
+                "content_length": int(response.headers.get("content-length") or 0),
+            }
+            try:
+                meta_path.write_text(json.dumps(meta))
+            except OSError:
+                pass
 
             logger.info(
                 "Downloaded dbwebexport.zip: %d bytes, sha256=%s, last-modified=%s",
@@ -91,26 +160,42 @@ class StateSourceAdapter(SourceAdapter):
                 last_modified=last_modified,
             )
 
+    def _ensure_zip(self) -> StateDownload:
+        """Return a usable cached zip, downloading when needed."""
+        if self._cached_file is not None and self._cached_file.path.exists():
+            return self._cached_file
+        if not self.force_refresh:
+            cached = self._load_cached_state()
+            if cached is not None:
+                logger.info(
+                    "Reusing cached dbwebexport.zip: %s (%d bytes)",
+                    cached.path,
+                    cached.size_bytes,
+                )
+                self._cached_file = cached
+                return cached
+        self._cached_file = self._download_zip()
+        return self._cached_file
+
     # -- SourceAdapter interface ------------------------------------------- #
 
     def get_source_files(self) -> list[SourceFileInfo]:
         """Get list of all TSV files in the latest download.
 
-        Downloads the zip if not cached, then lists all .tsv entries
-        from the zip's central directory without full extraction.
+        Uses the on-disk cache when present (download only when missing
+        or when the adapter was created with refresh=True), then lists
+        all .TSV entries from the zip's central directory without full
+        extraction.
         """
-        if self._cached_file and self._cached_file.path.exists():
-            zip_path = self._cached_file.path
-            checksum = self._cached_file.checksum
-        else:
-            self._cached_file = self._download_zip()
-            zip_path = self._cached_file.path
-            checksum = self._cached_file.checksum
+        cached = self._ensure_zip()
+        zip_path = cached.path
+        checksum = cached.checksum
 
         tsv_files: list[SourceFileInfo] = []
         with zipfile.ZipFile(zip_path, "r") as zf:
             for name in zf.namelist():
-                if name.endswith(".tsv"):
+                # Real export entries are upper-case ".TSV" — match case-insensitively.
+                if name.lower().endswith(".tsv"):
                     tsv_files.append(
                         SourceFileInfo(
                             name=name,
@@ -127,7 +212,7 @@ class StateSourceAdapter(SourceAdapter):
 
         Returns the raw bytes of the TSV file.
         """
-        zip_path = self.cache_dir / "dbwebexport.zip"
+        zip_path = self._ensure_zip().path
 
         with zipfile.ZipFile(zip_path, "r") as zf:
             if info.name not in zf.namelist():
@@ -180,25 +265,61 @@ class StateSourceAdapter(SourceAdapter):
 
     # -- incremental helpers ----------------------------------------------- #
 
+    def refresh(self) -> None:
+        """Force a fresh download on the next access (discard local cache)."""
+        self.force_refresh = True
+        self._cached_file = None
+
     def is_up_to_date(self) -> bool:
-        """Check if the cached zip is the latest version.
+        """Check if the cached zip matches the current remote version.
 
-        Compares the cached checksum with the latest remote checksum.
-        Returns True if no update needed.
+        Issues a HEAD request and compares the remote ETag /
+        Last-Modified / Content-Length against the sidecar metadata that
+        was recorded when the zip was downloaded. Returns True if the
+        cached copy is current (no re-download needed).
+
+        Note: the SOS CDN does not reliably expose a checksum, so we rely
+        on the identity headers. If the remote is unreachable or returns
+        no identity headers, we conservatively report False so the caller
+        re-downloads.
         """
-        with httpx.Client(timeout=30.0) as client:
-            response = client.head(SOS_RAW_DATA_URL)
-            if response.status_code == 304:
-                return True
-
-            remote_checksum = hashlib.sha256(response.content).hexdigest()
-
         cached_path = self._get_cached_zip()
         if cached_path is None:
             return False
 
-        cached_checksum = hashlib.sha256(cached_path.read_bytes()).hexdigest()
-        return remote_checksum == cached_checksum
+        meta: dict[str, Any] = {}
+        if self._meta_path.exists():
+            try:
+                meta = json.loads(self._meta_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                meta = {}
+        if not meta:
+            # Cache exists but has no recorded identity — treat as stale.
+            return False
+
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                response = client.head(SOS_RAW_DATA_URL, follow_redirects=True)
+                response.raise_for_status()
+        except httpx.HTTPError as e:
+            logger.warning("HEAD check failed (%s) — assuming stale", e)
+            return False
+
+        remote_etag = response.headers.get("etag")
+        remote_lm = response.headers.get("last-modified")
+        remote_len = int(response.headers.get("content-length") or 0)
+
+        # Compare whichever identity fields both sides have.
+        if meta.get("etag") and remote_etag:
+            return meta["etag"] == remote_etag
+        if meta.get("last_modified") and remote_lm:
+            return meta["last_modified"] == remote_lm
+        if meta.get("content_length") and remote_len:
+            return meta["content_length"] == remote_len
+
+        # No comparable identity headers — conservatively assume stale.
+        logger.debug("No comparable identity headers — assuming stale")
+        return False
 
     def clear_cache(self) -> None:
         """Clear the cached download."""

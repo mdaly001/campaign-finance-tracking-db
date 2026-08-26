@@ -77,16 +77,33 @@ class EntityResolver:
 
     def _ensure_extensions(self, conn: Connection) -> None:
         """Ensure pg_trgm and fuzzystrmatch extensions exist (Postgres only).
-        On SQLite, these extensions are not available but also not needed
-        for unit tests that only exercise merge queue operations.
+
+        On SQLite these extensions are not available but also not needed for
+        unit tests that only exercise merge queue operations. On a minimal
+        PostgreSQL build the contrib modules may be absent; in that case we
+        log a warning and continue (fuzzy matching will be unavailable).
         """
         try:
             dialect_name = conn.engine.dialect.name
         except Exception:
             dialect_name = ""
         if "postgresql" in dialect_name:
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS fuzzystrmatch"))
+            for ext in ("pg_trgm", "fuzzystrmatch"):
+                available = conn.execute(
+                    text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_available_extensions "
+                        "WHERE name = :e)"
+                    ),
+                    {"e": ext},
+                ).scalar()
+                if available:
+                    conn.execute(text(f"CREATE EXTENSION IF NOT EXISTS {ext}"))
+                else:
+                    logger.warning(
+                        "Extension %s not available on this server — "
+                        "fuzzy matching degraded",
+                        ext,
+                    )
 
     def find_matches(
         self,

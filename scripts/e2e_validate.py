@@ -10,8 +10,8 @@ This script is the final gate before v0.1.0-rc:
 
 from __future__ import annotations
 
-import sys
 import importlib
+import sys
 
 
 def test_imports():
@@ -48,10 +48,10 @@ def test_imports():
 
 def test_mcp_tools_registered():
     """Validate that all expected MCP tools are registered."""
-    from core.mcp.server import _create_server
     from core.mcp import tools as tool_mod
+    from core.mcp.server import _create_server
 
-    server = _create_server()
+    _ = _create_server()  # creation is the test
 
     # Check that tools module exports all expected functions
     expected_tools = [
@@ -96,8 +96,8 @@ def test_mcp_app_creation():
     from core.mcp.server import _create_server
 
     try:
-        server = _create_server()
-        print(f"  ✓ MCP server created successfully")
+        _ = _create_server()  # creation is the test
+        print("  ✓ MCP server created successfully")
         return True
     except Exception as e:
         print(f"  ✗ MCP server creation failed: {e}")

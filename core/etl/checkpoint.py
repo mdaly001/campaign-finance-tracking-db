@@ -1,5 +1,6 @@
 """LoadCheckpoint: idempotent load tracking in Postgres."""
 
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import text
@@ -8,19 +9,23 @@ from sqlalchemy import text
 class LoadCheckpoint:
     """Manages load checkpoints in Postgres ``load_checkpoint`` table.
 
-    Supports resume by table+date+hash so that interrupted or re-run
+    Supports resume by table+source+hash so that interrupted or re-run
     jobs can skip already-processed files.
 
-    Expected table schema (created by ``core/schema/003_load_checkpoint.sql``)::
+    Expected table schema (created by ``migrations/0001_create_all_tables.sql``)::
 
         CREATE TABLE load_checkpoint (
-            id            SERIAL PRIMARY KEY,
-            table_name    TEXT NOT NULL,
-            file_hash     TEXT NOT NULL,
-            processed_date TEXT NOT NULL,
-            loaded_at     TIMESTAMPTZ DEFAULT now()
+            checkpoint_id  SERIAL PRIMARY KEY,
+            table_name     VARCHAR(50) NOT NULL,
+            source         VARCHAR(30) NOT NULL DEFAULT 'calaccess',
+            file_hash      VARCHAR(64) NOT NULL,   -- SHA-256 of the file
+            source_file    VARCHAR(200),           -- e.g., 'CalAccess/DATA/RCPT_CD.TSV'
+            processed_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            rows_processed INTEGER,
+            notes          TEXT
         );
-        CREATE UNIQUE INDEX uq_load_checkpoint ON load_checkpoint(table_name, file_hash);
+        CREATE UNIQUE INDEX idx_load_checkpoint_table_hash
+            ON load_checkpoint(table_name, source, file_hash);
     """
 
     def __init__(self, engine: Any) -> None:
@@ -33,22 +38,42 @@ class LoadCheckpoint:
     # -- mutations --------------------------------------------------------- #
 
     def load_checkpoint(
-        self, table_name: str, file_hash: str, processed_date: str
+        self,
+        table_name: str,
+        file_hash: str,
+        processed_date: str | datetime | None = None,
+        *,
+        source: str = "calaccess",
+        source_file: str | None = None,
+        rows_processed: int | None = None,
+        notes: str | None = None,
     ) -> None:
         """Save checkpoint after processing a file.
 
         Uses ``ON CONFLICT DO NOTHING`` so repeated calls are safe.
 
         Args:
-            table_name: Target table name.
+            table_name: Target table name (or migration filename).
             file_hash: SHA-256 hex digest of the source file.
-            processed_date: The data date that was just loaded.
+            processed_date: Load timestamp. Defaults to ``now(UTC)``.
+            source: Data source tag (matches the unique index).
+            source_file: Optional source filename, e.g. 'CalAccess/DATA/RCPT_CD.TSV'.
+            rows_processed: Optional row count for this load.
+            notes: Optional free-form note.
         """
+        if processed_date is None:
+            processed_date = datetime.now(UTC)
         stmt = text(
             """
-            INSERT INTO load_checkpoint (table_name, file_hash, processed_date)
-            VALUES (:table_name, :file_hash, :processed_date)
-            ON CONFLICT (table_name, file_hash) DO NOTHING
+            INSERT INTO load_checkpoint (
+                table_name, source, file_hash, source_file,
+                processed_date, rows_processed, notes
+            )
+            VALUES (
+                :table_name, :source, :file_hash, :source_file,
+                :processed_date, :rows_processed, :notes
+            )
+            ON CONFLICT (table_name, source, file_hash) DO NOTHING
             """
         )
         with self._conn.begin() as conn:
@@ -56,8 +81,12 @@ class LoadCheckpoint:
                 stmt,
                 {
                     "table_name": table_name,
+                    "source": source,
                     "file_hash": file_hash,
+                    "source_file": source_file,
                     "processed_date": processed_date,
+                    "rows_processed": rows_processed,
+                    "notes": notes,
                 },
             )
 
@@ -73,7 +102,7 @@ class LoadCheckpoint:
         stmt = text(
             "SELECT processed_date FROM load_checkpoint "
             "WHERE table_name = :table_name AND file_hash = :file_hash "
-            "ORDER BY loaded_at DESC LIMIT 1"
+            "ORDER BY checkpoint_id DESC LIMIT 1"
         )
         with self._conn.begin() as conn:
             row = conn.execute(

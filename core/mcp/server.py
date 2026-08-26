@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import os
 import sys
@@ -31,6 +32,19 @@ from core.mcp.tools import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Tool list for introspection / tests
+TOOLS: list[str] = [
+    "contributions_by_donor",
+    "top_donors_for_committee_or_candidate",
+    "committee_outlays_to",
+    "vendor_revenue",
+    "committee_profile",
+    "measure_spending",
+    "donor_watch_since",
+    "upcoming_filings",
+    "filing_due_soon",
+]
 
 
 def _create_server() -> MCPServer:
@@ -150,20 +164,6 @@ def _create_server() -> MCPServer:
     return server
 
 
-# Tool list for introspection / tests
-TOOLS: list[str] = [
-    "contributions_by_donor",
-    "top_donors_for_committee_or_candidate",
-    "committee_outlays_to",
-    "vendor_revenue",
-    "committee_profile",
-    "measure_spending",
-    "donor_watch_since",
-    "upcoming_filings",
-    "filing_due_soon",
-]
-
-
 def main() -> None:
     """Entry point: start the MCP SSE server."""
     parser = argparse.ArgumentParser(description="Campaign Finance DB MCP Server")
@@ -204,11 +204,13 @@ def main() -> None:
     server = _create_server()
 
     try:
-        server.run_sse_async(
-            host=args.host,
-            port=args.port,
-            sse_path="/sse",
-            message_path="/messages/",
+        asyncio.run(
+            server.run_sse_async(
+                host=args.host,
+                port=args.port,
+                sse_path="/sse",
+                message_path="/messages/",
+            )
         )
     except KeyboardInterrupt:
         logger.info("MCP server stopped by user")

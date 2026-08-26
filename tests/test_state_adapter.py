@@ -252,29 +252,98 @@ def test_is_up_to_date_false_when_no_cache(cache_dir: Path, adapter: StateSource
         assert adapter.is_up_to_date() is False
 
 
-def test_is_up_to_date_true_when_match(cache_dir: Path, adapter: StateSourceAdapter) -> None:
-    """is_up_to_date returns True when checksums match."""
+def _write_sidecar(cache_dir: Path, **fields) -> None:
+    """Write the dbwebexport.zip.meta sidecar with the given identity fields."""
+    import json
+
+    sidecar = cache_dir / "dbwebexport.zip.meta"
+    sidecar.write_text(json.dumps(fields))
+
+
+def test_is_up_to_date_true_when_etag_matches(cache_dir: Path, adapter: StateSourceAdapter) -> None:
+    """is_up_to_date returns True when the CDN etag matches the sidecar."""
     cached_zip = cache_dir / "dbwebexport.zip"
     cached_zip.write_bytes(b"same content")
-    hashlib.sha256(b"same content").hexdigest()
+    _write_sidecar(
+        cache_dir,
+        sha256=hashlib.sha256(b"same content").hexdigest(),
+        size_bytes=len(b"same content"),
+        etag='"abc-123"',
+        content_length=len(b"same content"),
+    )
 
     with patch("httpx.Client") as mock_client:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
-        mock_resp.content = b"same content"
+        mock_resp.headers = {"etag": '"abc-123"'}
         mock_client.return_value.__enter__.return_value.head.return_value = mock_resp
 
         assert adapter.is_up_to_date() is True
 
 
-def test_is_up_to_date_true_on_304(cache_dir: Path, adapter: StateSourceAdapter) -> None:
-    """is_up_to_date returns True on HTTP 304 Not Modified."""
+def test_is_up_to_date_false_when_etag_differs(cache_dir: Path, adapter: StateSourceAdapter) -> None:
+    """is_up_to_date returns False when the CDN etag differs from the sidecar."""
+    cached_zip = cache_dir / "dbwebexport.zip"
+    cached_zip.write_bytes(b"same content")
+    _write_sidecar(
+        cache_dir,
+        sha256=hashlib.sha256(b"same content").hexdigest(),
+        size_bytes=len(b"same content"),
+        etag='"old-etag"',
+        content_length=len(b"same content"),
+    )
+
     with patch("httpx.Client") as mock_client:
         mock_resp = MagicMock()
-        mock_resp.status_code = 304
+        mock_resp.status_code = 200
+        mock_resp.headers = {"etag": '"new-etag"'}
+        mock_client.return_value.__enter__.return_value.head.return_value = mock_resp
+
+        assert adapter.is_up_to_date() is False
+
+
+def test_is_up_to_date_true_when_last_modified_matches(
+    cache_dir: Path, adapter: StateSourceAdapter
+) -> None:
+    """Without an etag, a matching last-modified header counts as fresh."""
+    cached_zip = cache_dir / "dbwebexport.zip"
+    cached_zip.write_bytes(b"same content")
+    _write_sidecar(
+        cache_dir,
+        sha256=hashlib.sha256(b"same content").hexdigest(),
+        size_bytes=len(b"same content"),
+        last_modified="Mon, 01 Jan 2024 00:00:00 GMT",
+        content_length=len(b"same content"),
+    )
+
+    with patch("httpx.Client") as mock_client:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"last-modified": "Mon, 01 Jan 2024 00:00:00 GMT"}
         mock_client.return_value.__enter__.return_value.head.return_value = mock_resp
 
         assert adapter.is_up_to_date() is True
+
+
+def test_is_up_to_date_conservative_without_identity_headers(
+    cache_dir: Path, adapter: StateSourceAdapter
+) -> None:
+    """When neither side carries comparable identity headers, assume stale."""
+    cached_zip = cache_dir / "dbwebexport.zip"
+    cached_zip.write_bytes(b"some content")
+    _write_sidecar(
+        cache_dir,
+        sha256=hashlib.sha256(b"some content").hexdigest(),
+        size_bytes=len(b"some content"),
+    )
+
+    with patch("httpx.Client") as mock_client:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
+        mock_client.return_value.__enter__.return_value.head.return_value = mock_resp
+
+        assert adapter.is_up_to_date() is False
 
 
 # -- clear_cache ----------------------------------------------------------- #

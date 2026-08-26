@@ -39,7 +39,20 @@ class TSVReader:
         Returns:
             List of dicts, each representing a row.
         """
-        lines = [line for line in tsv_string.splitlines() if line.strip()]
+        # The real SOS export occasionally contains NUL (0x00) bytes inside
+        # free-text fields. Postgres rejects NULs in every string type, so
+        # strip them at parse time (they are pure data corruption).
+        tsv_string = tsv_string.replace("\x00", "")
+
+        # Lines are CRLF-terminated, but free-text fields ALSO contain
+        # embedded control characters (bare \r, \x0b VT, \x1c-\x1e FS/GS/RS)
+        # that str.splitlines() would treat as line boundaries, splitting
+        # one logical row into a truncated row plus a garbage fragment row.
+        # Normalize CRLF -> LF and split on LF ONLY so embedded control
+        # chars stay inside their field.
+        tsv_string = tsv_string.replace("\r\n", "\n")
+
+        lines = [line for line in tsv_string.split("\n") if line.strip()]
         if not lines:
             return []
 
@@ -53,13 +66,22 @@ class TSVReader:
             fieldnames = [f"f{i}" for i in range(len(first_fields))]
             data_lines = lines
 
-        reader = csv.DictReader(
-            data_lines,
-            fieldnames=fieldnames,
-            restval=None,
-            delimiter="\t",
-        )
-        return self._coerce_rows(list(reader))
+        # The real SOS export contains ragged rows: some data lines carry
+        # MORE fields than the header (unescaped tabs inside free-text
+        # values) and some carry fewer. csv.DictReader stashes extras in a
+        # list under the None key, which breaks downstream string handling
+        # — so map fields manually: merge excess fields into the last
+        # column (preserving the data) and pad short rows with None.
+        n_cols = len(fieldnames)
+        rows: list[dict[str, str | None]] = []
+        for ln in data_lines:
+            fields = ln.split("\t")
+            if len(fields) > n_cols:
+                fields = fields[: n_cols - 1] + ["\t".join(fields[n_cols - 1 :])]
+            elif len(fields) < n_cols:
+                fields = fields + [None] * (n_cols - len(fields))
+            rows.append(dict(zip(fieldnames, fields)))
+        return self._coerce_rows(rows)
 
     def read_file(self, path: str) -> list[dict[str, Any]]:
         """Read and parse a TSV file from disk.
@@ -114,7 +136,7 @@ class TSVReader:
                     row[col] = int(float(val))  # handles "1.0" -> 1
                 else:
                     row[col] = target_type(val)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
                 # Leave value as-is on coercion failure
                 pass
         return row

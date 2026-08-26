@@ -4,10 +4,11 @@ import hashlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from sqlalchemy import Engine
+from sqlalchemy import Engine, text
 
 from core.etl.adapter import LoadSummary
 from core.etl.checkpoint import LoadCheckpoint
@@ -16,6 +17,33 @@ from core.etl.tsv import TSVReader
 from core.etl.upsert import upsert_records
 
 logger = logging.getLogger(__name__)
+
+
+_DT_FORMATS = (
+    "%m/%d/%Y %I:%M:%S %p",   # 1/27/2000 12:00:00 AM  (CAL-ACCESS)
+    "%m/%d/%Y %I:%M %p",      # 1/27/2000 12:00 AM
+    "%m/%d/%Y %H:%M:%S",      # 01/27/2000 00:00:00
+    "%Y-%m-%d %H:%M:%S",      # ISO with time
+    "%Y-%m-%dT%H:%M:%S",      # ISO T-separated
+    "%m/%d/%Y",               # 1/27/2000 (CAL-ACCESS date)
+    "%Y-%m-%d",               # ISO date
+)
+
+
+def _parse_datetime(val: str) -> datetime:
+    """Parse a CAL-ACCESS or ISO date/datetime string."""
+    val = val.strip()
+    for fmt in _DT_FORMATS:
+        try:
+            return datetime.strptime(val, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"unrecognized datetime format: {val!r}")
+
+
+def _parse_date(val: str) -> date:
+    """Parse a CAL-ACCESS or ISO date string (time component ignored)."""
+    return _parse_datetime(val).date()
 
 
 @dataclass
@@ -63,10 +91,13 @@ class TableLoader:
         """Apply type coercion to a record.
 
         Supported types:
-        - 'numeric'  -> float
-        - 'date'     -> datetime.date
+        - 'numeric'   -> Decimal (exact money)
+        - 'date'      -> datetime.date
         - 'timestamp' -> datetime.datetime
-        - 'integer'  -> int
+        - 'integer'   -> int
+
+        Date/timestamp values accept the CAL-ACCESS export formats
+        (``M/D/YYYY`` with optional ``h:mm:ss AM/PM``) as well as ISO.
         """
         if not coercions:
             return record
@@ -81,13 +112,11 @@ class TableLoader:
 
             try:
                 if type_name == "numeric":
-                    coerced[col] = float(val)
+                    coerced[col] = Decimal(str(val).strip())
                 elif type_name == "date":
-                    coerced[col] = datetime.strptime(str(val), "%Y-%m-%d").date()
+                    coerced[col] = _parse_date(str(val))
                 elif type_name == "timestamp":
-                    coerced[col] = datetime.strptime(
-                        str(val), "%Y-%m-%d %H:%M:%S"
-                    )
+                    coerced[col] = _parse_datetime(str(val))
                 elif type_name == "integer":
                     coerced[col] = int(float(val))
                 else:
@@ -97,9 +126,12 @@ class TableLoader:
                         self.current_table,
                         col,
                     )
-            except (ValueError, TypeError) as e:
+            # InvalidOperation: Decimal("garbage"); OverflowError:
+            # int(float("1e400")). Both must null out, not crash the load.
+            except (ValueError, TypeError, InvalidOperation, OverflowError) as e:
                 logger.warning(
-                    "Type coercion failed for %s.%s = %r: %s",
+                    "Type coercion failed for %s.%s = %r: %s (%s)",
+                    type_name,
                     self.current_table,
                     col,
                     val,
@@ -157,17 +189,29 @@ class TableLoader:
                 file_hash[:12],
                 checkpoint_date,
             )
-            summary.rows_skipped = len(list(self.reader.read_bytes(raw_bytes)))
+            # Cheap row count — avoid re-parsing a large file just to count.
+            summary.rows_skipped = max(raw_bytes.count(b"\n") - 1, 0)
             return summary
 
-        # Parse TSV
-        records = list(self.reader.read_bytes(raw_bytes))
+        # Parse TSV (normalize column keys to lowercase: TSV headers are
+        # upper-case, the DDL uses lower-case identifiers)
+        records = [
+            {str(k).lower(): v for k, v in rec.items()}
+            for rec in self.reader.read_bytes(raw_bytes)
+        ]
         summary.rows_read = len(records)
         logger.info("Parsed %d rows for %s", summary.rows_read, config.table_name)
 
         if not records:
             logger.warning("No records found in %s", config.table_name)
             return summary
+
+        # Surrogate-PK tables (no conflict key) are loaded append-only:
+        # truncate first so each load replaces the full snapshot.
+        if not config.conflict_columns:
+            with self.engine.begin() as conn:
+                conn.execute(text(f'TRUNCATE TABLE "{config.table_name}"'))
+            logger.info("Truncated %s (append-only load)", config.table_name)
 
         # Add source metadata to each record (stripped before upsert)
         for record in records:
@@ -257,18 +301,52 @@ class TableLoader:
                 )
             summary.rows_upserted += upserted
         except Exception as e:
-            logger.error("Upsert failed for %s: %s", config.table_name, e)
-
-            # Quarantine bad batch to dead letter
+            # A multi-row VALUES statement is all-or-nothing: one bad row
+            # (e.g. a blank PK value) would otherwise dead-letter up to a
+            # full batch of good rows. Retry row-by-row so that only the
+            # genuinely bad rows are quarantined.
+            logger.warning(
+                "Batch upsert failed for %s (%d rows): %s — retrying row-by-row",
+                config.table_name,
+                len(batch),
+                e,
+            )
+            recovered = 0
             for record in batch:
-                self.dead_letter.quarantine(
+                try:
+                    with self.engine.begin() as conn:
+                        upsert_records(
+                            conn,
+                            config.table_name,
+                            [record],
+                            config.conflict_columns,
+                        )
+                    summary.rows_upserted += 1
+                    recovered += 1
+                except Exception as row_err:
+                    summary.rows_failed += 1
+                    # Quarantine the bad row. A dead-letter failure must
+                    # never take down the table load — log and continue.
+                    try:
+                        self.dead_letter.quarantine(
+                            config.table_name,
+                            record,
+                            str(row_err),
+                            config.tsv_files[0] if config.tsv_files else "unknown",
+                        )
+                    except Exception as dl_err:  # noqa: BLE001 - best-effort
+                        logger.error(
+                            "Dead-letter quarantine failed for %s: %s",
+                            config.table_name,
+                            dl_err,
+                        )
+            if recovered:
+                logger.info(
+                    "Recovered %d/%d rows for %s via row-by-row retry",
+                    recovered,
+                    len(batch),
                     config.table_name,
-                    record,
-                    str(e),
-                    config.tsv_files[0] if config.tsv_files else "unknown",
                 )
-
-            summary.rows_failed += len(batch)
 
 
 def get_load_configs() -> dict[str, LoadConfig]:

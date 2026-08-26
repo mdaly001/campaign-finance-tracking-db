@@ -14,6 +14,9 @@ __pycache__/
 .mypy_cache/
 .pytest_cache/
 
+# Local dev tools (standalone Postgres, scratch venvs) — not part of the app
+.dev/
+
 # macOS
 .DS_Store
 

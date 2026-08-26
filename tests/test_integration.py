@@ -1,13 +1,24 @@
 """Integration tests: verify queries work on pre-seeded sample data.
 
 Uses the `loaded_db` fixture from conftest.py which provides an
-in-memory SQLite engine with all tables created and sample data inserted.
+in-memory SQLite engine with the real CAL-ACCESS schema and sample
+data inserted.
+
+Real-schema conventions:
+- No election_year on filings; cycle derived from transaction dates
+  (SQLite: STRFTIME('%Y', date)).
+- Committee names resolved via filer_xref_cd (cmte_id) -> filername_cd.
+- Expenditures live in expn_cd (not the invented exppd_cd).
 """
 
 from __future__ import annotations
 
 import pytest
 from sqlalchemy import text
+
+# Cycle predicate for 2024 transaction dates (SQLite).
+_CYCLE_2024 = "CAST(STRFTIME('%Y', rcpt_date) AS INTEGER) = 2024"
+_CYCLE_2024_EXPN = "CAST(STRFTIME('%Y', expn_date) AS INTEGER) = 2024"
 
 # ------------------------------------------------------------------ #
 #  Integration: Contributions query
@@ -20,11 +31,10 @@ class TestContributionsQuery:
         with loaded_db.connect() as conn:
             rows = conn.execute(
                 text(
-                    """
+                    f"""
                     SELECT SUM(amount) as total
                     FROM rcpt_cd rc
-                    JOIN filings f ON rc.filing_id = f.filing_id
-                    WHERE f.election_year = 2024
+                    WHERE rc.cmte_id = 'C001' AND {_CYCLE_2024}
                     """
                 )
             ).fetchone()
@@ -35,11 +45,10 @@ class TestContributionsQuery:
         with loaded_db.connect() as conn:
             rows = conn.execute(
                 text(
-                    """
+                    f"""
                     SELECT COUNT(*) as cnt
                     FROM rcpt_cd rc
-                    JOIN filings f ON rc.filing_id = f.filing_id
-                    WHERE f.election_year = 2024
+                    WHERE rc.cmte_id = 'C001' AND {_CYCLE_2024}
                     """
                 )
             ).fetchone()
@@ -50,11 +59,10 @@ class TestContributionsQuery:
         with loaded_db.connect() as conn:
             rows = conn.execute(
                 text(
-                    """
+                    f"""
                     SELECT ctrib_naml, SUM(amount) as total
                     FROM rcpt_cd rc
-                    JOIN filings f ON rc.filing_id = f.filing_id
-                    WHERE f.election_year = 2024
+                    WHERE rc.cmte_id = 'C001' AND {_CYCLE_2024}
                     GROUP BY ctrib_naml
                     ORDER BY total DESC
                     """
@@ -63,8 +71,8 @@ class TestContributionsQuery:
 
             names_totals = [(r[0], float(r[1])) for r in rows]
             # Bob should be first (1000 > 750)
-            assert names_totals[0] == ("Bob Jones", pytest.approx(1000.0))
-            assert names_totals[1] == ("Alice Smith", pytest.approx(750.0))
+            assert names_totals[0] == ("Jones", pytest.approx(1000.0))
+            assert names_totals[1] == ("Smith", pytest.approx(750.0))
 
 
 # ------------------------------------------------------------------ #
@@ -78,26 +86,24 @@ class TestExpendituresQuery:
         with loaded_db.connect() as conn:
             rows = conn.execute(
                 text(
-                    """
+                    f"""
                     SELECT SUM(amount) as total
-                    FROM exppd_cd e
-                    JOIN filings f ON e.filing_id = f.filing_id
-                    WHERE f.election_year = 2024
+                    FROM expn_cd e
+                    WHERE e.cmte_id = 'C001' AND {_CYCLE_2024_EXPN}
                     """
                 )
             ).fetchone()
             assert rows[0] == pytest.approx(1050.0)
 
     def test_vendor_breakdown(self, loaded_db):
-        """Acme Corp received 300, Bob Jones received 750."""
+        """Acme received 300, Bob received 750."""
         with loaded_db.connect() as conn:
             rows = conn.execute(
                 text(
-                    """
+                    f"""
                     SELECT payee_naml, SUM(amount) as total
-                    FROM exppd_cd e
-                    JOIN filings f ON e.filing_id = f.filing_id
-                    WHERE f.election_year = 2024
+                    FROM expn_cd e
+                    WHERE e.cmte_id = 'C001' AND {_CYCLE_2024_EXPN}
                     GROUP BY payee_naml
                     ORDER BY total DESC
                     """
@@ -105,8 +111,8 @@ class TestExpendituresQuery:
             ).fetchall()
 
             names_totals = [(r[0], float(r[1])) for r in rows]
-            assert names_totals[0] == ("Bob Jones", pytest.approx(750.0))
-            assert names_totals[1] == ("Acme Corp", pytest.approx(300.0))
+            assert names_totals[0] == ("Jones", pytest.approx(750.0))
+            assert names_totals[1] == ("Acme", pytest.approx(300.0))
 
 
 # ------------------------------------------------------------------ #
@@ -116,27 +122,33 @@ class TestExpendituresQuery:
 
 class TestCommitteeProfile:
     def test_committee_exists(self, loaded_db):
-        """FILERNAME should return Test Committee for C001."""
+        """cmte_id C001 resolves to a filername_cd record via filer_xref_cd."""
         with loaded_db.connect() as conn:
             rows = conn.execute(
-                text("SELECT naml FROM filername WHERE filer_id = 'C001'")
+                text(
+                    """
+                    SELECT n.naml
+                    FROM filer_xref_cd x
+                    JOIN filername_cd n ON n.filer_id = x.filer_id
+                    WHERE x.xref_id = 'C001'
+                    """
+                )
             ).fetchone()
-            assert rows[0] == "Test Committee"
+            assert rows is not None
+            assert rows[0] == "Test"
 
     def test_cash_flow(self, loaded_db):
         """Cash flow: receipts 1750, expenditures 1050 → net +700."""
         with loaded_db.connect() as conn:
             rows = conn.execute(
                 text(
-                    """
+                    f"""
                     SELECT
                         (SELECT COALESCE(SUM(amount), 0) FROM rcpt_cd rc
-                         JOIN filings f ON rc.filing_id = f.filing_id
-                         WHERE f.election_year = 2024)
+                          WHERE rc.cmte_id = 'C001' AND {_CYCLE_2024})
                         -
-                        (SELECT COALESCE(SUM(amount), 0) FROM exppd_cd e
-                         JOIN filings f ON e.filing_id = f.filing_id
-                         WHERE f.election_year = 2024)
+                        (SELECT COALESCE(SUM(amount), 0) FROM expn_cd e
+                          WHERE e.cmte_id = 'C001' AND {_CYCLE_2024_EXPN})
                         AS net_cash
                     """
                 )
@@ -151,18 +163,24 @@ class TestCommitteeProfile:
 
 class TestBallotMeasuresQuery:
     def test_measure_found(self, loaded_db):
-        """PROP 15 should be in ballot_measures."""
+        """Measure 15 should be in ballot_measures_cd."""
         with loaded_db.connect() as conn:
             rows = conn.execute(
-                text("SELECT measure_name FROM ballot_measures WHERE measure_no = 'PROP 15'")
+                text(
+                    "SELECT measure_name FROM ballot_measures_cd "
+                    "WHERE measure_no = '15'"
+                )
             ).fetchone()
             assert rows[0] == "Property Tax Initiative"
 
     def test_measure_jurisdiction(self, loaded_db):
-        """PROP 15 should be Statewide."""
+        """Measure 15 should be Statewide."""
         with loaded_db.connect() as conn:
             rows = conn.execute(
-                text("SELECT jurisdiction FROM ballot_measures WHERE measure_no = 'PROP 15'")
+                text(
+                    "SELECT jurisdiction FROM ballot_measures_cd "
+                    "WHERE measure_no = '15'"
+                )
             ).fetchone()
             assert rows[0] == "Statewide"
 
