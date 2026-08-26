@@ -3,7 +3,7 @@
 This folder contains two things:
 
 1. **A database** of California campaign-finance and lobbying disclosure data
-   (the official State of California SOS "CAL-ACCESS" export — ~55 million rows
+   (the official State of California SOS "CAL-ACCESS" export — ~80.7 million rows
    across 80 tables: contributions, expenditures, committees, filers, lobbying, etc.)
 2. **A query server** (MCP) that lets AI apps and other programs ask the
    database questions ("top donors to committee X in 2024", "spending on
@@ -74,7 +74,7 @@ You'll see lines like `Loaded 1000 rows into rcpt_cd (progress: 12000000)`
 and, at the end of each table, a summary like
 `Table RCPT_CD: 20180537 read, 20180537 upserted, 0 skipped, 0 failed`.
 
-A small number of rows (a few hundred out of 55 million) are broken **in the
+A small number of rows (~1,000 out of 80.7 million) are broken **in the
 State's own source files** — the loader logs them into an audit table called
 `etl_dead_letter` instead of failing. That is expected and fine.
 
@@ -168,7 +168,7 @@ NOT NULL except primary keys, because the source data regularly omits fields.
 
 ## Known source-data quirks (not bugs in this system)
 
-- ~1,009 rows out of 55 million are malformed in the SOS export itself
+- ~1,009 rows out of 80.7 million are malformed in the SOS export itself
   (columns shifted, or entirely empty). They're in `etl_dead_letter` with
   the full row data if you ever need them.
 - 3 source tables are genuinely empty in the export (lobbyist history files).
