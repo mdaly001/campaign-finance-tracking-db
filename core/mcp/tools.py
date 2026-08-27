@@ -24,6 +24,12 @@ Real-schema conventions (CAL-ACCESS export, 2002 data model):
   organizations in ``ctrib_dscr``. Payees: ``payee_naml``/``payee_namf``.
 - Aliases come from the scraper-owned ``entity_alias`` table (empty until
   entity resolution has run); matching degrades gracefully to direct names.
+- Contribution tools read the ``receipts_all`` view, which unions
+  ``rcpt_cd`` (periodic reports) with the rapid-disclosure tables
+  ``s497_cd`` (Form 497 24-hour large-contribution reports) and
+  ``s498_cd`` (Form 498 receipts). A gift disclosed in a 24-hour report is
+  usually disclosed again in a later periodic report, so the tools de-dup
+  across sources before counting (see the de-dup note above the helpers).
 
 Each tool returns structured data via Pydantic models that map to
 JSON-serializable dictionaries for the MCP transport layer.
@@ -189,6 +195,113 @@ def _committee_predicate(alias: str) -> str:
     )
 
 
+# --------------------------------------------------------------------------- #
+#  Receipts union + 24-hour de-duplication
+# --------------------------------------------------------------------------- #
+#
+# Contributions are disclosed in three detail tables: rcpt_cd (periodic
+# reports), s497_cd (Form 497 24-hour large-contribution reports) and
+# s498_cd (Form 498 rapid-disclosure receipts). A gift that triggered a
+# 24-hour report is usually reported AGAIN in a later periodic report, so
+# the same contribution can appear in more than one table.
+#
+# The ``receipts_all`` view (migrations/0002) normalizes the three tables
+# into one row layout. The de-dup below runs on the *filtered* subset of
+# that view: for each (donor, date, amount) group it keeps
+# ``max(rows-per-source)`` rows, preferring rcpt_cd rows first, so that
+#
+#   * a gift reported in both a 24-hour and a periodic report counts once,
+#   * two different gifts with the same date+amount on the same day both
+#     survive (the group keeps the max of the per-source counts, not the
+#     min — a source that reported the day more completely wins).
+#
+# Known limitation: rows are matched by donor name (or donor cmte_id when
+# the name is blank). A committee donor identified by name in one source
+# and by cmte_id in the other is not merged and can be counted twice.
+
+
+_SRC_PRIORITY = "CASE src WHEN 'rcpt_cd' THEN 1 WHEN 's497_cd' THEN 2 ELSE 3 END"
+
+
+def _donor_match_predicate(alias: str, alias_clauses: str) -> str:
+    """WHERE fragment matching a donor by name across all receipt sources.
+
+    Individuals match ``donor_naml``/``donor_namf`` (s497/s498 store org
+    names in the same "name last" column, so they match too); organizations
+    also match ``ctrib_dscr`` (rcpt_cd only) and entity_alias names.
+    """
+    return (
+        f"({alias}.donor_naml ILIKE :last"
+        f" OR ({alias}.donor_naml ILIKE :last"
+        f" AND {alias}.donor_namf ILIKE :first_mid)"
+        f" OR {alias}.donor_naml ILIKE :full"
+        f" OR {alias}.ctrib_dscr ILIKE :full"
+        f"{alias_clauses})"
+    )
+
+
+def _alias_clauses(alias: str, p: dict[str, str]) -> tuple[str, dict[str, Any]]:
+    """Build entity_alias match clauses for the receipts view."""
+    extra: dict[str, Any] = {}
+    aliases = [
+        a for a in _alias_names(p["base"]) if a.lower() != p["base"].lower()
+    ]
+    if not aliases:
+        return "", extra
+    clause = " OR " + " OR ".join(
+        f"({alias}.ctrib_dscr = :alias{i} OR {alias}.donor_naml = :alias{i})"
+        for i in range(len(aliases))
+    )
+    for i, a in enumerate(aliases):
+        extra[f"alias{i}"] = a
+    return clause, extra
+
+
+def _rowlist_dedup_sql(
+    row_cte: str, select_sql: str, order_by: str, limit: int | str
+) -> str:
+    """Wrap a filtered row CTE (named ``r``) in the cross-source de-dup.
+
+    ``row_cte`` must select the normalized ``receipts_all`` columns
+    (``src, filing_id, tran_id, receipt_date, amount, donor_key,
+    donor_name, ...``) already restricted to the donor/cycle/date of
+    interest. ``select_sql`` is the final SELECT list (prefix columns with
+    ``s.``); the result rows come from ``seq s`` joined to the ``keep``
+    CTE. See the module de-dup note above for the semantics.
+    """
+    return f"""
+    WITH {row_cte},
+    seq AS (
+        SELECT r.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY donor_key, receipt_date, amount
+                   ORDER BY {_SRC_PRIORITY},
+                            tran_id NULLS LAST,
+                            filing_id
+               ) AS rn
+        FROM r
+    ),
+    keep AS (
+        SELECT donor_key, receipt_date, amount, MAX(src_n) AS keep_n
+        FROM (
+            SELECT donor_key, receipt_date, amount, src, COUNT(*) AS src_n
+            FROM r
+            GROUP BY 1, 2, 3, 4
+        ) p
+        GROUP BY 1, 2, 3
+    )
+    {select_sql}
+    FROM seq s
+    JOIN keep k
+      ON k.donor_key = s.donor_key
+     AND k.receipt_date = s.receipt_date
+     AND k.amount = s.amount
+    WHERE s.rn <= k.keep_n
+    ORDER BY {order_by}
+    LIMIT {limit}
+    """
+
+
 def _committee_name(committee_id: str) -> dict[str, Any] | None:
     """Resolve a cmte_id (e.g. 'C0695132') to its filername_cd record.
 
@@ -239,6 +352,7 @@ class ContributionRecord(BaseModel):
     cmte_id: str | None = None
     memo_refno: str | None = None
     donor_name: str | None = None
+    source: str | None = None  # receipts_all source: rcpt_cd | s497_cd | s498_cd
 
 
 # -- 2. top_donors_for_committee_or_candidate -------------------------------- #
@@ -349,6 +463,7 @@ class DonorWatchRecord(BaseModel):
     cmte_id: str | None = None
     memo_refno: str | None = None
     donor_name: str | None = None
+    source: str | None = None  # receipts_all source: rcpt_cd | s497_cd | s498_cd
 
 
 # -- 8. upcoming_filings ---------------------------------------------------------- #
@@ -388,11 +503,17 @@ def contributions_by_donor(
 ) -> list[dict[str, Any]]:
     """Return all contributions by a donor name in a given election cycle.
 
+    Covers periodic reports AND the 24-hour Form 497 / Form 498 rapid
+    reports (via the ``receipts_all`` view); a gift disclosed in both is
+    counted once (see the de-dup note above the helpers). Each row's
+    ``source`` names the table it came from.
+
     Args:
         donor_name: Partial or full donor name (``"Last, First M"`` or free
-            text). Individuals match ``ctrib_naml``/``ctrib_namf``;
-            organizations match ``ctrib_dscr``.
-        cycle: Election cycle year (e.g. 2024) — derived from ``rcpt_date``.
+            text). Individuals match the donor last/first-name fields;
+            organizations match the donor/org name and description fields.
+        cycle: Election cycle year (e.g. 2024) — derived from the receipt
+            date.
         include_aliases: If True, also match alias names from the
             scraper-owned ``entity_alias`` table.
 
@@ -400,44 +521,35 @@ def contributions_by_donor(
         List of ContributionRecord dicts (newest first, max 500).
     """
     p = _name_parts(donor_name)
+    alias_clauses, extra_params = (
+        _alias_clauses("x", p) if include_aliases else ("", {})
+    )
 
-    alias_clauses = ""
-    extra_params: dict[str, Any] = {}
-    if include_aliases:
-        aliases = [a for a in _alias_names(p["base"]) if a.lower() != p["base"].lower()]
-        if aliases:
-            alias_clauses = " OR " + " OR ".join(
-                f"r.ctrib_dscr = :alias{i}" for i in range(len(aliases))
-            )
-            for i, a in enumerate(aliases):
-                extra_params[f"alias{i}"] = a
-
-    sql = f"""
-        SELECT
-            r.tran_id,
-            r.filing_id,
-            r.amend_id,
-            EXTRACT(YEAR FROM r.rcpt_date)::int AS cycle,
-            r.amount,
-            r.rcpt_date,
-            r.ctrib_dscr AS purpose,
-            r.cmte_id,
-            r.memo_refno,
-            COALESCE(
-                NULLIF(TRIM(COALESCE(r.ctrib_naml, '') || ' ' || COALESCE(r.ctrib_namf, '')), ''),
-                r.ctrib_dscr
-            ) AS donor_name
-        FROM rcpt_cd r
-        WHERE EXTRACT(YEAR FROM r.rcpt_date)::int = :cycle
-          AND (
-                r.ctrib_naml ILIKE :last
-             OR (r.ctrib_naml ILIKE :last AND r.ctrib_namf ILIKE :first_mid)
-             OR r.ctrib_dscr ILIKE :full
-            {alias_clauses}
-          )
-        ORDER BY r.rcpt_date DESC
-        LIMIT 500
+    row_cte = f"""
+        r AS (
+            SELECT x.src, x.filing_id, x.amend_id, x.tran_id, x.receipt_date,
+                   x.amount, x.ctrib_dscr, x.cmte_id, x.memo_refno,
+                   x.donor_key, x.donor_name
+            FROM receipts_all x
+            WHERE EXTRACT(YEAR FROM x.receipt_date)::int = :cycle
+              AND {_donor_match_predicate('x', alias_clauses)}
+        )
     """
+    select_sql = """
+        SELECT
+            s.src AS source,
+            s.tran_id,
+            s.filing_id,
+            s.amend_id,
+            EXTRACT(YEAR FROM s.receipt_date)::int AS cycle,
+            s.amount,
+            s.receipt_date AS rcpt_date,
+            s.ctrib_dscr AS purpose,
+            s.cmte_id,
+            s.memo_refno,
+            COALESCE(NULLIF(TRIM(s.donor_name), ''), s.cmte_id) AS donor_name
+    """
+    sql = _rowlist_dedup_sql(row_cte, select_sql, "s.receipt_date DESC", 500)
     rows = execute_read(
         sql,
         {"cycle": cycle, "last": p["last"], "first_mid": p["first_mid"],
@@ -457,6 +569,7 @@ def contributions_by_donor(
             cmte_id=c.get("cmte_id"),
             memo_refno=c.get("memo_refno"),
             donor_name=c.get("donor_name"),
+            source=c.get("source"),
         )
         out.append(rec.model_dump())
     return out
@@ -469,10 +582,14 @@ def top_donors_for_committee_or_candidate(
 ) -> list[dict[str, Any]]:
     """Return the top N donors by total amount to a committee in a cycle.
 
+    Covers periodic reports AND the 24-hour Form 497 / Form 498 rapid
+    reports (via the ``receipts_all`` view); a gift disclosed in both is
+    counted once (see the de-dup note above the helpers).
+
     Args:
         committee_id: Committee ID as it appears on filings (``cmte_id``
             or ``xref_id``, e.g. ``C0695132``).
-        cycle: Election cycle year (derived from ``rcpt_date``).
+        cycle: Election cycle year (derived from the receipt date).
         limit: Maximum number of donors to return (default 10).
 
     Returns:
@@ -480,28 +597,50 @@ def top_donors_for_committee_or_candidate(
     """
     # For PAC / committee-to-committee receipts the SOS export leaves the
     # donor name fields blank and identifies the donor by committee ID in
-    # rcpt_cd.cmte_id; resolve the name through filer_xref -> filername.
-    # (filer_xref.xref_id is unique per filer, and donor_cmte is deduped to
-    # one row per filer, so the joins cannot multiply receipt rows.)
+    # cmte_id; resolve the name through filer_xref -> filername.
+    # (xref_id is unique in filer_xref_cd, and donor_cmte is deduped to one
+    # row per filer, so the joins cannot multiply receipt rows.)
+    #
+    # The r/dedup CTEs implement the cross-source de-dup: rows are grouped
+    # per (donor, date, amount, source) and the group keeps the MAX
+    # per-source row count, so double-reported gifts count once.
     sql = f"""
         WITH donor_cmte AS (
             SELECT DISTINCT ON (filer_id) filer_id, naml, namf
             FROM filername_cd
+        ),
+        r AS (
+            SELECT x.donor_key, x.donor_name, x.cmte_id,
+                   x.receipt_date, x.amount, x.src,
+                   COUNT(*) AS src_n
+            FROM receipts_all x
+            WHERE {_committee_predicate('x')}
+              AND EXTRACT(YEAR FROM x.receipt_date)::int = :cycle
+            GROUP BY x.donor_key, x.donor_name, x.cmte_id,
+                     x.receipt_date, x.amount, x.src
+        ),
+        dedup AS (
+            SELECT donor_key,
+                   MAX(NULLIF(donor_name, '')) AS donor_name,
+                   MAX(cmte_id) AS cmte_id,
+                   receipt_date,
+                   amount,
+                   MAX(src_n) AS keep_n
+            FROM r
+            GROUP BY donor_key, receipt_date, amount
         )
         SELECT
             COALESCE(
-                NULLIF(TRIM(COALESCE(r.ctrib_naml, '') || ' ' || COALESCE(r.ctrib_namf, '')), ''),
-                r.ctrib_dscr,
+                NULLIF(TRIM(dedup.donor_name), ''),
                 NULLIF(TRIM(COALESCE(dc.naml, '') || ' ' || COALESCE(dc.namf, '')), ''),
+                dedup.cmte_id,
                 '(unknown)'
             ) AS donor_name,
-            COUNT(*) AS contributions,
-            COALESCE(SUM(r.amount), 0) AS total
-        FROM rcpt_cd r
-        LEFT JOIN filer_xref_cd fx ON fx.xref_id = r.cmte_id
+            SUM(keep_n) AS contributions,
+            SUM(keep_n * amount) AS total
+        FROM dedup
+        LEFT JOIN filer_xref_cd fx ON fx.xref_id = dedup.cmte_id
         LEFT JOIN donor_cmte dc ON dc.filer_id = fx.filer_id
-        WHERE {_committee_predicate('r')}
-          AND EXTRACT(YEAR FROM r.rcpt_date)::int = :cycle
         GROUP BY 1
         ORDER BY total DESC
         LIMIT :lim
@@ -714,6 +853,10 @@ def committee_profile(
 ) -> dict[str, Any] | None:
     """Return a summary profile for a committee.
 
+    Contribution totals include the 24-hour Form 497 / Form 498 rapid
+    reports (via the ``receipts_all`` view); double-reported gifts are
+    counted once (see the de-dup note above the helpers).
+
     Args:
         committee_id: Committee ID (``cmte_id`` or ``xref_id``,
             e.g. ``C0695132``).
@@ -726,17 +869,32 @@ def committee_profile(
     name_row = _committee_name(committee_id)
     filer_id = _resolve_filer_id(committee_id)
 
-    asof_clause_r = " AND r.rcpt_date <= :asof" if as_of_date else ""
+    asof_clause_r = " AND x.receipt_date <= :asof" if as_of_date else ""
     asof_clause_e = " AND e.expn_date <= :asof" if as_of_date else ""
     params_base: dict[str, Any] = {"filer": filer_id}
     if as_of_date:
         params_base["asof"] = as_of_date
 
+    # receipts_all = rcpt_cd + 24-hr s497_cd + s498_cd; the dedup CTE keeps
+    # double-reported gifts counted once (max rows per donor+date+amount
+    # across sources).
     rcpt = execute_read(
         f"""
-        SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS n
-        FROM rcpt_cd r
-        WHERE {_committee_predicate('r')}{asof_clause_r}
+        WITH r AS (
+            SELECT x.donor_key, x.receipt_date, x.amount, x.src,
+                   COUNT(*) AS src_n
+            FROM receipts_all x
+            WHERE {_committee_predicate('x')}{asof_clause_r}
+            GROUP BY 1, 2, 3, 4
+        ),
+        dedup AS (
+            SELECT donor_key, receipt_date, amount, MAX(src_n) AS keep_n
+            FROM r
+            GROUP BY 1, 2, 3
+        )
+        SELECT COALESCE(SUM(keep_n * amount), 0) AS total,
+               COALESCE(SUM(keep_n), 0) AS n
+        FROM dedup
         """,
         params_base,
     )[0]
@@ -752,11 +910,12 @@ def committee_profile(
 
     # Note: GREATEST() would return NULL when the committee has receipts
     # but no expenditures (or vice versa), so the two maxima are merged
-    # with MAX() over a UNION ALL, which ignores NULLs.
+    # with MAX() over a UNION ALL, which ignores NULLs. The receipts branch
+    # uses receipts_all so 24-hour report activity counts as activity.
     last_row = execute_read(
         f"""
         SELECT MAX(d) AS last_activity FROM (
-            SELECT r.rcpt_date AS d FROM rcpt_cd r WHERE {_committee_predicate('r')}
+            SELECT x.receipt_date AS d FROM receipts_all x WHERE {_committee_predicate('x')}
             UNION ALL
             SELECT e.expn_date AS d FROM expn_cd e WHERE {_committee_predicate('e')}
         ) t
@@ -914,52 +1073,48 @@ def donor_watch_since(
 ) -> list[dict[str, Any]]:
     """Return contributions from a donor on or after a given date.
 
+    Covers periodic reports AND the 24-hour Form 497 / Form 498 rapid
+    reports (via the ``receipts_all`` view); a gift disclosed in both is
+    counted once (see the de-dup note above the helpers). Each row's
+    ``source`` names the table it came from.
+
     Args:
         donor_name: Donor name (``"Last, First M"`` or org name).
-        since_date: Inclusive lower bound on ``rcpt_date``.
+        since_date: Inclusive lower bound on the receipt date.
         include_aliases: If True, also match ``entity_alias`` names.
 
     Returns:
         List of DonorWatchRecord dicts (newest first, max 500).
     """
     p = _name_parts(donor_name)
+    alias_clauses, extra_params = (
+        _alias_clauses("x", p) if include_aliases else ("", {})
+    )
 
-    alias_clauses = ""
-    extra_params: dict[str, Any] = {}
-    if include_aliases:
-        aliases = [a for a in _alias_names(p["base"]) if a.lower() != p["base"].lower()]
-        if aliases:
-            alias_clauses = " OR " + " OR ".join(
-                f"r.ctrib_dscr = :alias{i}" for i in range(len(aliases))
-            )
-            for i, a in enumerate(aliases):
-                extra_params[f"alias{i}"] = a
-
-    sql = f"""
-        SELECT
-            r.tran_id,
-            r.filing_id,
-            r.amend_id,
-            r.amount,
-            r.rcpt_date,
-            r.ctrib_dscr AS purpose,
-            r.cmte_id,
-            r.memo_refno,
-            COALESCE(
-                NULLIF(TRIM(COALESCE(r.ctrib_naml, '') || ' ' || COALESCE(r.ctrib_namf, '')), ''),
-                r.ctrib_dscr
-            ) AS donor_name
-        FROM rcpt_cd r
-        WHERE r.rcpt_date >= :since
-          AND (
-                r.ctrib_naml ILIKE :last
-             OR (r.ctrib_naml ILIKE :last AND r.ctrib_namf ILIKE :first_mid)
-             OR r.ctrib_dscr ILIKE :full
-            {alias_clauses}
-          )
-        ORDER BY r.rcpt_date DESC
-        LIMIT 500
+    row_cte = f"""
+        r AS (
+            SELECT x.src, x.filing_id, x.amend_id, x.tran_id, x.receipt_date,
+                   x.amount, x.ctrib_dscr, x.cmte_id, x.memo_refno,
+                   x.donor_key, x.donor_name
+            FROM receipts_all x
+            WHERE x.receipt_date >= :since
+              AND {_donor_match_predicate('x', alias_clauses)}
+        )
     """
+    select_sql = """
+        SELECT
+            s.src AS source,
+            s.tran_id,
+            s.filing_id,
+            s.amend_id,
+            s.amount,
+            s.receipt_date AS rcpt_date,
+            s.ctrib_dscr AS purpose,
+            s.cmte_id,
+            s.memo_refno,
+            COALESCE(NULLIF(TRIM(s.donor_name), ''), s.cmte_id) AS donor_name
+    """
+    sql = _rowlist_dedup_sql(row_cte, select_sql, "s.receipt_date DESC", 500)
     rows = execute_read(
         sql,
         {"since": since_date, "last": p["last"], "first_mid": p["first_mid"],
@@ -978,6 +1133,7 @@ def donor_watch_since(
             cmte_id=c.get("cmte_id"),
             memo_refno=c.get("memo_refno"),
             donor_name=c.get("donor_name"),
+            source=c.get("source"),
         )
         out.append(rec.model_dump())
     return out

@@ -110,40 +110,46 @@ class MockDB:
                 )
             ]
 
-        # -- rcpt_cd queries (distinguish by shape) ------------------- #
-        if "FROM RCPT_CD" in norm:
-            if "GROUP BY" in norm and ":FILER" in norm:
-                # top_donors aggregation
+        # -- receipts_all queries (rcpt_cd + 24-hr s497_cd + s498_cd;
+        #    distinguish by shape) ------------------------------------- #
+        if "FROM RECEIPTS_ALL" in norm:
+            if "AS CONTRIBUTIONS" in norm:
+                # top_donors aggregation (24-hr deduped)
                 return [
                     _mock_row(["donor_name", "contributions", "total"],
                               ["Alice Smith", 2, 300.0]),
                     _mock_row(["donor_name", "contributions", "total"],
                               ["Bob Jones", 1, 50.0]),
                 ]
-            if "SUM(AMOUNT)" in norm and ":CYCLE" not in norm and ":SINCE" not in norm:
-                # committee_profile rcpt totals
+            if "SUM(KEEP_N" in norm and ":CYCLE" not in norm and ":SINCE" not in norm:
+                # committee_profile receipt totals (24-hr deduped)
                 return [_mock_row(["total", "n"], [1000.0, 7])]
             if ":SINCE" in norm:
                 # donor_watch_since
                 return [
                     _mock_row(
-                        ["tran_id", "filing_id", "amend_id", "amount", "rcpt_date",
-                         "purpose", "cmte_id", "memo_refno", "donor_name"],
-                        ["T9", 42, 0, 100.0, "2026-06-01", None, "C1", None, "Alice Smith"],
+                        ["source", "tran_id", "filing_id", "amend_id", "amount",
+                         "rcpt_date", "purpose", "cmte_id", "memo_refno", "donor_name"],
+                        ["rcpt_cd", "T9", 42, 0, 100.0, "2026-06-01", None, "C1",
+                         None, "Alice Smith"],
                     )
                 ]
             if ":CYCLE" in norm:
                 # contributions_by_donor
                 return [
                     _mock_row(
-                        ["tran_id", "filing_id", "amend_id", "cycle", "amount",
-                         "rcpt_date", "purpose", "cmte_id", "memo_refno", "donor_name"],
-                        ["T1", 42, 0, 2026, 100.5, "2026-01-15", "CONTRIBUTION", "C1", None, "Alice Smith"],
+                        ["source", "tran_id", "filing_id", "amend_id", "cycle",
+                         "amount", "rcpt_date", "purpose", "cmte_id",
+                         "memo_refno", "donor_name"],
+                        ["rcpt_cd", "T1", 42, 0, 2026, 100.5, "2026-01-15",
+                         "CONTRIBUTION", "C1", None, "Alice Smith"],
                     ),
                     _mock_row(
-                        ["tran_id", "filing_id", "amend_id", "cycle", "amount",
-                         "rcpt_date", "purpose", "cmte_id", "memo_refno", "donor_name"],
-                        ["T2", 43, 0, 2026, 50.0, "2026-02-01", None, "C1", "M1", "Acme Corp"],
+                        ["source", "tran_id", "filing_id", "amend_id", "cycle",
+                         "amount", "rcpt_date", "purpose", "cmte_id",
+                         "memo_refno", "donor_name"],
+                        ["s497_cd", "T2", 43, 0, 2026, 50.0, "2026-02-01",
+                         None, "C1", "M1", "Acme Corp"],
                     ),
                 ]
 
@@ -304,13 +310,15 @@ class TestContributionsByDonor:
         assert row["cmte_id"] == "C1"
         assert row["cycle"] == 2026
         assert row["donor_name"] == "Alice Smith"
+        # rows carry their receipts_all source (24-hr reports included)
+        assert {r["source"] for r in result} == {"rcpt_cd", "s497_cd"}
 
     def test_name_patterns_passed(self, patched_db):
         """The SQL should receive last/first_mid/full LIKE patterns."""
         from core.mcp.tools import contributions_by_donor
 
         contributions_by_donor("Smith, Alice M", 2026)
-        rcpt_call = next(c for c in _mock_db.calls if "FROM RCPT_CD" in c["sql"])
+        rcpt_call = next(c for c in _mock_db.calls if "FROM RECEIPTS_ALL" in c["sql"])
         assert rcpt_call["params"]["last"] == "%Smith%"
         assert rcpt_call["params"]["first_mid"] == "Alice M %"
         assert rcpt_call["params"]["full"] == "%Smith, Alice M%"
@@ -322,7 +330,7 @@ class TestContributionsByDonor:
         contributions_by_donor("Alice", 2026, include_aliases=True)
         alias_call = next(c for c in _mock_db.calls if "FROM ENTITY_ALIAS" in c["sql"])
         assert alias_call is not None
-        rcpt_call = next(c for c in _mock_db.calls if "FROM RCPT_CD" in c["sql"])
+        rcpt_call = next(c for c in _mock_db.calls if "FROM RECEIPTS_ALL" in c["sql"])
         assert "alias0" in rcpt_call["params"]
 
     def test_include_aliases_false(self, patched_db):
@@ -331,6 +339,146 @@ class TestContributionsByDonor:
 
         contributions_by_donor("Alice", 2026, include_aliases=False)
         assert not any("FROM ENTITY_ALIAS" in c["sql"] for c in _mock_db.calls)
+
+
+# ------------------------------------------------------------------ #
+#  24-hour reporting: contribution tools query receipts_all
+# ------------------------------------------------------------------ #
+
+class TestReceiptsUnion:
+    """24-hour Form 497 / Form 498 gifts live in s497_cd / s498_cd, not
+    rcpt_cd; every contribution tool must read the receipts_all union
+    and de-dup double-reported gifts across sources."""
+
+    def _receipts_calls(self):
+        return [c for c in _mock_db.calls if "FROM RECEIPTS_ALL" in c["sql"]]
+
+    def test_contributions_by_donor_uses_view(self, patched_db):
+        from core.mcp.tools import contributions_by_donor
+
+        contributions_by_donor("Smith", 2026)
+        assert self._receipts_calls()
+        assert not any("FROM RCPT_CD" in c["sql"] for c in _mock_db.calls)
+
+    def test_top_donors_uses_view_and_dedup(self, patched_db):
+        from core.mcp.tools import top_donors_for_committee_or_candidate
+
+        top_donors_for_committee_or_candidate("C1", 2026)
+        calls = self._receipts_calls()
+        assert calls
+        # de-dup keeps max(rows-per-source) per (donor, date, amount)
+        assert any("MAX(SRC_N)" in c["sql"] for c in calls)
+
+    def test_committee_profile_uses_view(self, patched_db):
+        from core.mcp.tools import committee_profile
+
+        committee_profile("C1")
+        calls = self._receipts_calls()
+        assert len(calls) >= 2  # contribution totals + last activity
+
+    def test_donor_watch_since_uses_view(self, patched_db):
+        from core.mcp.tools import donor_watch_since
+
+        donor_watch_since("Smith", date(2026, 1, 1))
+        assert self._receipts_calls()
+
+
+# ------------------------------------------------------------------ #
+#  Cross-source de-dup semantics (real SQL, in-memory SQLite)
+# ------------------------------------------------------------------ #
+
+class TestRowlistDedup:
+    """_rowlist_dedup_sql keeps max(rows-per-source) per (donor, date,
+    amount), preferring rcpt_cd rows. Verified against a real SQL engine
+    with a receipts_all-shaped fixture, so the window/CTE syntax and the
+    keep-rule itself are exercised, not just the SQL text."""
+
+    @pytest.fixture()
+    def dedup_engine(self):
+        from sqlalchemy import create_engine, text
+        from sqlalchemy.pool import StaticPool
+
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        with engine.begin() as conn:
+            conn.execute(text(
+                """
+                CREATE TABLE receipts_all (
+                    src TEXT,
+                    filing_id INTEGER,
+                    amend_id INTEGER,
+                    tran_id TEXT,
+                    receipt_date TEXT,
+                    amount NUMERIC,
+                    donor_naml TEXT,
+                    donor_namf TEXT,
+                    ctrib_dscr TEXT,
+                    cmte_id TEXT,
+                    memo_refno TEXT,
+                    donor_key TEXT,
+                    donor_name TEXT
+                )
+                """
+            ))
+            conn.execute(text(
+                """
+                INSERT INTO receipts_all VALUES
+                -- ACLU $200k gift reported on BOTH a 24-hour report and
+                -- the later periodic report -> must count once, and the
+                -- rcpt_cd row is preferred
+                ('rcpt_cd', 100, 0, 'T1', '2026-04-03', 200000,
+                 'ACLU OF NORTHERN CALIFORNIA', '', NULL, 'C100', NULL,
+                 'ACLU OF NORTHERN CALIFORNIA', 'ACLU OF NORTHERN CALIFORNIA'),
+                ('s497_cd', 101, 0, 'T2', '2026-04-03', 200000,
+                 'ACLU OF NORTHERN CALIFORNIA', '', NULL, NULL, NULL,
+                 'ACLU OF NORTHERN CALIFORNIA', 'ACLU OF NORTHERN CALIFORNIA'),
+                -- SEIU: two DIFFERENT $12.5k gifts the same day, disclosed
+                -- only on 24-hour reports -> both must survive
+                ('s497_cd', 102, 0, 'T3', '2026-08-06', 12500,
+                 'SEIU', '', NULL, NULL, NULL, 'SEIU', 'SEIU'),
+                ('s497_cd', 103, 0, 'T4', '2026-08-06', 12500,
+                 'SEIU', '', NULL, NULL, NULL, 'SEIU', 'SEIU'),
+                -- periodic-only individual gift
+                ('rcpt_cd', 104, 0, 'T5', '2026-05-01', 500,
+                 'JONES', 'BOB', NULL, NULL, NULL, 'JONES BOB', 'JONES BOB')
+                """
+            ))
+        return engine
+
+    def _run(self, engine):
+        from sqlalchemy import text
+
+        from core.mcp.tools import _rowlist_dedup_sql
+
+        sql = _rowlist_dedup_sql(
+            "r AS (SELECT * FROM receipts_all)",
+            "SELECT s.src, s.filing_id, s.amount",
+            "s.receipt_date DESC, s.filing_id",
+            100,
+        )
+        with engine.connect() as conn:
+            return [dict(r._mapping) for r in conn.execute(text(sql))]
+
+    def test_double_reported_gift_counts_once(self, dedup_engine):
+        rows = self._run(dedup_engine)
+        aclu = [r for r in rows if r["amount"] == 200000]
+        assert len(aclu) == 1
+        assert aclu[0]["src"] == "rcpt_cd"  # periodic row preferred
+
+    def test_multi_gift_same_day_survives(self, dedup_engine):
+        rows = self._run(dedup_engine)
+        seiu = [r for r in rows if r["amount"] == 12500]
+        assert len(seiu) == 2
+        assert {r["filing_id"] for r in seiu} == {102, 103}
+
+    def test_row_count_and_totals(self, dedup_engine):
+        rows = self._run(dedup_engine)
+        # 1 (ACLU) + 2 (SEIU) + 1 (Jones) = 4 rows, not 5 naive
+        assert len(rows) == 4
+        assert sum(float(r["amount"]) for r in rows) == 225500.0
 
 
 # ------------------------------------------------------------------ #
@@ -468,7 +616,9 @@ class TestCommitteeProfile:
         # only the name-lookup and GREATEST queries can be empty/null.
         def _zero_aggregates(sql, params=None):
             s = sql.upper()
-            if "SUM(AMOUNT)" in s:
+            # SUM(KEEP_N ...) = receipts_all 24-hr-deduped contribution
+            # totals; SUM(AMOUNT) = expn_cd totals.
+            if "SUM(KEEP_N" in s or "SUM(AMOUNT)" in s:
                 return [{"total": 0, "n": 0}]
             if "AS LAST_ACTIVITY" in s:
                 return [{"last_activity": None}]
@@ -503,10 +653,10 @@ class TestCommitteeProfile:
         assert result["as_of_date"] == "2026-01-01"
         rcpt_call = next(
             c for c in _mock_db.calls
-            if "FROM RCPT_CD" in c["sql"] and "SUM(AMOUNT)" in c["sql"]
+            if "FROM RECEIPTS_ALL" in c["sql"] and "SUM(KEEP_N" in c["sql"]
         )
         assert rcpt_call["params"]["asof"] == date(2026, 1, 1)
-        assert "RCPT_DATE <= :ASOF" in rcpt_call["sql"]
+        assert "RECEIPT_DATE <= :ASOF" in rcpt_call["sql"]
 
 
 # ------------------------------------------------------------------ #
@@ -600,9 +750,9 @@ class TestDonorWatchSince:
         from core.mcp.tools import donor_watch_since
 
         donor_watch_since("Smith", date(2026, 1, 1), include_aliases=False)
-        rcpt_call = next(c for c in _mock_db.calls if "FROM RCPT_CD" in c["sql"])
+        rcpt_call = next(c for c in _mock_db.calls if "FROM RECEIPTS_ALL" in c["sql"])
         assert rcpt_call["params"]["since"] == date(2026, 1, 1)
-        assert "RCPT_DATE >= :SINCE" in rcpt_call["sql"]
+        assert "RECEIPT_DATE >= :SINCE" in rcpt_call["sql"]
 
 
 # ------------------------------------------------------------------ #

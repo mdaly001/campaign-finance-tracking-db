@@ -92,9 +92,9 @@
 | Table | Description | Rows (est.) | Key Columns |
 |-------|-------------|-------------|-------------|
 | `s401_cd` | Schedule S401 — Independent Expenditures | ~3M | filer_id, expn_amt, expn_date |
-| `s496_cd` | Schedule S496 — Small Contributions | ~500K | filing_id, amount |
-| `s497_cd` | Schedule S497 — Large Contributions (> $1K) | ~2M | filer_id, amount, receipt_dt |
-| `s498_cd` | Schedule S498 — Large Expenditures (> $10K) | ~500K | filer_id, expn_amt |
+| `s496_cd` | Schedule S496 — expenditure lines (no payee name fields in this export) | 75,636 | filing_id, amount, exp_date, expn_dscr |
+| `s497_cd` | Form 497 — Large Contribution report (24-hour reporting; donor in `enty_*` fields) | 1,392,112 | filing_id, ctrib_date, amount, enty_naml, enty_namf, cmte_id |
+| `s498_cd` | Form 498 — Rapid Disclosure (F498-R receipts + F498-A attribution lines) | 27,520 | filing_id, date_rcvd, amt_rcvd, amt_attrib, payor_naml, payor_namf |
 | `f495p2` | F-495 Part 2 — Candidate Contributions | 20,000 | elect_date, contribamt |
 | `f501_502` | F-501/F-502 Report of Organization/Candidate | 150,000 | filer_id, cand_office |
 | `f690p2` | F-690 Part 2 — Lobbying Amendments | 5,000 | filing_id, exec_date |
@@ -290,8 +290,10 @@ filers.filer_id ← cvr_registration.filer_id
 filers.filer_id ← cvr_so.filer_id
 filers.filer_id ← cvr_lobby_disclosure.filer_id
 filers.filer_id ← s401_cd.filer_id
-filers.filer_id ← s497_cd.filer_id
-filers.filer_id ← s498_cd.filer_id
+filers.filer_id ← filer_filings_cd.filer_id  (rapid tables below join via filing_id)
+filings.filing_id ← s497_cd.filing_id
+filings.filing_id ← s498_cd.filing_id
+filings.filing_id ← s496_cd.filing_id
 
 filings.filing_id ← rcpt_cd.filing_id
 filings.filing_id ← exppd_cd.filing_id
@@ -313,10 +315,10 @@ filing_periods.period_id → filings.period_id
 - **Primary indexes:** All PRIMARY KEY columns (B-tree)
 - **FK indexes:** All foreign key columns
 - **Query-optimized indexes:**
-  - `rcpt_cd`: (filer_id, receipt_dt), (committee_id, receipt_dt), amount DESC, cand_office
+  - `rcpt_cd`: cmte_id, ctrib_naml, filing_id, rcpt_date
   - `exppd_cd`: (filer_id, expn_date), amount DESC, payee_naml
   - `s401_cd`: (filer_id, expn_date), expn_amt DESC
-  - `s497_cd`: (filer_id, receipt_dt), amount DESC WHERE amount > 1000
-  - `s498_cd`: (filer_id, expn_date), expn_amt DESC WHERE expn_amt > 10000
+  - `s497_cd`: filing_id (supports the `receipts_all` union view)
+  - `s498_cd`: filing_id (supports the `receipts_all` union view)
 - **Entity resolution:** GIN indexes on naml/fullname using `to_tsvector('simple')`
 - **Fuzzy matching:** pg_trgm and fuzzystrmatch extensions enabled
