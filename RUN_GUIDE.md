@@ -106,8 +106,12 @@ sleep 2; kill %1
 ```
 
 **c. (Optional) connect a client.** Point any MCP client at
-`http://localhost:9527/sse`. It exposes 11 tools, for example:
+`http://localhost:9527/sse`. It exposes **15** read-only tools. Tell your
+agent to call `get_server_docs` first — it returns the full guide
+(`docs/mcp_server.md`), so the agent needs no other repository access:
 
+- `get_server_docs` — the full guide (args, conventions, worked examples)
+- `describe_table` — columns + gotchas for any table, before ad-hoc SQL
 - `contributions_by_donor` — everything a donor has given, with cycle filter
 - `top_donors_for_committee_or_candidate` — biggest donors to a committee
 - `committee_profile` — who runs the committee, status, address
@@ -115,6 +119,8 @@ sleep 2; kill %1
 - `measure_spending` — spending tied to a ballot measure
 - `vendor_revenue` — what vendors are paid across the system
 - `committees_paying_vendor` — who pays a vendor (handles name variants; `candidate_only` to exclude ballot-measure committees)
+- `payments_to_person` — every role a person plays at once: paid as vendor, gave as donor, ran as candidate; flags the 24-hour blind-spot count
+- `rapid_expense_vendors` — recover payee names for a committee's 24-hour (Form 496) expense lines
 - `donor_watch_since`, `upcoming_filings`, `filing_due_soon`, `committee_outlays_to`
 
 ## Day to day

@@ -1,6 +1,6 @@
 """MCP server entry point for the Campaign Finance Database.
 
-Launches an SSE-based MCP server with 11 Phase 1 query tools.
+Launches an SSE-based MCP server with 15 read-only query tools.
 Runs on port 9527 (configurable via MCP_PORT env var) with /sse endpoint.
 
 Usage:
@@ -24,10 +24,14 @@ from core.mcp.tools import (
     committee_profile,
     committees_paying_vendor,
     contributions_by_donor,
+    describe_table,
     donor_watch_since,
     filing_due_soon,
     find_committees,
+    get_server_docs,
     measure_spending,
+    payments_to_person,
+    rapid_expense_vendors,
     top_donors_for_committee_or_candidate,
     upcoming_filings,
     vendor_revenue,
@@ -48,7 +52,38 @@ TOOLS: list[str] = [
     "donor_watch_since",
     "upcoming_filings",
     "filing_due_soon",
+    "payments_to_person",
+    "rapid_expense_vendors",
+    "describe_table",
+    "get_server_docs",
 ]
+
+# Delivered to the client in the MCP initialize response so a freshly
+# attached agent gets the essentials before its first tool call.
+INSTRUCTIONS = """\
+California campaign-finance disclosure data (CAL-ACCESS, CA Secretary of
+State), read-only. Call get_server_docs() first for the full guide;
+describe_table() shows columns + gotchas for any table before ad-hoc SQL.
+
+Essentials:
+- Individuals are stored LAST-first (naml=last name, namf=first name);
+  organizations sit in the naml field. Name search is word-anchored and
+  case-insensitive.
+- A "cycle" is derived from the transaction date; there is no year column.
+- Contribution tools read the receipts_all view (periodic + 24-hour forms,
+  de-duplicated) — a gift in both counts once.
+- 24-hour EXPENDITURE reports (Form 496 / s496_cd) have NO payee name:
+  vendor answers are a lower bound. Use rapid_expense_vendors(committee_id)
+  to recover payees (80-97% resolve via date+amount match).
+- Use payments_to_person(name) for "who paid X / what did X pay" questions
+  — it checks payee, donor, and committee/candidate roles at once. Its
+  blind_spot count shows how many unnamed 24-hour expense lines the paying
+  committees have (run rapid_expense_vendors on those committees).
+- Committee ids (cmte_id, e.g. C0695132) resolve to filer ids internally;
+  find_committees() looks them up from names.
+- Data is a snapshot (not live); check the newest transaction date for
+  freshness. Snapshot: newest reports received ~2026-08-24.
+"""
 
 
 def _create_server() -> MCPServer:
@@ -66,10 +101,12 @@ def _create_server() -> MCPServer:
         name="cfdb",
         title="Campaign Finance Database",
         description=(
-            "Query tool for California campaign finance disclosure data. "
-            "Provides read-only access to contributions, expenditures, "
-            "committee profiles, and filing deadlines."
+            "Read-only query tools for California campaign finance "
+            "disclosure data (CAL-ACCESS): contributions, expenditures, "
+            "committees, people, filing deadlines, and 24-hour-report "
+            "vendor resolution."
         ),
+        instructions=INSTRUCTIONS,
     )
 
     # 1. contributions_by_donor
@@ -186,6 +223,67 @@ def _create_server() -> MCPServer:
             "hits 'AL MEDIA LLC' but not 'CENTRAL MEDIA'). "
             "Set candidate_only=True to restrict to candidate committees "
             "(excludes ballot-measure and other committee types)."
+        ),
+    )
+
+    # 12. payments_to_person
+    server.add_tool(
+        payments_to_person,
+        name="payments_to_person",
+        description=(
+            "Find every role a person plays in the disclosure data in one "
+            "call: payments made TO the person (as vendor/payee in "
+            "expenditure records), contributions made BY the person "
+            "(de-duplicated across periodic and 24-hour reports), and "
+            "committees/candidates whose name matches. Name matching is "
+            "field-aware and word-anchored, so 'Daly' never hits 'Odalys' "
+            "and last-first storage is handled automatically. When the "
+            "person was paid, the result includes a blind_spot count of "
+            "the paying committees' Form 496 (24-hour) expense lines, "
+            "which carry no payee name — resolve them with "
+            "rapid_expense_vendors."
+        ),
+    )
+
+    # 13. rapid_expense_vendors
+    server.add_tool(
+        rapid_expense_vendors,
+        name="rapid_expense_vendors",
+        description=(
+            "Recover the payees of a committee's 24-hour (Form 496) "
+            "expenditures, which the SOS export discloses without payee "
+            "names. Matches each 24-hour line to its periodic-report "
+            "re-filing by (payment date, amount) within the same filer "
+            "(80-97% of lines resolve on the largest rapid-disclosure "
+            "filers). Returns resolved and unresolved lines plus a "
+            "resolution percentage; unresolved lines are usually recent "
+            "spend awaiting the next periodic report."
+        ),
+    )
+
+    # 14. describe_table
+    server.add_tool(
+        describe_table,
+        name="describe_table",
+        description=(
+            "Show the columns, approximate row count, and known gotchas "
+            "for any public table or view. Call this before writing "
+            "ad-hoc SQL — the 24-hour tables have divergent column names "
+            "(s497_cd uses amount/ctrib_date; s498_cd uses "
+            "amt_rcvd/date_rcvd) and several tables carry documented "
+            "join pitfalls."
+        ),
+    )
+
+    # 15. get_server_docs
+    server.add_tool(
+        get_server_docs,
+        name="get_server_docs",
+        description=(
+            "Return the full server quick-start guide as markdown: every "
+            "tool with arguments and when to use it, the data "
+            "conventions, and the known caveats. Call this first when "
+            "attaching a new agent."
         ),
     )
 

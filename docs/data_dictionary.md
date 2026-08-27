@@ -268,6 +268,24 @@ Lobbying activity summary per registered lobbyist.
 - filings_count: Number of associated filings
 - activity_descriptions: Count of non-null activity descriptions
 
+### receipts_all
+
+Contribution source-of-truth for the MCP contribution tools. A simple
+`UNION ALL` of the periodic receipt line table and the 24-hour
+contribution forms, normalized to one column set.
+
+- Sources: `rcpt_cd` (periodic), `s497_cd` (24-hour large contributions),
+  `s498_cd` (24-hour receipts, `form_type = 'F498-R'` only)
+- Columns: `src` (origin table), `filing_id`, `amend_id`, `tran_id`,
+  `receipt_date`, `amount`, `donor_naml`/`donor_namf` (individual) or
+  `ctrib_dscr` (organization), `cmte_id` (donor committee, if any),
+  `memo_refno`, `donor_key`, `donor_name`
+- **No de-duplication in the view**: a gift reported in both a 24-hour
+  report and the later periodic re-report appears twice here. The MCP
+  tools apply cross-source de-duplication on top (filer, donor key,
+  amount, near-date), so such a gift counts once in tool results.
+  Ad-hoc SQL against this view must de-duplicate itself.
+
 ---
 
 ## Column Type Conventions

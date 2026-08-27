@@ -40,6 +40,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from decimal import Decimal
 from typing import Any
 
@@ -134,6 +135,57 @@ def _vendor_regex(name: str) -> str:
     but NOT ``CENTRAL MEDIA``. Used with the SQL ``~*`` operator.
     """
     return r"\m" + re.sub(r"([.\\+*?[](){}^$|])", r"\\\1", (name or "").strip())
+
+
+def _person_predicate(
+    naml_field: str, namf_field: str, name: str, prefix: str = "pl"
+) -> tuple[str, dict[str, Any]]:
+    """SQL predicate + params matching a *person* name across the two
+    name fields of one alias row.
+
+    Handles every storage order seen in the SOS export:
+
+    - last-first:  ``naml='Daly'``, ``namf='Michael Gomez'``
+    - first-last:  ``naml='Michael'``, ``namf='Daly'``
+    - single field: ``naml='Gomez Daly'``, ``namf=''`` (or the reverse)
+
+    Matches are word-anchored (``\\m``, Postgres ARE flavor) so searching
+    "Daly" never hits ``Odalys`` or ``BRENDALYN``, and a middle name is
+    optional (searching "Michael Gomez Daly" still finds "Daly Michael").
+    Used with the case-insensitive ``~*`` operator.
+    """
+    p = _name_parts(name)
+    last = p["last"].strip("%").strip()
+    first = p["first_mid"].strip().rstrip("%").strip()
+    first = first.split()[0] if first else ""  # middle initials optional
+
+    last_r, first_r = re.escape(last), re.escape(first)
+    naml, namf = naml_field, namf_field
+    comb = (
+        f"TRIM(COALESCE({naml}, '') || ' ' || COALESCE({namf}, ''))"
+    )
+    params: dict[str, Any] = {}
+    branches: list[str] = []
+    if last and first:
+        branches.append(f"({naml} ~* :{prefix}_last AND {namf} ~* :{prefix}_first)")
+        branches.append(f"({naml} ~* :{prefix}_first AND {namf} ~* :{prefix}_last)")
+        branches.append(f"({comb} ~* :{prefix}_lastfirst)")
+        branches.append(f"({comb} ~* :{prefix}_firstlast)")
+        params = {
+            f"{prefix}_last": rf"\m{last_r}",
+            f"{prefix}_first": rf"\m{first_r}",
+            f"{prefix}_lastfirst": rf"\m{last_r}\b[\s,.]+{first_r}",
+            f"{prefix}_firstlast": rf"\m{first_r}(?:[\s.][^.]*[\s.])*{last_r}\b",
+        }
+    elif last:
+        branches.append(f"({naml} ~* :{prefix}_last)")
+        branches.append(f"({namf} ~* :{prefix}_last)")
+        params = {f"{prefix}_last": rf"\m{last_r}"}
+    else:
+        branches.append(f"({naml} ~* :{prefix}_first)")
+        branches.append(f"({namf} ~* :{prefix}_first)")
+        params = {f"{prefix}_first": rf"\m{first_r}"}
+    return "(" + " OR ".join(branches) + ")", params
 
 
 def _alias_names(base: str, limit: int = 50) -> list[str]:
@@ -1244,3 +1296,573 @@ def filing_due_soon(days_ahead: int = 7) -> list[dict[str, Any]]:
         )
         out.append(rec.model_dump())
     return out
+
+
+# --------------------------------------------------------------------------- #
+#  12. payments_to_person
+#  13. rapid_expense_vendors
+#  14. describe_table
+#  15. get_server_docs
+# --------------------------------------------------------------------------- #
+
+
+class PersonPayment(BaseModel):
+    """A payment made TO the person (payee in expn_cd)."""
+
+    date: str | None = None
+    amount: float
+    purpose: str | None = None
+    payee_name: str | None = None
+    committee: str | None = None
+    cmte_id: str | None = None
+
+
+class PersonGift(BaseModel):
+    """A contribution made BY the person (via receipts_all, de-duped)."""
+
+    date: str | None = None
+    amount: float
+    purpose: str | None = None
+    donor_name: str | None = None
+    cmte_id: str | None = None
+    source: str | None = None
+
+
+class PersonFiler(BaseModel):
+    """A committee/candidate whose name matches the person."""
+
+    filer_id: int
+    name: str
+    cmte_id: str | None = None
+
+
+class PersonBlindSpot(BaseModel):
+    """Form 496 24-hour lines of the paying committees that vendor
+    queries cannot see (no payee name field)."""
+
+    s496_lines_for_paying_committees: int
+    note: str = (
+        "These 24-hour expenditure lines have no payee name in the SOS "
+        "export; some may be additional payments to the person. Use "
+        "rapid_expense_vendors on those committees to resolve them."
+    )
+
+
+def payments_to_person(
+    person_name: str,
+    since_date: date | None = None,
+    roles: str = "all",
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Find every role a person plays in the disclosure data.
+
+    "Payments to X" is role-ambiguous, so this searches all three at once
+    and labels each hit:
+
+    - ``payee`` — payments made TO the person (``expn_cd`` payee lines,
+      i.e. the person as vendor/consultant),
+    - ``donor`` — contributions made BY the person (``receipts_all``,
+      24-hour de-duplicated),
+    - ``filer`` — committees/candidates whose name matches (the person as
+      a campaigner).
+
+    Name matching is field-aware and word-anchored (see
+    ``_person_predicate``): it finds last-first and first-last storage and
+    ignores substring false friends like "Daly" inside "Odalys".
+
+    Args:
+        person_name: Person name (``"Michael Gomez Daly"``,
+            ``"Daly, Michael"``, or just ``"Daly"``).
+        since_date: Inclusive lower bound on transaction date (all roles).
+        roles: ``"all"`` (default) or a single role ``"payee"``,
+            ``"donor"``, ``"filer"``.
+        limit: Maximum detail rows per role (default 100).
+
+    Returns:
+        Dict with per-role match counts (``total`` is the pre-limit count),
+        detail rows (newest first), and — when the person was paid — a
+        ``blind_spot`` count of the paying committees' Form 496 lines,
+        which carry no payee name and may include further payments.
+    """
+    roles_wanted = {r.strip().lower() for r in roles.split(",")} or {"all"}
+    do_payee = roles_wanted <= {"all"} or "payee" in roles_wanted
+    do_donor = roles_wanted <= {"all"} or "donor" in roles_wanted
+    do_filer = roles_wanted <= {"all"} or "filer" in roles_wanted
+
+    since_sql = " AND {a}.expn_date >= :since" if since_date else ""
+    result: dict[str, Any] = {"person": person_name, "since": _dtos(since_date)}
+
+    # -- payee: payments made TO the person ----------------------------- #
+    pred, params = _person_predicate(
+        "e.payee_naml", "e.payee_namf", person_name, prefix="pe"
+    )
+    payee_rows: list[dict[str, Any]] = []
+    payee_total = 0
+    if do_payee:
+        payee_sql = f"""
+            WITH filings AS (
+                SELECT DISTINCT filing_id, filer_id FROM filer_filings_cd
+            ),
+            filer_name AS (
+                SELECT DISTINCT ON (filer_id) filer_id, naml, namf
+                FROM filername_cd ORDER BY filer_id
+            ),
+            filer_cmte AS (
+                SELECT DISTINCT ON (filer_id) filer_id, xref_id
+                FROM filer_xref_cd ORDER BY filer_id, effect_dt DESC NULLS LAST
+            ),
+            m AS (
+                SELECT e.filing_id, e.expn_date, e.amount, e.expn_dscr,
+                       e.payee_naml, e.payee_namf, ff.filer_id,
+                       COUNT(*) OVER () AS total_matches
+                FROM expn_cd e
+                JOIN filings ff ON ff.filing_id = e.filing_id
+                WHERE {pred}{since_sql.format(a='e')}
+            )
+            SELECT m.expn_date, m.amount,
+                   LEFT(TRIM(COALESCE(m.expn_dscr, '')), 120) AS purpose,
+                   TRIM(COALESCE(m.payee_naml, '') || ' ' || COALESCE(m.payee_namf, ''))
+                       AS payee_name,
+                   m.filer_id,
+                   TRIM(COALESCE(fn.naml, '') || ' ' || COALESCE(fn.namf, ''))
+                       AS committee,
+                   fc.xref_id AS cmte_id,
+                   m.total_matches
+            FROM m
+            LEFT JOIN filer_name fn ON fn.filer_id = m.filer_id
+            LEFT JOIN filer_cmte fc ON fc.filer_id = m.filer_id
+            ORDER BY m.expn_date DESC NULLS LAST
+            LIMIT :lim
+        """
+        rows = execute_read(
+            payee_sql,
+            {"lim": limit, **params, **({"since": since_date} if since_date else {})},
+        )
+        for row in rows:
+            c = _coerce_row(row)
+            payee_total = int(c.get("total_matches") or 0)
+            rec = PersonPayment(
+                date=c.get("expn_date"),
+                amount=_money(c.get("amount")),
+                purpose=c.get("purpose"),
+                payee_name=c.get("payee_name") or None,
+                committee=c.get("committee") or None,
+                cmte_id=str(c["cmte_id"]) if c.get("cmte_id") else None,
+            )
+            payee_rows.append(rec.model_dump())
+        result["payee"] = {
+            "total": payee_total,
+            "returned": len(payee_rows),
+            "payments": payee_rows,
+        }
+
+        # blind spot: Form 496 lines of the paying committees
+        if payee_total > 0:
+            s496_since = " AND s.exp_date >= :s496_since" if since_date else ""
+            bs = execute_read(
+                f"""
+                SELECT COUNT(*) AS n
+                FROM s496_cd s
+                WHERE s.filing_id IN (
+                    SELECT DISTINCT ff.filing_id
+                    FROM filer_filings_cd ff
+                    WHERE ff.filer_id IN (
+                        SELECT DISTINCT ff2.filer_id
+                        FROM expn_cd e2
+                        JOIN filer_filings_cd ff2 ON ff2.filing_id = e2.filing_id
+                        WHERE {pred.replace('e.', 'e2.')}
+                        {since_sql.format(a='e2')}
+                    )
+                ){s496_since}
+                """,
+                {**params,
+                 **({"since": since_date, "s496_since": since_date}
+                    if since_date else {})},
+            )
+            result["blind_spot"] = PersonBlindSpot(
+                s496_lines_for_paying_committees=int(bs[0]["n"]) if bs else 0
+            ).model_dump()
+
+    # -- donor: contributions made BY the person ------------------------- #
+    if do_donor:
+        dpred, dparams = _person_predicate(
+            "x.donor_naml", "x.donor_namf", person_name, prefix="pd"
+        )
+        dsince = " AND x.receipt_date >= :since" if since_date else ""
+        row_cte = f"""
+            r AS (
+                SELECT x.src, x.filing_id, x.amend_id, x.tran_id,
+                       x.receipt_date, x.amount, x.ctrib_dscr, x.cmte_id,
+                       x.memo_refno, x.donor_key, x.donor_name
+                FROM receipts_all x
+                WHERE {dpred}{dsince}
+            )
+        """
+        select_sql = """
+            SELECT s.src AS source, s.tran_id, s.filing_id, s.amend_id,
+                   s.amount, s.receipt_date AS rcpt_date,
+                   s.ctrib_dscr AS purpose, s.cmte_id, s.memo_refno,
+                   COALESCE(NULLIF(TRIM(s.donor_name), ''), s.cmte_id)
+                       AS donor_name
+        """
+        dtotal_rows = execute_read(
+            f"SELECT COUNT(*) AS n FROM receipts_all x WHERE {dpred}{dsince}",
+            {**dparams, **({"since": since_date} if since_date else {})},
+        )
+        donor_total = int(dtotal_rows[0]["n"]) if dtotal_rows else 0
+        sql = _rowlist_dedup_sql(
+            row_cte, select_sql, "s.receipt_date DESC NULLS LAST", 500
+        )
+        rows = execute_read(
+            sql, {**dparams, **({"since": since_date} if since_date else {})}
+        )
+        gift_rows: list[dict[str, Any]] = []
+        for row in rows:
+            c = _coerce_row(row)
+            rec = PersonGift(
+                date=c.get("rcpt_date"),
+                amount=_money(c.get("amount")),
+                purpose=c.get("purpose"),
+                donor_name=c.get("donor_name"),
+                cmte_id=c.get("cmte_id"),
+                source=c.get("source"),
+            )
+            gift_rows.append(rec.model_dump())
+        result["donor"] = {
+            "total": donor_total,
+            "returned": len(gift_rows),
+            "gifts": gift_rows[:limit],
+        }
+
+    # -- filer: committees/candidates with this name --------------------- #
+    if do_filer:
+        fpred, fparams = _person_predicate(
+            "fn.naml", "fn.namf", person_name, prefix="pf"
+        )
+        rows = execute_read(
+            f"""
+            SELECT DISTINCT fn.filer_id,
+                   TRIM(COALESCE(fn.naml, '') || ' ' || COALESCE(fn.namf, ''))
+                       AS name,
+                   fc.xref_id AS cmte_id
+            FROM filername_cd fn
+            LEFT JOIN (
+                SELECT DISTINCT ON (filer_id) filer_id, xref_id
+                FROM filer_xref_cd
+                ORDER BY filer_id, effect_dt DESC NULLS LAST
+            ) fc ON fc.filer_id = fn.filer_id
+            WHERE {fpred}
+            ORDER BY fn.filer_id
+            LIMIT :lim
+            """,
+            {"lim": limit, **fparams},
+        )
+        filer_rows = [
+            PersonFiler(
+                filer_id=int(c.get("filer_id")),
+                name=c.get("name") or "(unknown)",
+                cmte_id=str(c["cmte_id"]) if c.get("cmte_id") else None,
+            ).model_dump()
+            for c in (_coerce_row(r) for r in rows)
+        ]
+        result["filer"] = {"matches": filer_rows}
+
+    return result
+
+
+class RapidExpenseLine(BaseModel):
+    """One Form 496 (24-hour) expenditure line, with its payee resolved
+    from the periodic re-report when possible."""
+
+    date: str | None = None
+    amount: float
+    description: str | None = None
+    payee: str | None = None  # None => unresolved (see note)
+    resolved: bool = False
+    ambiguous: bool = False  # True => several payees match (date, amount)
+
+
+def rapid_expense_vendors(
+    committee_id: str,
+    since_date: date | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Resolve the payees of a committee's 24-hour (Form 496) expenditures.
+
+    Form 496 lines carry amount, date and a free-text description but NO
+    payee name (structural blind spot). Periodic reports re-file the same
+    dollars to the exact cent with payee names, so a (payment date, amount)
+    match within the same filer recovers the vendor for most lines
+    (80-97% measured on the largest rapid-disclosure filers). Unresolved
+    lines are usually recent spend whose periodic re-report has not been
+    filed yet.
+
+    Args:
+        committee_id: Committee ID (``cmte_id``/``xref_id`` or a numeric
+            ``filer_id``).
+        since_date: Inclusive lower bound on the payment date.
+        limit: Maximum lines to return (default 200).
+
+    Returns:
+        Dict with ``total_lines`` (pre-limit), per-line payees (resolved
+        and unresolved, newest first), ``resolution_pct``, and a note.
+    """
+    fid = _resolve_filer_id(committee_id)
+    if fid < 0:
+        return {
+            "committee_id": committee_id,
+            "committee": None,
+            "total_lines": 0,
+            "returned": 0,
+            "resolved": [],
+            "unresolved": [],
+            "resolution_pct": 0.0,
+            "note": "committee id could not be resolved; no filings matched.",
+        }
+
+    since_sql = " AND s.exp_date >= :since" if since_date else ""
+    total_rows = execute_read(
+        f"""
+        SELECT COUNT(*) AS n
+        FROM s496_cd s
+        WHERE s.filing_id IN (
+            SELECT DISTINCT filing_id FROM filer_filings_cd WHERE filer_id = :fid
+        ){since_sql}
+        """,
+        {"fid": fid, **({"since": since_date} if since_date else {})},
+    )
+    total = int(total_rows[0]["n"]) if total_rows else 0
+
+    # One row per 24-hour line (no fan-out): matched payees are collected
+    # into an array so a (date, amount) matching several payees still
+    # yields exactly one line, flagged ambiguous.
+    rows = execute_read(
+        f"""
+        WITH f AS (
+            SELECT DISTINCT filing_id FROM filer_filings_cd
+            WHERE filer_id = :fid
+        ),
+        s496 AS (
+            SELECT s.filing_id, s.line_item,
+                   s.exp_date::date AS d, s.amount,
+                   LEFT(TRIM(COALESCE(s.expn_dscr, '')), 120) AS dscr
+            FROM s496_cd s
+            WHERE s.filing_id IN (SELECT filing_id FROM f){since_sql}
+        ),
+        expn AS (
+            SELECT DISTINCT e.expn_date::date AS d, e.amount,
+                   TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, ''))
+                       AS payee
+            FROM expn_cd e
+            WHERE e.filing_id IN (SELECT filing_id FROM f)
+              AND TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, ''))
+                  <> ''
+        )
+        SELECT s.d, s.amount, s.dscr,
+               (SELECT ARRAY_AGG(p.payee ORDER BY p.payee)
+                FROM expn p
+                WHERE p.d = s.d AND p.amount = s.amount
+               ) AS payees
+        FROM s496 s
+        ORDER BY s.d DESC NULLS LAST, s.filing_id, s.line_item
+        LIMIT :lim
+        """,
+        {"fid": fid, "lim": limit, **({"since": since_date} if since_date else {})},
+    )
+
+    resolved: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+    n_resolved = 0
+    for row in rows:
+        c = _coerce_row(row)
+        payees: list[str] = [p for p in (c.get("payees") or []) if p]
+        rec = RapidExpenseLine(
+            date=c.get("d"),
+            amount=_money(c.get("amount")),
+            description=c.get("dscr") or None,
+            payee=payees[0] if payees else None,
+            resolved=bool(payees),
+            ambiguous=len(payees) > 1,
+        )
+        if rec.resolved:
+            n_resolved += 1
+            resolved.append(rec.model_dump())
+        else:
+            unresolved.append(rec.model_dump())
+
+    name = _committee_name(committee_id)
+    returned = len(resolved) + len(unresolved)
+    # When truncated, the pct is a floor (only over the returned rows).
+    pct = round(100.0 * n_resolved / returned, 1) if returned else 0.0
+    note = (
+        "Each 24-hour line appears once; a line matching several payees on "
+        "the same (date, amount) is flagged ambiguous with the first "
+        "candidate in payee. Unresolved lines usually re-appear with names "
+        "in the next periodic report."
+    )
+    if returned < total:
+        note += f" Only the first {returned} of {total} lines returned; "
+        note += "resolution_pct covers returned lines only."
+    return {
+        "committee_id": committee_id,
+        "committee": _committee_display(name) or None,
+        "total_lines": total,
+        "returned": returned,
+        "resolved": resolved,
+        "unresolved": unresolved,
+        "resolution_pct": pct,
+        "note": note,
+    }
+
+
+# Curated schema gotchas surfaced by describe_table (kept short on purpose).
+_TABLE_NOTES: dict[str, str] = {
+    "rcpt_cd": (
+        "Periodic-report contributions. Individuals: ctrib_naml=LAST, "
+        "ctrib_namf=FIRST (last-first!). Organizations: ctrib_dscr. "
+        "cmte_id here is the DONOR committee, not the recipient. For a "
+        "complete contribution picture read receipts_all instead (adds the "
+        "24-hour tables with de-dup)."
+    ),
+    "expn_cd": (
+        "Periodic-report expenditures. payee_naml=LAST, payee_namf=FIRST "
+        "for individuals; organizations in payee_naml. There is NO payee "
+        "description field (only expn_dscr for the purpose). expn_date can "
+        "be NULL or corrupt (some rows carry 1900/3000-era dates) — never "
+        "use unbounded MAX(expn_date)."
+    ),
+    "s496_cd": (
+        "24-hour EXPENDITURE reports (Form 496). amount, date and free-text "
+        "expn_dscr ONLY — no payee name field (structural blind spot). "
+        "descriptions are usually generic labels ('MAILER', 'TELEVISION "
+        "ADS'), not payees. Resolve payees with the rapid_expense_vendors "
+        "tool (date+amount match against the periodic re-report)."
+    ),
+    "s497_cd": (
+        "24-hour large-CONTRIBUTION reports (Form 497). Column gotchas: "
+        "amount is `amount` (NOT amt_rcvd), date is `ctrib_date`. Donor "
+        "name in enty_naml (last) / enty_namf (first)."
+    ),
+    "s498_cd": (
+        "24-hour receipt reports (Form 498). Column gotchas: amount is "
+        "`amt_rcvd`, date is `date_rcvd`. Payor name in payor_naml / "
+        "payor_namf."
+    ),
+    "receipts_all": (
+        "View: normalized union of rcpt_cd + s497_cd + s498_cd with "
+        "cross-source 24-hour de-duplication. Contribution tools read this, "
+        "so a gift reported in both a 24-hour and a periodic report counts "
+        "once. Key columns: src, receipt_date, amount, donor_naml, "
+        "donor_namf, ctrib_dscr, donor_name, cmte_id (donor committee)."
+    ),
+    "filername_cd": (
+        "Committee/filer names — INFLATED: one row per (name x contact) "
+        "combo, so a filer appears ~10x. Use DISTINCT ON (filer_id) for a "
+        "single name. effect_dt is flattened (not a real name-history "
+        "timeline)."
+    ),
+    "filer_filings_cd": (
+        "Maps filing_id -> filer_id. (filing_id, filer_id) PAIRS CAN BE "
+        "DUPLICATED — joins that fan out on it inflate counts. Use DISTINCT "
+        "or EXISTS semi-joins."
+    ),
+    "filer_xref_cd": (
+        "Maps committee IDs (xref_id = cmte_id) -> filer_id. When a filer "
+        "has several xrefs, take the latest via effect_dt DESC NULLS LAST."
+    ),
+    "names_cd": (
+        "Name master (key: namid). Derived from the detail tables, which "
+        "store name TEXT, not IDs — searching this table is not a "
+        "substitute for searching rcpt_cd/expn_cd."
+    ),
+}
+
+
+def describe_table(table_name: str) -> dict[str, Any]:
+    """Return the column list, approximate row count, and known gotchas
+    for a table or view.
+
+    Use this before writing ad-hoc SQL: the 24-hour tables in particular
+    have divergent column names (s497 uses `amount`/`ctrib_date`, s498
+    uses `amt_rcvd`/`date_rcvd`).
+
+    Args:
+        table_name: Public schema table or view name (e.g. ``"s497_cd"``,
+            ``"receipts_all"``).
+
+    Returns:
+        Dict with ``table``, ``approx_rows``, ``columns`` (name + type +
+        nullable), ``notes`` (curated gotchas, may be None), and — for an
+        unknown name — the list of available tables under ``available``.
+    """
+    t = (table_name or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9_]+", t):
+        return {"error": f"invalid table name: {table_name!r}"}
+    rows = execute_read(
+        """
+        SELECT column_name,
+               data_type || CASE
+                   WHEN character_maximum_length IS NOT NULL
+                        THEN '('::text || character_maximum_length || ')'
+                   ELSE ''
+               END AS data_type,
+               is_nullable = 'YES' AS nullable
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = :t
+        ORDER BY ordinal_position
+        """,
+        {"t": t},
+    )
+    if not rows:
+        available = execute_read(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'public' ORDER BY table_name"
+        )
+        return {
+            "error": f"unknown table or view: {table_name!r}",
+            "available": [r["table_name"] for r in available],
+        }
+    rc = execute_read(
+        """
+        SELECT COALESCE(reltuples::bigint, 0) AS n
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relname = :t
+        """,
+        {"t": t},
+    )
+    return {
+        "table": t,
+        "approx_rows": int(rc[0]["n"]) if rc else 0,
+        "columns": [
+            {"name": r["column_name"], "type": r["data_type"],
+             "nullable": bool(r["nullable"])}
+            for r in rows
+        ],
+        "notes": _TABLE_NOTES.get(t),
+    }
+
+
+def get_server_docs() -> str:
+    """Return the full server quick-start guide as markdown.
+
+    Call this first when attaching a new agent: it covers how to use
+    every tool, the data conventions, and the known caveats. (The same
+    text ships in ``docs/mcp_server.md`` in the repository.)
+    """
+    doc = Path(__file__).resolve().parents[2] / "docs" / "mcp_server.md"
+    try:
+        return doc.read_text(encoding="utf-8")
+    except OSError:
+        return (
+            "# Campaign Finance Database MCP server\n\n"
+            "Read-only query tools over the CAL-ACCESS (CA SOS) campaign "
+            "finance disclosure database. Full guide: docs/mcp_server.md "
+            "in the campaign-finance-tracking-db repository.\n\n"
+            "Tools: contributions_by_donor, top_donors_for_committee_or_candidate, "
+            "committee_outlays_to, vendor_revenue, committees_paying_vendor, "
+            "committee_profile, find_committees, measure_spending, "
+            "donor_watch_since, upcoming_filings, filing_due_soon, "
+            "payments_to_person, rapid_expense_vendors, describe_table, "
+            "get_server_docs.\n"
+        )

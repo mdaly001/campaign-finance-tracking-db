@@ -265,6 +265,9 @@ class TestDB:
         import os
 
         with patch.dict(os.environ, {"DB_PASSWORD": "pw", "DB_HOST": "h"}):
+            # patch.dict keeps other keys; DATABASE_URL (commonly exported
+            # to run the server) would otherwise shadow the components.
+            os.environ.pop("DATABASE_URL", None)
             from core.mcp import db
 
             importlib.reload(db)
@@ -826,11 +829,14 @@ class TestServer:
         return _create_server()
 
     def test_server_creation(self, server):
-        """_create_server should return an MCPServer with 11 tools."""
+        """_create_server should return an MCPServer with all registered tools."""
         import asyncio
 
         tools = asyncio.run(server.list_tools())
-        assert len(tools) == 11
+        # Count is derived from the TOOLS list so it stays correct as tools
+        # are added (currently 15).
+        assert len(tools) == len(TOOLS)
+        assert len(tools) >= 15
 
     def test_tool_names_registered(self, server):
         """All expected tool names should be present."""
