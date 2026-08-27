@@ -9,3 +9,4 @@ tests
 Dockerfile
 docker-compose.yml
 *.md
+!README.md
