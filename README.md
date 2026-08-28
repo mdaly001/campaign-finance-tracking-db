@@ -23,7 +23,7 @@ This project ingests and normalizes campaign finance disclosure data from Califo
 curl -fsSL https://raw.githubusercontent.com/mdaly001/campaign-finance-tracking-db/master/install.sh | bash
 ```
 
-Useful flags: `--lite` (no local LLM), `--no-etl` (skip the long data load for now), `--model NAME` (qwen3-14b | gpt-oss-20b | qwen3.6-35b-a3b | coder-next-80b | none), `--model-url URL` (any GGUF), `--dir PATH`, `--yes`. It is idempotent — re-run it to resume or repair. Windows users: run it inside WSL2 (the script will tell you how).
+Useful flags: `--lite` (no local LLM), `--db-only` (just PostgreSQL + ETL + MCP — no LLM, no chat UI; ideal for a server when you already host models/agents on your network), `--llm-url URL` (use a model you already serve, e.g. `http://192.168.1.20:8080/v1`), `--no-chat`, `--no-etl` (skip the long data load for now), `--model NAME` (qwen3-14b | gpt-oss-20b | qwen3.6-35b-a3b | coder-next-80b | none), `--model-url URL` (any GGUF), `--dir PATH`, `--yes`. It is idempotent — re-run it to resume or repair. Windows users: run it inside WSL2 (the script will tell you how).
 
 Otherwise, step by step:
 

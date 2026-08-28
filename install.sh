@@ -11,6 +11,11 @@
 #
 # Flags:
 #   --lite        everything except the local LLM (chat UI wired later)
+#   --db-only     database + ETL + MCP server only — no LLM, no chat UI
+#                 (use when you already host models/agents on your network)
+#   --no-chat     skip the Open WebUI chat container (own frontend, e.g. Hermes)
+#   --llm-url URL skip local model download; point the chat UI at this
+#                 OpenAI-compatible URL (e.g. http://192.168.1.20:8080/v1)
 #   --no-etl      skip the (long) initial data download for now
 #   --model NAME  force model: qwen3-14b | gpt-oss-20b | qwen3.6-35b-a3b | coder-next-80b | none
 #   --model-url U force an explicit GGUF download URL (resumable)
@@ -25,6 +30,7 @@ REPO_URL="https://github.com/mdaly001/campaign-finance-tracking-db.git"
 INSTALL_DIR="${CFDB_HOME:-$HOME/campaign-finance-db}"
 MODEL_DIR=""                     # set after INSTALL_DIR is final
 LITE=0; RUN_ETL=1; ASSUME_YES=0
+RUN_CHAT=1; DB_ONLY=0; LLM_URL=""
 MODEL_OVERRIDE=""; MODEL_URL_OVERRIDE=""
 LLM_PORT=8080
 CHAT_PORT=3000
@@ -40,6 +46,9 @@ pause_or_go() { [ "$ASSUME_YES" = 1 ] && return 0; printf "Press Enter to contin
 while [ $# -gt 0 ]; do
   case "$1" in
     --lite) LITE=1 ;;
+    --db-only) DB_ONLY=1; LITE=1; RUN_CHAT=0 ;;
+    --no-chat) RUN_CHAT=0 ;;
+    --llm-url) LLM_URL="${2:-}"; LITE=1; shift ;;
     --no-etl) RUN_ETL=0 ;;
     --model) MODEL_OVERRIDE="${2:-}"; shift ;;
     --model-url) MODEL_URL_OVERRIDE="${2:-}"; shift ;;
@@ -122,12 +131,15 @@ esac; }
 # summary -------------------------------------------------------------------
 echo
 printf "${C_BOLD}This will install:${C_OFF}
-  PostgreSQL 16 + CAL-ACCESS data (initial load can take hours)
+  PostgreSQL 16%s
   MCP server            http://localhost:${MCP_PORT}/sse
-"
-[ "$LITE" = 0 ] && printf "  Local LLM (${MODEL})   http://localhost:${LLM_PORT}/v1
-  Browser chat UI         http://localhost:${CHAT_PORT}
-"
+" "$( [ "$RUN_ETL" = 1 ] && echo " + CAL-ACCESS data (initial load can take hours)" )"
+if [ "$LITE" = 0 ]; then
+  printf "  Local LLM (%s)      http://localhost:%s/v1\n" "$MODEL" "$LLM_PORT"
+elif [ -n "$LLM_URL" ]; then
+  printf "  Remote LLM          %s\n" "$LLM_URL"
+fi
+[ "$RUN_CHAT" = 1 ] && printf "  Browser chat UI     http://localhost:%s\n" "$CHAT_PORT"
 echo "Install dir: ${INSTALL_DIR}"
 echo
 pause_or_go
@@ -259,19 +271,24 @@ if [ "$LITE" = 0 ]; then
 fi
 
 # chat ui (Open WebUI) ------------------------------------------------------
-log "Starting browser chat UI (:${CHAT_PORT})..."
-docker rm -f cfdb-chat >/dev/null 2>&1 || true
-HOST_GATEWAY=""
-[ "$OSFAM" = linux ] && HOST_GATEWAY="--add-host=host.docker.internal:host-gateway"
-# shellcheck disable=SC2086
-docker run -d --name cfdb-chat --restart unless-stopped \
-  -p "$CHAT_PORT:8000" \
-  -v cfdb-openwebui:/app/backend/data \
-  $HOST_GATEWAY \
-  -e OPENAI_API_BASE_URL="http://host.docker.internal:${LLM_PORT}/v1" \
-  -e OPENAI_API_KEY="***" \
-  -e WEBUI_AUTH=False \
-  ghcr.io/open-webui/open-webui:main >/dev/null
+if [ "$RUN_CHAT" = 1 ]; then
+  CHAT_MODEL_BASE="${LLM_URL:-http://host.docker.internal:${LLM_PORT}/v1}"
+  log "Starting browser chat UI (:${CHAT_PORT}) -> model ${CHAT_MODEL_BASE}"
+  docker rm -f cfdb-chat >/dev/null 2>&1 || true
+  HOST_GATEWAY=""
+  [ "$OSFAM" = linux ] && HOST_GATEWAY="--add-host=host.docker.internal:host-gateway"
+  # shellcheck disable=SC2086
+  docker run -d --name cfdb-chat --restart unless-stopped \
+    -p "$CHAT_PORT:8000" \
+    -v cfdb-openwebui:/app/backend/data \
+    $HOST_GATEWAY \
+    -e OPENAI_API_BASE_URL="$CHAT_MODEL_BASE" \
+    -e OPENAI_API_KEY="***" \
+    -e WEBUI_AUTH=False \
+    ghcr.io/open-webui/open-webui:main >/dev/null
+else
+  log "Skipping chat UI (use your own frontend against http://localhost:${LLM_PORT}/v1)."
+fi
 
 # smoke tests ---------------------------------------------------------------
 log "Smoke tests..."
@@ -282,17 +299,28 @@ else
 fi
 [ "$LITE" = 0 ] && [ "$LLM_UP" = 1 ] && \
   ( curl -sf "http://localhost:${LLM_PORT}/v1/models" >/dev/null && log "LLM server: OK" || warn "LLM server: not ready yet" )
-for _ in $(seq 1 60); do
-  curl -s -o /dev/null -m 2 "http://localhost:${CHAT_PORT}" && break; sleep 2
-done
+if [ "$RUN_CHAT" = 1 ]; then
+  for _ in $(seq 1 60); do
+    curl -s -o /dev/null -m 2 "http://localhost:${CHAT_PORT}" && break; sleep 2
+  done
+fi
 
 # done ----------------------------------------------------------------------
+LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+[ -z "$LAN_IP" ] && LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || true)"
 echo
 printf "${C_GREEN}${C_BOLD}Done.${C_OFF}\n\n"
-printf "Open ${C_BOLD}http://localhost:${CHAT_PORT}${C_OFF} in your browser and ask, for example:\n\n"
-printf "  \"Who are the top donors to any campaign in the database?\"\n\n"
-printf "To teach the chat about the campaign-finance tools, open the\nchat UI's Settings, then paste this MCP server URL into the MCP fields:\n\n"
-printf "  http://host.docker.internal:${MCP_PORT}/sse\n\n"
+if [ "$RUN_CHAT" = 1 ]; then
+  printf "Open ${C_BOLD}http://localhost:${CHAT_PORT}${C_OFF} in your browser and ask, for example:\n\n"
+  printf "  \"Who are the top donors to any campaign in the database?\"\n\n"
+  printf "To teach the chat about the campaign-finance tools, open the\nchat UI's MCP settings and paste this server URL:\n\n"
+  printf "  http://host.docker.internal:${MCP_PORT}/sse\n\n"
+else
+  log "Endpoints (also reachable on your LAN at ${LAN_IP:-<this-host-ip>}):"
+  printf "  MCP:  http://%s:${MCP_PORT}/sse   (point Hermes/Open WebUI/etc. at this)\n" "${LAN_IP:-<this-host-ip>}"
+  [ "$LITE" = 0 ] && printf "  LLM:  http://%s:${LLM_PORT}/v1\n" "${LAN_IP:-<this-host-ip>}"
+  echo
+fi
 [ "$RUN_ETL" = 0 ] && printf "NOTE: data load was skipped. Start it anytime:  cd %s && docker compose run --rm etl\n" "$INSTALL_DIR"
 printf "\nDay-2 commands (from %s):\n" "$INSTALL_DIR"
 printf "  docker compose ps                # what's running\n"
