@@ -9,7 +9,11 @@ WORKDIR /app
 RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
 
 # Copy dependency manifests and install into /app/.venv
-COPY --chown=appuser:appuser pyproject.toml uv.lock ./
+# NOTE: README.md must be copied too — pyproject.toml declares `readme =
+# "README.md"` and hatchling validates its existence when uv syncs the
+# project itself. Keep `!README.md` in .dockerignore so the file reaches
+# the build context.
+COPY --chown=appuser:appuser pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev
 
 # Copy application source
