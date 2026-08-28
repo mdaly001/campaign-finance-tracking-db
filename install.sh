@@ -293,9 +293,10 @@ if [ "$RUN_CHAT" = 1 ]; then
   [ "$OSFAM" = linux ] && HOST_GATEWAY="--add-host=host.docker.internal:host-gateway"
   # shellcheck disable=SC2086
   docker run -d --name cfdb-chat --restart unless-stopped \
-    -p "$CHAT_PORT:8000" \
+    -p "$CHAT_PORT:8080" \
     -v cfdb-openwebui:/app/backend/data \
     $HOST_GATEWAY \
+    -e PORT=8080 \
     -e OPENAI_API_BASE_URL="$CHAT_MODEL_BASE" \
     -e OPENAI_API_KEY="***" \
     -e WEBUI_AUTH=False \
@@ -306,11 +307,12 @@ fi
 
 # smoke tests ---------------------------------------------------------------
 log "Smoke tests..."
-if curl -s -o /dev/null -m 5 "http://localhost:${MCP_PORT}/sse"; then
-  log "MCP server: OK (http://localhost:${MCP_PORT}/sse)"
-else
-  warn "MCP server: no response on :${MCP_PORT}"
-fi
+# SSE is a never-ending stream; judge by whether the endpoint event arrives.
+SSE_PROBE="$(curl -sN -m 4 "http://localhost:${MCP_PORT}/sse" 2>/dev/null | head -c 200 || true)"
+case "$SSE_PROBE" in
+  *"event:"*) log "MCP server: OK (streaming at http://localhost:${MCP_PORT}/sse)" ;;
+  *)          warn "MCP server: no SSE response on :${MCP_PORT}" ;;
+esac
 [ "$LITE" = 0 ] && [ "$LLM_UP" = 1 ] && \
   ( curl -sf "http://localhost:${LLM_PORT}/v1/models" >/dev/null && log "LLM server: OK" || warn "LLM server: not ready yet" )
 if [ "$RUN_CHAT" = 1 ]; then
@@ -320,8 +322,14 @@ if [ "$RUN_CHAT" = 1 ]; then
 fi
 
 # done ----------------------------------------------------------------------
-LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-[ -z "$LAN_IP" ] && LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || true)"
+LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+if [ -z "$LAN_IP" ]; then
+  LAN_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+fi
+if [ -z "$LAN_IP" ]; then
+  LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || true)"
+fi
+[ -z "$LAN_IP" ] && LAN_IP="localhost"
 echo
 printf "${C_GREEN}${C_BOLD}Done.${C_OFF}\n\n"
 if [ "$RUN_CHAT" = 1 ]; then
