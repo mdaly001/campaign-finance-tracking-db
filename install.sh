@@ -16,6 +16,7 @@
 #   --no-chat     skip the Open WebUI chat container (own frontend, e.g. Hermes)
 #   --llm-url URL skip local model download; point the chat UI at this
 #                 OpenAI-compatible URL (e.g. http://192.168.1.20:8080/v1)
+#   --model-file P  serve a pre-downloaded local GGUF at path P (skips download)
 #   --no-etl      skip the (long) initial data download for now
 #   --model NAME  force model: qwen3-14b | gpt-oss-20b | qwen3.6-35b-a3b | coder-next-80b | none
 #   --model-url U force an explicit GGUF download URL (resumable)
@@ -31,7 +32,7 @@ INSTALL_DIR="${CFDB_HOME:-$HOME/campaign-finance-db}"
 MODEL_DIR=""                     # set after INSTALL_DIR is final
 LITE=0; RUN_ETL=1; ASSUME_YES=0
 RUN_CHAT=1; DB_ONLY=0; LLM_URL=""
-MODEL_OVERRIDE=""; MODEL_URL_OVERRIDE=""
+MODEL_OVERRIDE=""; MODEL_URL_OVERRIDE=""; MODEL_FILE_PATH=""
 LLM_PORT=8080
 CHAT_PORT=3000
 MCP_PORT=9527
@@ -49,6 +50,7 @@ while [ $# -gt 0 ]; do
     --db-only) DB_ONLY=1; LITE=1; RUN_CHAT=0 ;;
     --no-chat) RUN_CHAT=0 ;;
     --llm-url) LLM_URL="${2:-}"; LITE=1; shift ;;
+    --model-file) MODEL_FILE_PATH="${2:-}"; shift ;;
     --no-etl) RUN_ETL=0 ;;
     --model) MODEL_OVERRIDE="${2:-}"; shift ;;
     --model-url) MODEL_URL_OVERRIDE="${2:-}"; shift ;;
@@ -126,7 +128,8 @@ model_extra_args() { case "$1" in
   *) echo "" ;;
 esac; }
 
-[ "$MODEL" = none ] && [ "$LITE" = 0 ] && { warn "Only ${RAM_GB} GB RAM — skipping local LLM (chat UI will need an API key later)."; LITE=1; }
+[ -n "$MODEL_FILE_PATH" ] && [ "$DB_ONLY" = 0 ] && LITE=0
+[ "$MODEL" = none ] && [ -z "$MODEL_FILE_PATH" ] && [ "$LITE" = 0 ] && { warn "Only ${RAM_GB} GB RAM — skipping local LLM (chat UI will need an API key later)."; LITE=1; }
 
 # summary -------------------------------------------------------------------
 echo
@@ -135,7 +138,7 @@ printf "${C_BOLD}This will install:${C_OFF}
   MCP server            http://localhost:${MCP_PORT}/sse
 " "$( [ "$RUN_ETL" = 1 ] && echo " + CAL-ACCESS data (initial load can take hours)" )"
 if [ "$LITE" = 0 ]; then
-  printf "  Local LLM (%s)      http://localhost:%s/v1\n" "$MODEL" "$LLM_PORT"
+  printf "  Local LLM (%s)      http://localhost:%s/v1\n" "$(basename "${MODEL_FILE_PATH:-$MODEL}")" "$LLM_PORT"
 elif [ -n "$LLM_URL" ]; then
   printf "  Remote LLM          %s\n" "$LLM_URL"
 fi
@@ -167,6 +170,10 @@ install_docker() {
 
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
   log "Docker: $(docker --version)"
+  docker info >/dev/null 2>&1 || die "Docker is installed but this shell cannot reach the daemon (permission denied on docker.sock).
+  Fix: log out and back in (group membership lands in new shells), or:
+    sudo usermod -aG docker \$USER   # then open a NEW terminal
+  and re-run this installer."
 else
   install_docker
   docker info >/dev/null 2>&1 || die "Docker daemon is not running. Start it (Docker Desktop / 'colima start' / 'sudo systemctl start docker') and re-run."
@@ -228,7 +235,14 @@ docker compose up -d mcp
 
 # llm -----------------------------------------------------------------------
 LLM_UP=0
-if [ "$LITE" = 0 ]; then
+if [ "$LITE" = 0 ] && [ -n "$MODEL_FILE_PATH" ]; then
+  [ -f "$MODEL_FILE_PATH" ] || die "--model-file not found: $MODEL_FILE_PATH"
+  MODEL_DIR="$(cd "$(dirname "$MODEL_FILE_PATH")" && pwd)"
+  GF="$(basename "$MODEL_FILE_PATH")"
+  CTX=32768; EXTRA=""
+  case "$GF" in *gpt-oss*) EXTRA="--jinja" ;; esac
+  log "Using local model: $MODEL_DIR/$GF (ctx=${CTX})"
+elif [ "$LITE" = 0 ]; then
   GF="$(model_file "$MODEL")"; URL="${MODEL_URL_OVERRIDE:-$(model_url "$MODEL")}"; CTX="$(model_ctx "$MODEL")"; EXTRA="$(model_extra_args "$MODEL")"
   if [ -z "$URL" ]; then warn "Unknown model '$MODEL'; skipping LLM serve."; LITE=1; fi
 fi
