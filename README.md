@@ -17,6 +17,16 @@ This project ingests and normalizes campaign finance disclosure data from Califo
 
 ### Quick Start
 
+**Prefer one command?** The installer auto-detects your OS, RAM and GPU, then sets up Docker (if needed), PostgreSQL, the CAL-ACCESS data, the MCP server, a local LLM sized to your hardware, and a browser chat UI at <http://localhost:3000>:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mdaly001/campaign-finance-tracking-db/master/install.sh | bash
+```
+
+Useful flags: `--lite` (no local LLM), `--no-etl` (skip the long data load for now), `--model NAME` (qwen3-14b | gpt-oss-20b | qwen3.6-35b-a3b | coder-next-80b | none), `--model-url URL` (any GGUF), `--dir PATH`, `--yes`. It is idempotent — re-run it to resume or repair. Windows users: run it inside WSL2 (the script will tell you how).
+
+Otherwise, step by step:
+
 ```bash
 # 1. Clone and configure (optional — compose has sane defaults)
 git clone https://github.com/mdaly001/campaign-finance-tracking-db.git
