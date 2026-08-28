@@ -85,7 +85,7 @@ are exactly where small models produce confidently wrong financial answers.
 Serve the model (llama.cpp):
 
 ```bash
-llama-server -d 32768 --cache-type-k q8 --cache-type-v q8 \
+llama-server -d 32768 --cache-type-k q8_0 --cache-type-v q8_0 \
   -m qwen3.6-35b-a3b-q4_k_m.gguf --port 8080
 ```
 

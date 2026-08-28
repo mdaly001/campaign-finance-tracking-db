@@ -261,7 +261,7 @@ if [ "$LITE" = 0 ]; then
     command -v llama-server >/dev/null 2>&1 || brew install llama.cpp
     # shellcheck disable=SC2086
     nohup llama-server -m "$MODEL_DIR/$GF" --ctx-size "$CTX" $EXTRA \
-      --cache-type-k q8 --cache-type-v q8 \
+      --cache-type-k q8_0 --cache-type-v q8_0 \
       --host 0.0.0.0 --port "$LLM_PORT" > "$INSTALL_DIR/llama-server.log" 2>&1 &
     warn "llama-server listens on all interfaces (needed for the chat container to reach it on macOS). On a shared network, consider a firewall rule for port ${LLM_PORT}."
     echo "llama-server pid: $!  (log: $INSTALL_DIR/llama-server.log)"
@@ -273,7 +273,7 @@ if [ "$LITE" = 0 ]; then
     docker run -d --name cfdb-llm $GPU_ARGS --restart unless-stopped \
       -p "$LLM_PORT:$LLM_PORT" -v "$MODEL_DIR:/models" \
       ghcr.io/ggml-org/llama.cpp:server \
-      -m "/models/$GF" --ctx-size "$CTX" $EXTRA --cache-type-k q8 --cache-type-v q8 \
+      -m "/models/$GF" --ctx-size "$CTX" $EXTRA --cache-type-k q8_0 --cache-type-v q8_0 \
       --host 0.0.0.0 --port "$LLM_PORT" >/dev/null
   fi
   log "Waiting for model to load (first request can be slow)..."
