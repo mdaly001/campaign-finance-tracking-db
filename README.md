@@ -41,6 +41,65 @@ docker compose run --rm etl -- incremental \
   --database-url postgresql://cfdb:change-me@db:5432/cfdb
 ```
 
+## Talking to the database with a local AI agent
+
+The MCP server (port **9527**) exposes ~15 analytical tools — donor lookups,
+committee profiles, payments-to-person, 24-hour-report vendor recovery, and
+a built-in `get_server_docs` guide so any connected agent can self-onboard.
+To use it fully offline you need two pieces:
+
+1. **A model server** exposing an OpenAI-compatible endpoint — LM Studio,
+   llama.cpp (`llama-server`), or Ollama all work.
+2. **An MCP-client harness** — [OpenCode](https://opencode.ai/docs/mcp-servers/)
+   (recommended; MCP is first-class), OpenClaw, Hermes Agent, or DeepSeek
+   Harness. Point it at `http://localhost:9527/sse`.
+
+### Pick your model by RAM
+
+The database itself needs ~3 GB (Postgres) + ~0.1 GB (MCP server). Your RAM
+budget minus that is the model's. MoE models ("A3B" = ~3B active parameters)
+are strongly preferred: they run fast even without a GPU.
+
+| Your RAM | Recommended model | Quant / size | Notes |
+|---|---|---|---|
+| **16 GB** | **Qwen3-14B-Instruct** | Q4_K_M ≈ 9 GB | Minimum viable. Keep context ≤ 8K, enable q8 KV-cache (`--cache-type-k q8 --cache-type-v q8`), set Postgres `shared_buffers=1GB`. Tool-calling works but verify numbers on complex questions. (Apple Silicon 16 GB unified memory: gpt-oss-20b fits at MXFP4 — a better pick there.) |
+| **32 GB** | **Qwen3.6-35B-A3B** (analysis) or **Qwen3-Coder-30B-A3B-Instruct** (tool-driving) | Q4_K_M ≈ 19–21 GB | The sweet spot. MoE = laptop-CPU speeds. Keep context ≤ 32K. If you want headroom instead of peak quality: **gpt-oss-20b** (≈ 13 GB) has excellent, very reliable tool calls. |
+| **64 GB** | **Qwen3-Coder-Next (80B-A3B)** | Q4_K_M ≈ 45 GB | Best tool-calling + SQL available locally. Fits with Postgres (4 GB) and OS with room for a 32K context at q8 KV. Alternative: Qwen3.6-35B-A3B at higher precision / bigger context. |
+
+Avoid sub-10B models: the tool schema, date arguments, and the data caveats
+(names stored last-first, Form 496 payee blind spots, de-duplication rules)
+are exactly where small models produce confidently wrong financial answers.
+
+### Example wiring
+
+Serve the model (llama.cpp):
+
+```bash
+llama-server -d 32768 --cache-type-k q8 --cache-type-v q8 \
+  -m qwen3.6-35b-a3b-q4_k_m.gguf --port 8080
+```
+
+Connect OpenCode (`opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "cfdb": { "type": "remote", "url": "http://localhost:9527/sse" }
+  }
+}
+```
+
+Then ask it things like: *"Which committees paid Inland Empire United Action
+Fund since 2016, and what were their five biggest expenses?"*
+
+**Agent tip:** your first tool call should always be `get_server_docs` — it
+returns the full data-conventions guide (no repo access needed).
+
+> Note: MCP support varies by harness version. OpenCode supports MCP servers
+> natively; OpenClaw and Hermes Agent's support is adapter/skill-based —
+> check their current docs before assuming the 15 tools will appear.
+
 ### Local Development
 
 ```bash
