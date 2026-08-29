@@ -1,7 +1,8 @@
 """MCP server entry point for the Campaign Finance Database.
 
-Launches an SSE-based MCP server with 15 read-only query tools.
-Runs on port 9527 (configurable via MCP_PORT env var) with /sse endpoint.
+Launches an MCP server with 15 read-only query tools.
+Runs on port 9527 (configurable via MCP_PORT env var); serves Streamable
+HTTP at /mcp and the legacy SSE transport at /sse.
 
 Usage:
     python -m core.mcp.server              # Start MCP server (default port)
@@ -332,15 +333,20 @@ def main() -> None:
 
     server = _create_server()
 
+    # Dual transport on one port:
+    #   - Streamable HTTP at /mcp  (current MCP spec — the only transport the
+    #     Open WebUI MCP client speaks; it POSTs initialize to the connection
+    #     url and would otherwise 404 and silently attach zero tools)
+    #   - legacy SSE at /sse       (kept for older MCP clients like OpenCode)
+    # The streamable app is the root ASGI app and owns the session-manager
+    # lifespan; the SSE app is mounted into it and shares that session manager.
+    import uvicorn
+
+    app = server.streamable_http_app(streamable_http_path="/mcp")
+    app.mount("/sse", server.sse_app(sse_path="", message_path="/messages/"))
+
     try:
-        asyncio.run(
-            server.run_sse_async(
-                host=args.host,
-                port=args.port,
-                sse_path="/sse",
-                message_path="/messages/",
-            )
-        )
+        uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level.lower())
     except KeyboardInterrupt:
         logger.info("MCP server stopped by user")
         sys.exit(0)
