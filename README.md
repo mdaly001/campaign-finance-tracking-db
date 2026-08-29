@@ -134,7 +134,7 @@ uv run pytest tests/
 
 ### Prior Art Attribution
 
-This project builds on prior analysis of California campaign finance data published by the [Los Angeles Times](https://www.latimes.com/) and other news organizations. We acknowledge their pioneering investigative work that demonstrated the public value of structured campaign finance data. This project aims to make that data more accessible for ongoing transparency research.
+This project builds on prior analysis of California campaign finance data published by the Los Angeles Times and other news organizations. We acknowledge their pioneering investigative work that demonstrated the public value of structured campaign finance data. This project aims to make that data more accessible for ongoing transparency research.
 
 ## Privacy Notice
 
