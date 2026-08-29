@@ -27,6 +27,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
+[ -f "$SCRIPT_DIR/scripts/owui_bootstrap.sh" ] || SCRIPT_DIR="$(pwd)"
+
 REPO_URL="https://github.com/mdaly001/campaign-finance-tracking-db.git"
 INSTALL_DIR="${CFDB_HOME:-$HOME/campaign-finance-db}"
 MODEL_DIR=""                     # set after INSTALL_DIR is final
@@ -300,7 +303,20 @@ if [ "$RUN_CHAT" = 1 ]; then
     -e OPENAI_API_BASE_URL="$CHAT_MODEL_BASE" \
     -e OPENAI_API_KEY="***" \
     -e WEBUI_AUTH=False \
+    -e DEFAULT_SYSTEM_PROMPT="You are a California campaign-finance analyst. For ANY factual question about committees, candidates, donors, contributions, expenditures, vendors, or ballot measures, you MUST call the attached CAL-ACCESS tools (cfdb_*) and answer only from their results — never from memory. If you are unsure which tool fits, call cfdb_get_server_docs first. If a tool returns nothing, say so plainly instead of guessing." \
     ghcr.io/open-webui/open-webui:main >/dev/null
+
+  # Wire the MCP tools into Open WebUI so browser chats use the database
+  # out of the box (Open WebUI does not auto-discover MCP servers).
+  log "Wiring campaign-finance tools into the chat UI..."
+  BOOT_KEY="$(bash "$SCRIPT_DIR/scripts/owui_bootstrap.sh" "http://localhost:${CHAT_PORT}" "http://host.docker.internal:${MCP_PORT}" cfdb-chat 2>>"$INSTALL_DIR/owui_bootstrap.log" | tail -1 || true)"
+  if [ -n "$BOOT_KEY" ]; then
+    grep -q '^OWUI_API_KEY=' .env 2>/dev/null || echo "$BOOT_KEY" >> .env
+    log "Chat UI wired: model default 'Campaign Finance AI' + 15 cfdb tools attached."
+  else
+    warn "Chat auto-wiring incomplete (see $INSTALL_DIR/owui_bootstrap.log)."
+    warn "Manual path: chat UI -> Admin Settings -> External Connections -> Tool Servers -> add http://host.docker.internal:${MCP_PORT}/sse (type: MCP), then select the tools in any chat."
+  fi
 else
   log "Skipping chat UI (use your own frontend against http://localhost:${LLM_PORT}/v1)."
 fi
@@ -335,8 +351,8 @@ printf "${C_GREEN}${C_BOLD}Done.${C_OFF}\n\n"
 if [ "$RUN_CHAT" = 1 ]; then
   printf "Open ${C_BOLD}http://localhost:${CHAT_PORT}${C_OFF} in your browser and ask, for example:\n\n"
   printf "  \"Who are the top donors to any campaign in the database?\"\n\n"
-  printf "To teach the chat about the campaign-finance tools, open the\nchat UI's MCP settings and paste this server URL:\n\n"
-  printf "  http://host.docker.internal:${MCP_PORT}/sse\n\n"
+  printf "The chat already has the campaign-finance tools attached\n(model: 'Campaign Finance AI') - no configuration needed.\n"
+  printf "It will only use tools; nothing you ask leaves this machine.\n\n"
 else
   log "Endpoints (also reachable on your LAN at ${LAN_IP:-<this-host-ip>}):"
   printf "  MCP:  http://%s:${MCP_PORT}/sse   (point Hermes/Open WebUI/etc. at this)\n" "${LAN_IP:-<this-host-ip>}"

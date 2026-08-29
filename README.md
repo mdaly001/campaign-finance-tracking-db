@@ -17,7 +17,7 @@ This project ingests and normalizes campaign finance disclosure data from Califo
 
 ### Quick Start
 
-**Prefer one command?** The installer auto-detects your OS, RAM and GPU, then sets up Docker (if needed), PostgreSQL, the CAL-ACCESS data, the MCP server, a local LLM sized to your hardware, and a browser chat UI at <http://localhost:3000>:
+**Prefer one command?** The installer auto-detects your OS, RAM and GPU, then sets up Docker (if needed), PostgreSQL, the CAL-ACCESS data, the MCP server, a local LLM sized to your hardware, and a browser chat UI at <http://localhost:3000>. The chat arrives **pre-wired**: a default model named "Campaign Finance AI" carries all 15 cfdb tools, so users just ask questions — no MCP configuration, and nothing leaves the machine:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mdaly001/campaign-finance-tracking-db/master/install.sh | bash
