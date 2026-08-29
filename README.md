@@ -44,7 +44,7 @@ docker compose run --rm etl
 # 4. Start the MCP server
 docker compose up -d mcp
 
-# 5. Query at http://localhost:9527/sse
+# 5. Query at http://localhost:9527/mcp
 
 # Re-check for updates (no-op if the SOS export is unchanged):
 docker compose run --rm etl -- incremental \
@@ -62,7 +62,7 @@ To use it fully offline you need two pieces:
    llama.cpp (`llama-server`), or Ollama all work.
 2. **An MCP-client harness** — [OpenCode](https://opencode.ai/docs/mcp-servers/)
    (recommended; MCP is first-class), OpenClaw, Hermes Agent, or DeepSeek
-   Harness. Point it at `http://localhost:9527/sse`.
+   Harness. Point it at `http://localhost:9527/mcp`.
 
 ### Pick your model by RAM
 
@@ -95,7 +95,7 @@ Connect OpenCode (`opencode.json`):
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
-    "cfdb": { "type": "remote", "url": "http://localhost:9527/sse" }
+    "cfdb": { "type": "remote", "url": "http://localhost:9527/mcp" }
   }
 }
 ```

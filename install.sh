@@ -138,7 +138,7 @@ esac; }
 echo
 printf "${C_BOLD}This will install:${C_OFF}
   PostgreSQL 16%s
-  MCP server            http://localhost:${MCP_PORT}/sse
+  MCP server            http://localhost:${MCP_PORT}/mcp
 " "$( [ "$RUN_ETL" = 1 ] && echo " + CAL-ACCESS data (initial load can take hours)" )"
 if [ "$LITE" = 0 ]; then
   printf "  Local LLM (%s)      http://localhost:%s/v1\n" "$(basename "${MODEL_FILE_PATH:-$MODEL}")" "$LLM_PORT"
@@ -315,19 +315,21 @@ if [ "$RUN_CHAT" = 1 ]; then
     log "Chat UI wired: model default 'Campaign Finance AI' + 15 cfdb tools attached."
   else
     warn "Chat auto-wiring incomplete (see $INSTALL_DIR/owui_bootstrap.log)."
-    warn "Manual path: chat UI -> Admin Settings -> External Connections -> Tool Servers -> add http://host.docker.internal:${MCP_PORT}/sse (type: MCP), then select the tools in any chat."
+    warn "Manual path: chat UI -> Admin Settings -> External Connections -> Tool Servers -> add http://host.docker.internal:${MCP_PORT}/mcp (type: MCP), then select the tools in any chat."
   fi
 else
   log "Skipping chat UI (use your own frontend against http://localhost:${LLM_PORT}/v1)."
 fi
 
 # smoke tests ---------------------------------------------------------------
-log "Smoke tests..."
-# SSE is a never-ending stream; judge by whether the endpoint event arrives.
-SSE_PROBE="$(curl -sN -m 4 "http://localhost:${MCP_PORT}/sse" 2>/dev/null | head -c 200 || true)"
-case "$SSE_PROBE" in
-  *"event:"*) log "MCP server: OK (streaming at http://localhost:${MCP_PORT}/sse)" ;;
-  *)          warn "MCP server: no SSE response on :${MCP_PORT}" ;;
+# Streamable HTTP transport: POST an initialize handshake to /mcp and accept a
+# JSON-RPC result (or an event-stream event) as proof the server answers tools.
+MCP_PROBE="$(curl -sN -m 4 -H 'Accept: application/json, text/event-stream' \
+  -H 'Content-Type: application/json' -X POST "http://localhost:${MCP_PORT}/mcp" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"installer","version":"0"},"capabilities":{}}}' 2>/dev/null | head -c 400 || true)"
+case "$MCP_PROBE" in
+  *'"result"'*|*event:*) log "MCP server: OK (streamable-http at http://localhost:${MCP_PORT}/mcp)" ;;
+  *)                     warn "MCP server: no /mcp response on :${MCP_PORT}" ;;
 esac
 [ "$LITE" = 0 ] && [ "$LLM_UP" = 1 ] && \
   ( curl -sf "http://localhost:${LLM_PORT}/v1/models" >/dev/null && log "LLM server: OK" || warn "LLM server: not ready yet" )
@@ -355,7 +357,7 @@ if [ "$RUN_CHAT" = 1 ]; then
   printf "It will only use tools; nothing you ask leaves this machine.\n\n"
 else
   log "Endpoints (also reachable on your LAN at ${LAN_IP:-<this-host-ip>}):"
-  printf "  MCP:  http://%s:${MCP_PORT}/sse   (point Hermes/Open WebUI/etc. at this)\n" "${LAN_IP:-<this-host-ip>}"
+  printf "  MCP:  http://%s:${MCP_PORT}/mcp   (point Hermes/Open WebUI/etc. at this)\n" "${LAN_IP:-<this-host-ip>}"
   [ "$LITE" = 0 ] && printf "  LLM:  http://%s:${LLM_PORT}/v1\n" "${LAN_IP:-<this-host-ip>}"
   echo
 fi
