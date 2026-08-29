@@ -1,8 +1,8 @@
 """MCP server entry point for the Campaign Finance Database.
 
 Launches an MCP server with 15 read-only query tools.
-Runs on port 9527 (configurable via MCP_PORT env var); serves Streamable
-HTTP at /mcp and the legacy SSE transport at /sse.
+Runs on port 9527 (configurable via MCP_PORT env var); serves the Streamable
+HTTP transport at /mcp (point MCP clients at http://<host>:9527/mcp).
 
 Usage:
     python -m core.mcp.server              # Start MCP server (default port)
@@ -333,23 +333,20 @@ def main() -> None:
 
     server = _create_server()
 
-    # Dual transport on one port:
-    #   - Streamable HTTP at /mcp  (current MCP spec — the only transport the
-    #     Open WebUI MCP client speaks; it POSTs initialize to the connection
-    #     url and would otherwise 404 and silently attach zero tools)
-    #   - legacy SSE at /sse       (kept for older MCP clients like OpenCode)
-    # The streamable app is the root ASGI app and owns the session-manager
-    # lifespan; the SSE app is mounted into it and shares that session manager.
-    import uvicorn
-
-    app = server.streamable_http_app(streamable_http_path="/mcp")
-    app.mount("/sse", server.sse_app(sse_path="", message_path="/messages/"))
-
-    try:
-        uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level.lower())
-    except KeyboardInterrupt:
-        logger.info("MCP server stopped by user")
-        sys.exit(0)
+    # Serve the Streamable HTTP transport (current MCP spec) — the only transport
+    # the Open WebUI MCP client speaks (it POSTs the initialize handshake to the
+    # connection url; on an SSE-only server it got a 404 and silently attached
+    # zero tools, so chats hallucinated instead of querying the database).
+    # The SDK's own runner is used (no uvicorn import here — uvicorn is not a
+    # hard dependency of this image; importing it at runtime would crash-loop
+    # the container). Legacy SSE consumers must point at /mcp now.
+    asyncio.run(
+        server.run_streamable_http_async(
+            host=args.host,
+            port=args.port,
+            streamable_http_path="/mcp",
+        )
+    )
 
 
 if __name__ == "__main__":
