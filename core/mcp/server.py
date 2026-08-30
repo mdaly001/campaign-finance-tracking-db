@@ -1,6 +1,7 @@
 """MCP server entry point for the Campaign Finance Database.
 
-Launches an MCP server with 15 read-only query tools.
+Launches an MCP server with 16 read-only query tools (15 domain tools + a
+run_sql escape hatch for edge-case queries).
 Runs on port 9527 (configurable via MCP_PORT env var); serves the Streamable
 HTTP transport at /mcp (point MCP clients at http://<host>:9527/mcp).
 
@@ -33,6 +34,7 @@ from core.mcp.tools import (
     measure_spending,
     payments_to_person,
     rapid_expense_vendors,
+    run_sql,
     top_donors_for_committee_or_candidate,
     upcoming_filings,
     vendor_revenue,
@@ -56,6 +58,7 @@ TOOLS: list[str] = [
     "payments_to_person",
     "rapid_expense_vendors",
     "describe_table",
+    "run_sql",
     "get_server_docs",
 ]
 
@@ -64,7 +67,9 @@ TOOLS: list[str] = [
 INSTRUCTIONS = """\
 California campaign-finance disclosure data (CAL-ACCESS, CA Secretary of
 State), read-only. Call get_server_docs() first for the full guide;
-describe_table() shows columns + gotchas for any table before ad-hoc SQL.
+describe_table() shows columns + gotchas for any table before ad-hoc SQL;
+run_sql(sql) runs a single read-only SELECT/WITH/EXPLAIN — the escape hatch
+for edge-case questions no dedicated tool covers.
 
 Essentials:
 - Individuals are stored LAST-first (naml=last name, namf=first name);
@@ -285,6 +290,19 @@ def _create_server() -> MCPServer:
             "tool with arguments and when to use it, the data "
             "conventions, and the known caveats. Call this first when "
             "attaching a new agent."
+        ),
+    )
+
+    # 16. run_sql — SQL escape hatch for edge cases no dedicated tool covers
+    server.add_tool(
+        run_sql,
+        name="run_sql",
+        description=(
+            "Run ONE read-only SQL query (must start with SELECT, WITH, or "
+            "EXPLAIN) against the campaign-finance database. Prefer a dedicated "
+            "tool when one fits; use this for edge-case/ad-hoc questions. "
+            "Guards: single statement, 15s timeout, capped rows; runs as a "
+            "read-only role so writes are impossible."
         ),
     )
 

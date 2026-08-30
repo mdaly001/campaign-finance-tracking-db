@@ -45,8 +45,9 @@ from decimal import Decimal
 from typing import Any
 
 from pydantic import BaseModel
+from sqlalchemy import text
 
-from core.mcp.db import execute_read
+from core.mcp.db import execute_read, get_engine
 
 logger = logging.getLogger(__name__)
 
@@ -1864,5 +1865,45 @@ def get_server_docs() -> str:
             "committee_profile, find_committees, measure_spending, "
             "donor_watch_since, upcoming_filings, filing_due_soon, "
             "payments_to_person, rapid_expense_vendors, describe_table, "
-            "get_server_docs.\n"
+            "run_sql, get_server_docs.\n"
         )
+
+
+def run_sql(sql: str, row_limit: int = 200) -> dict[str, Any]:
+    """Run one read-only SQL query against the campaign-finance database.
+
+    Escape hatch for edge-case questions no dedicated tool covers.
+    Guards: one statement only, must start with SELECT/WITH/EXPLAIN;
+    15 s statement timeout; capped row fetch. Runs as the read-only
+    ``cfdb_reader`` role, so writes are impossible and privileged schemas
+    (unredacted) stay invisible even to raw SQL — prefer a dedicated tool
+    when one fits; reach for this for anything else.
+    """
+    cleaned = (sql or "").strip().rstrip(";").strip()
+    if not cleaned:
+        return {"error": "empty SQL"}
+    first = cleaned.split(None, 1)[0].upper()
+    if first not in {"SELECT", "WITH", "EXPLAIN"}:
+        return {"error": f"only SELECT/WITH/EXPLAIN are allowed, got '{first}'"}
+    if first == "EXPLAIN" and cleaned.upper().split(None, 2)[1:2] == ["ANALYZE"]:
+        return {"error": "EXPLAIN ANALYZE executes the statement; plain EXPLAIN only"}
+    if ";" in cleaned:
+        return {"error": "single statement only"}
+    limit = max(1, min(int(row_limit), 1000))
+    engine = get_engine()
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SET LOCAL statement_timeout = 15000"))
+            conn.execute(text("SET TRANSACTION READ ONLY"))
+            result = conn.execute(text(cleaned), {})
+            columns = list(result.keys())
+            rows = [dict(_coerce_row(dict(zip(columns, r)))) for r in result.fetchmany(limit + 1)]
+        truncated = len(rows) > limit
+        return {
+            "columns": columns,
+            "row_count": min(len(rows), limit),
+            "truncated": truncated,
+            "rows": rows[:limit],
+        }
+    except Exception as exc:  # surface SQL errors as data, never as transport errors
+        return {"error": f"{type(exc).__name__}: {exc}"}
