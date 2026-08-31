@@ -746,7 +746,7 @@ def committee_outlays_to(
             e.cmte_id,
             e.tran_id,
             e.memo_refno
-        FROM expn_cd e
+        FROM expn_cd_deduped e
         WHERE {_committee_predicate('e')}
           AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle
           AND TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, ''))
@@ -797,7 +797,7 @@ def vendor_revenue(vendor_name: str, limit: int = 20) -> list[dict[str, Any]]:
             ) AS vendor_name,
             COUNT(*) AS payments,
             COALESCE(SUM(e.amount), 0) AS total
-        FROM expn_cd e
+        FROM expn_cd_deduped e
         WHERE TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, ''))
               ~* :vendor
         GROUP BY 1
@@ -872,7 +872,7 @@ def committees_paying_vendor(
             fcl.category AS filer_category,
             COUNT(*) AS payments,
             COALESCE(SUM(e.amount), 0) AS total
-        FROM expn_cd e
+        FROM expn_cd_deduped e
         JOIN filings ff ON ff.filing_id = e.filing_id
         LEFT JOIN filer_name fn ON fn.filer_id = ff.filer_id
         LEFT JOIN filer_cmte fc ON fc.filer_id = ff.filer_id
@@ -955,7 +955,7 @@ def committee_profile(
     expn = execute_read(
         f"""
         SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS n
-        FROM expn_cd e
+        FROM expn_cd_deduped e
         WHERE {_committee_predicate('e')}{asof_clause_e}
         """,
         params_base,
@@ -970,7 +970,7 @@ def committee_profile(
         SELECT MAX(d) AS last_activity FROM (
             SELECT x.receipt_date AS d FROM receipts_all x WHERE {_committee_predicate('x')}
             UNION ALL
-            SELECT e.expn_date AS d FROM expn_cd e WHERE {_committee_predicate('e')}
+            SELECT e.expn_date AS d FROM expn_cd_deduped e WHERE {_committee_predicate('e')}
         ) t
         """,
         {"filer": filer_id},
@@ -1416,7 +1416,7 @@ def payments_to_person(
                 SELECT e.filing_id, e.expn_date, e.amount, e.expn_dscr,
                        e.payee_naml, e.payee_namf, ff.filer_id,
                        COUNT(*) OVER () AS total_matches
-                FROM expn_cd e
+                FROM expn_cd_deduped e
                 JOIN filings ff ON ff.filing_id = e.filing_id
                 WHERE {pred}{since_sql.format(a='e')}
             )
@@ -1463,13 +1463,13 @@ def payments_to_person(
             bs = execute_read(
                 f"""
                 SELECT COUNT(*) AS n
-                FROM s496_cd s
+                FROM s496_cd_deduped s
                 WHERE s.filing_id IN (
                     SELECT DISTINCT ff.filing_id
                     FROM filer_filings_cd ff
                     WHERE ff.filer_id IN (
                         SELECT DISTINCT ff2.filer_id
-                        FROM expn_cd e2
+                        FROM expn_cd_deduped e2
                         JOIN filer_filings_cd ff2 ON ff2.filing_id = e2.filing_id
                         WHERE {pred.replace('e.', 'e2.')}
                         {since_sql.format(a='e2')}
@@ -1625,7 +1625,7 @@ def rapid_expense_vendors(
     total_rows = execute_read(
         f"""
         SELECT COUNT(*) AS n
-        FROM s496_cd s
+        FROM s496_cd_deduped s
         WHERE s.filing_id IN (
             SELECT DISTINCT filing_id FROM filer_filings_cd WHERE filer_id = :fid
         ){since_sql}
@@ -1647,14 +1647,14 @@ def rapid_expense_vendors(
             SELECT s.filing_id, s.line_item,
                    s.exp_date::date AS d, s.amount,
                    LEFT(TRIM(COALESCE(s.expn_dscr, '')), 120) AS dscr
-            FROM s496_cd s
+            FROM s496_cd_deduped s
             WHERE s.filing_id IN (SELECT filing_id FROM f){since_sql}
         ),
         expn AS (
             SELECT DISTINCT e.expn_date::date AS d, e.amount,
                    TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, ''))
                        AS payee
-            FROM expn_cd e
+            FROM expn_cd_deduped e
             WHERE e.filing_id IN (SELECT filing_id FROM f)
               AND TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, ''))
                   <> ''
