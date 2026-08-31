@@ -193,16 +193,20 @@ class TableLoader:
             summary.rows_skipped = max(raw_bytes.count(b"\n") - 1, 0)
             return summary
 
-        # Parse TSV (normalize column keys to lowercase: TSV headers are
-        # upper-case, the DDL uses lower-case identifiers)
-        records = [
-            {str(k).lower(): v for k, v in rec.items()}
-            for rec in self.reader.read_bytes(raw_bytes)
-        ]
-        summary.rows_read = len(records)
-        logger.info("Parsed %d rows for %s", summary.rows_read, config.table_name)
+        # Stream-parse the TSV (normalize column keys to lowercase: TSV
+        # headers are upper-case, the DDL uses lower-case identifiers).
+        # Streaming keeps peak memory at O(batch_size): one parsed row is
+        # live at a time, batches are upserted and discarded — the full
+        # file is never materialized as a list of dicts.
+        stream = iter(
+            (
+                {str(k).lower(): v for k, v in rec.items()}
+                for rec in self.reader.stream_bytes(raw_bytes)
+            )
+        )
 
-        if not records:
+        first = next(stream, None)
+        if first is None:
             logger.warning("No records found in %s", config.table_name)
             return summary
 
@@ -213,14 +217,17 @@ class TableLoader:
                 conn.execute(text(f'TRUNCATE TABLE "{config.table_name}"'))
             logger.info("Truncated %s (append-only load)", config.table_name)
 
-        # Add source metadata to each record (stripped before upsert)
-        for record in records:
+        # Process records: tag metadata, coerce, validate, strip, batch upsert
+        batch: list[dict] = []
+        record = first
+        while record is not None:
+            summary.rows_read += 1
+
+            # Source metadata attached on ingest (stripped again before
+            # upsert; kept in the dict so row-level hooks can observe it).
             record["__table__"] = config.table_name
             record["__file_hash__"] = file_hash
 
-        # Process records: coerce, validate, strip columns, batch upsert
-        batch: list[dict] = []
-        for record in records:
             # Strip unwanted columns
             record = self._strip_columns(record, config.skip_columns)
 
@@ -230,6 +237,7 @@ class TableLoader:
             # Validate
             if not self._validate_row(record, config):
                 summary.rows_skipped += 1
+                record = next(stream, None)
                 continue
 
             batch.append(record)
@@ -244,6 +252,8 @@ class TableLoader:
                     summary.rows_upserted + summary.rows_failed,
                 )
                 batch = []
+
+            record = next(stream, None)
 
         # Final batch
         if batch:
