@@ -15,16 +15,19 @@ Large contributions to certain committees must be reported within 24 hours
 re-reported in the committee's periodic reports, so a naive union of
 `rcpt_cd` + `s497_cd` + `s498_cd` double-counts.
 
-- The `receipts_all` view (migration 0002) unions the three sources; every
-  row carries a `source` column.
+- The `receipts_all` view (rebuilt by migration 0004 on top of the
+  `*_deduped` views) unions the three amendment-deduplicated sources; every
+  row carries a `src` column.
 - Contribution tools (`contributions_by_donor`,
   `top_donors_for_committee_or_candidate`, `committee_profile`,
-  `donor_watch_since`) dedup per (donor key, date, amount), keeping one row
-  per source present and preferring `rcpt_cd` when a gift appears in both.
+  `donor_watch_since`) read `receipts_all` and dedup per (donor key, date,
+  amount), keeping one row per source present and preferring `rcpt_cd`
+  when a gift appears in both.
 
-**Watch out for:** if you write raw SQL against these tables directly (instead
-of the tools), you must apply the same dedup or you will over-count recent
-activity from rapid-disclosure committees.
+**Watch out for:** if you write raw SQL against the raw base tables
+(`rcpt_cd` directly instead of `rcpt_cd_deduped`/`receipts_all`), you must
+apply both dedups (amendments + cross-source) or you will over-count.
+See section 1.3 for the amendment dimension.
 
 ### 1.2 24-hour *expenditures* carry no payee name (structural blind spot)
 The 24-hour expenditure report (form 496, table `s496_cd`) records amount,
@@ -135,6 +138,56 @@ field) or internal memo codes, and rarely contain a payee's name at all.
 They tell you *what was bought*, not *who was paid*. For those lines, the
 only reliable answer is to re-run step 2 after the committee's next periodic
 report lands.
+
+### 1.3 Amendment versions: `amend_id` duplicates every amended transaction
+
+Every CAL-ACCESS fact table (`rcpt_cd`, `expn_cd`, `s497_cd`, `s496_cd`,
+`s498_cd`, `lexp_cd`, `loan_cd`, `debt_cd`, `splt_cd`, `text_memo_cd`)
+keys rows by `(amend_id, filing_id, form_type, line_item, rec_type)`.
+When a committee amends a filing, the SOS re-publishes the entire filing
+with a new `amend_id` (0 = original, 1 = first amendment, …). A single
+logical transaction therefore exists 2–10 times in the raw table, and a
+naive `SUM(amount)` over a raw fact table counts every version of the
+transaction — inflating totals by 30–60% on amendment-heavy committees.
+
+- **Verified impact (2026-08 snapshot, migration `0004_dedup_views.sql`):**
+
+  | table | raw rows | deduped rows | reduction |
+  |-------|---------:|-------------:|----------:|
+  | `rcpt_cd` | 20,184,473 | 14,250,967 | −29.4% |
+  | `expn_cd` | 15,747,158 | 12,820,285 | −18.6% |
+  | `s497_cd` | 1,394,158 | 1,283,164 | −8.0% |
+  | `s496_cd` | 75,685 | 62,734 | −17.1% |
+  | `s498_cd` | 27,609 | 27,016 | −2.1% |
+
+  Spot check (verified against this snapshot): filer 1239774
+  "PHILLIPS FOR ASSEMBLY" raw `rcpt_cd` total $503,037.22 → deduped
+  $434,217.90 — $68,819.32 of amended duplicates removed.
+
+- **ETL invariant:** loads always write the *raw* base tables with the full
+  composite key including `amend_id` (see `core/etl/loader.py` —
+  `DEDUP_FACT_TABLES` / `dedup_view_name()`). Dedup happens at **query
+  time**, never on write, so late-filed amendments land as new rows with
+  `amend_id > 0` and supersede earlier versions automatically.
+
+**Guidance:** query the `*_deduped` views (or the union views
+`receipts_all` / `expn_all`, which are built on them), never the raw fact
+tables, for any SUM/COUNT/ranking. The deduped view keeps the highest
+`amend_id` per `(filing_id, line_item)` group:
+
+```sql
+-- Correct: deduplicated contributions to one filer's filings
+SELECT r.tran_id, r.amount
+FROM rcpt_cd_deduped r
+JOIN filer_filings_cd f ON f.filing_id = r.filing_id
+WHERE f.filer_id = :filer_id;
+
+-- Wrong: includes every amended copy of the same transaction
+SELECT r.tran_id, r.amount
+FROM rcpt_cd r
+JOIN filer_filings_cd f ON f.filing_id = r.filing_id
+WHERE f.filer_id = :filer_id;
+```
 
 ---
 

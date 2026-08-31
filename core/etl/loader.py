@@ -19,6 +19,55 @@ from core.etl.upsert import upsert_records
 logger = logging.getLogger(__name__)
 
 
+# ------------------------------------------------------------------ #
+#  Amendment-version dedup (migration 0004)
+# ------------------------------------------------------------------ #
+# CAL-ACCESS fact tables store every amendment of a filing as a separate
+# row: the composite key is (amend_id, filing_id, form_type, line_item,
+# rec_type), and a logical transaction can appear 2-10 times with
+# increasing amend_id (0 = original, 1 = first amendment, ...).
+#
+# Loader invariant: fact tables are ALWAYS loaded into the RAW base tables
+# (rcpt_cd, expn_cd, ...) keeping every amendment version, using the full
+# composite key (including amend_id) as the upsert conflict key. The
+# loader must never collapse amendment versions on write — amendments
+# re-filed after the initial load land as new rows with amend_id > 0 and
+# supersede the earlier version at query time, not on write.
+#
+# The query surface must read from the `*_deduped` views (migration
+# 0004_dedup_views.sql), which keep only the latest amend_id per
+# (filing_id, line_item) group. Use dedup_view_name() to map a base
+# table to its deduped view.
+DEDUP_FACT_TABLES: tuple[str, ...] = (
+    "rcpt_cd",
+    "expn_cd",
+    "lexp_cd",
+    "s497_cd",
+    "s498_cd",
+    "s496_cd",
+    "loan_cd",
+    "debt_cd",
+    "splt_cd",
+    "text_memo_cd",
+)
+
+
+def dedup_view_name(table_name: str) -> str | None:
+    """Return the deduped view name for a fact table, or None.
+
+    Every CAL-ACCESS fact table (amendment versioning applies) has a
+    companion view `<table>_deduped` created by migration 0004 that
+    collapses amendment versions: it keeps only the row with the highest
+    amend_id per (filing_id, line_item) group. Tools and reports MUST
+    query the deduped view — summing amounts on the raw base table
+    double-counts every amended transaction.
+    """
+    base = table_name.lower()
+    if base in DEDUP_FACT_TABLES:
+        return f"{base}_deduped"
+    return None
+
+
 _DT_FORMATS = (
     "%m/%d/%Y %I:%M:%S %p",   # 1/27/2000 12:00:00 AM  (CAL-ACCESS)
     "%m/%d/%Y %I:%M %p",      # 1/27/2000 12:00 AM
