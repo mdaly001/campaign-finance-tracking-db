@@ -106,6 +106,61 @@ Fund since 2016, and what were their five biggest expenses?"*
 **Agent tip:** your first tool call should always be `get_server_docs` — it
 returns the full data-conventions guide (no repo access needed).
 
+### Instructing your agent/harness (CRITICAL)
+
+When connecting an LLM to this database, you **must ensure the agent reads
+the documentation files** before writing queries. Without this context, the
+agent will produce confidently wrong financial answers due to dataset quirks
+that are invisible from the schema alone.
+
+**Three files every agent MUST read:**
+
+1. **`docs/data_caveats.md`** — All the gotchas that silently distort results:
+   name storage order, 24-hour report dedup, row-count inflation from joins,
+   committee renaming, refund-as-expenditure, and the correct SQL templates
+   for common queries.
+
+2. **`docs/mcp_server.md`** — The MCP tool catalog and data conventions.
+   Call `get_server_docs` first if the agent doesn't have repo access — it
+   returns this exact text.
+
+3. **`docs/data_dictionary.md`** — Full table/column definitions.
+
+**How to inject these into an agent:**
+
+- **OpenWebUI (chat UI):** The installer sets a system prompt (see below).
+  To add more context, edit the `DEFAULT_SYSTEM_PROMPT` env var in the
+  `docker run` command or set it via the Admin Settings.
+
+- **CLI harnesses (Hermes, OpenCode, etc.):** Put the docs in your session
+  as context or a `.agents.md` / `AGENTS.md` file in the repo root. Most
+  harnesses auto-inject these on session start.
+
+- **Programmatic:** Include the docs as system messages in your API calls
+  before any tool-invocation turns.
+
+**Minimum system prompt for OpenWebUI (the installer already sets this):**
+
+```
+You are a California campaign-finance analyst. For ANY factual question
+about committees, candidates, donors, contributions, expenditures, vendors,
+or ballot measures, you MUST call the attached CAL-ACCESS tools (cfdb_*)
+and answer only from their results — never from memory.
+
+CRITICAL RULES:
+- Always call `get_server_docs` first to load data conventions.
+- Names are stored LAST-FIRST (e.g. payee_naml='Daly', namf='Michael Gomez').
+- On rcpt_cd, cmte_id identifies the DONOR's committee, not the recipient.
+  Always scope queries through filer_filings_cd, not cmte_id.
+- 24-hour expenditure reports (s496_cd) have NO payee names — only a
+  description. Vendor data from expn_cd is a lower bound; use
+  rapid_expense_vendors to recover payees.
+- Never trust a large total without spot-checking the raw rows for that
+  filing_id — a filing may contain many different donors, not just the one
+  you're interested in.
+- If a tool returns nothing, say so plainly instead of guessing.
+```
+
 > Note: MCP support varies by harness version. OpenCode supports MCP servers
 > natively; OpenClaw and Hermes Agent's support is adapter/skill-based —
 > check their current docs before assuming the 15 tools will appear.
