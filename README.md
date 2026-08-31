@@ -100,8 +100,7 @@ Connect OpenCode (`opencode.json`):
 }
 ```
 
-Then ask it things like: *"Which committees paid Inland Empire United Action
-Fund since 2016, and what were their five biggest expenses?"*
+Then ask it things like: *"Which committees paid VENDOR1 since 2016, and what were their five biggest expenses?"*
 
 **Agent tip:** your first tool call should always be `get_server_docs` — it
 returns the full data-conventions guide (no repo access needed).
