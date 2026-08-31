@@ -257,3 +257,145 @@ structured outcomes is unbuilt. Do not ask the database who won.
 ### 5.3 Precinct-level results are out of scope
 Per project spec, even the planned PDF parsing excludes precinct-level
 data.
+
+---
+
+## 6. Common Query Patterns — Correct Approaches
+
+These are **working templates** for the most common analytical questions.
+Copy these rather than writing ad-hoc JOIN chains — they handle the
+gotchas documented in sections 3.2–3.8 above.
+
+### 6.1 "Who are the top donors to committee X?"
+
+```sql
+-- Correct: aggregate on the *donor* name fields from rcpt_cd,
+-- scoped to the recipient committee through filer_filings_cd.
+SELECT
+    COALESCE(ctrib_naml, '(unknown)') AS donor_name,
+    COUNT(*) AS num_contributions,
+    ROUND(SUM(amount), 2) AS total_gave
+FROM rcpt_cd
+WHERE filing_id IN (
+    SELECT DISTINCT f.filing_id
+    FROM filer_filings_cd f
+    JOIN filer_xref_cd x ON f.xref_filer_id = x.xref_filer_id
+    JOIN filername_cd n ON f.xref_filer_id = n.xref_filer_id
+    WHERE TRIM(COALESCE(n.naml, '') || ' ' || COALESCE(n.namf, ''))
+          ILIKE '%COMMITTEE_NAME%'
+)
+GROUP BY ctrib_naml, ctrib_namf, ctrib_namt
+ORDER BY total_gave DESC
+LIMIT 20;
+```
+
+**Do NOT** use `cmte_id` as the filter (section 3.3: `cmte_id` is the
+*donor's* committee ID, not the recipient's).
+
+### 6.2 "Where did donor X's money go?" (recipient tracing)
+
+```sql
+-- Correct: query rcpt_cd by donor name, resolve each filing_id to the
+-- *receiving* committee name via the JOIN chain.
+SELECT
+    TRIM(COALESCE(n.naml, '') || ' ' || COALESCE(n.namf, '')) AS receiving_committee,
+    COUNT(*) AS num_transactions,
+    ROUND(SUM(r.amount), 2) AS total_given,
+    MIN(r.rcpt_date) AS first_contribution,
+    MAX(r.rcpt_date) AS last_contribution
+FROM rcpt_cd r
+JOIN filer_filings_cd f ON r.filing_id = f.filing_id
+JOIN filer_xref_cd x ON f.xref_filer_id = x.xref_filer_id
+JOIN filername_cd n ON f.xref_filer_id = n.xref_filer_id
+WHERE (TRIM(COALESCE(r.ctrib_naml, '')) ILIKE '%DONOR_LAST%'
+    OR TRIM(COALESCE(r.ctrib_namf, '')) ILIKE '%DONOR_FIRST%')
+GROUP BY n.xref_filer_id
+ORDER BY total_given DESC;
+```
+
+**CRITICAL:** Always verify large totals by checking the raw donor names
+for a given `filing_id`. A `filing_id` join resolves the *receiving
+committee*, but the individual rows in `rcpt_cd` may contain hundreds of
+different donors (e.g., a CDP transfer where one county party receives
+money from 600+ individual donors — that $198K total was *not* from one
+person). Always run:
+
+```sql
+-- Spot-check: who actually gave money to this committee in this filing?
+SELECT ctrib_naml, ctrib_namf, amount, rcpt_date
+FROM rcpt_cd WHERE filing_id = :filing_id
+ORDER BY amount DESC LIMIT 20;
+```
+
+### 6.3 "How much did committee X spend on vendor Y?"
+
+```sql
+SELECT
+    TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, '')) AS payee_name,
+    COUNT(*) AS num_payments,
+    ROUND(SUM(e.amount), 2) AS total_paid,
+    MIN(e.expn_date::date) AS first_payment,
+    MAX(e.expn_date::date) AS last_payment
+FROM expn_cd e
+WHERE e.filing_id IN (
+    SELECT DISTINCT f.filing_id
+    FROM filer_filings_cd f
+    JOIN filer_xref_cd x ON f.xref_filer_id = x.xref_filer_id
+    JOIN filername_cd n ON f.xref_filer_id = n.xref_filer_id
+    WHERE TRIM(COALESCE(n.naml, '') || ' ' || COALESCE(n.namf, ''))
+          ILIKE '%COMMITTEE_NAME%'
+)
+AND TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, ''))
+    ~* '\mVENDOR_KEYWORD\b'
+GROUP BY payee_naml, payee_namf
+ORDER BY total_paid DESC;
+```
+
+### 6.4 Avoiding row-count inflation from joins
+
+The `filer_filings_cd` and `filername_cd` tables multiply row counts:
+
+- `filer_filings_cd` can have duplicate `(filing_id, xref_filer_id)` pairs
+- `filername_cd` has ~10× rows per filer (one per name × contact combo)
+
+**Fixes:**
+- Use `DISTINCT` in subqueries: `SELECT DISTINCT filing_id FROM ...`
+- Use `EXISTS` instead of `JOIN` when you only need a filter:
+  ```sql
+  WHERE EXISTS (
+      SELECT 1 FROM filer_filings_cd ff
+      JOIN filername_cd fn ON ff.xref_filer_id = fn.xref_filer_id
+      WHERE ff.filing_id = rcpt_cd.filing_id
+        AND TRIM(COALESCE(fn.naml, '')) ILIKE '%COMMITTEE%'
+  )
+  ```
+- Never `COUNT(*)` directly from a `filername_cd` JOIN — always
+  `COUNT(DISTINCT rcpt_cd.filing_id)` or aggregate on `rcpt_cd`
+  before joining.
+
+### 6.5 De-duplicating rapid-disclosure contributions
+
+The `receipts_all` view handles this for you. If you query raw tables:
+
+```sql
+-- Dedup per (donor key, date, amount), keeping rcpt_cd when a gift
+-- appears in both a periodic report and a 24-hour report.
+SELECT DISTINCT ON (
+    COALESCE(ctrib_naml, '') || COALESCE(ctrib_namf, ''),
+    rcpt_date::date,
+    amount
+)
+    ctrib_naml, ctrib_namf, rcpt_date, amount, source
+FROM (
+    SELECT ctrib_naml, ctrib_namf, rcpt_date, amount, 'rcpt_cd' AS source
+    FROM rcpt_cd
+    UNION ALL
+    SELECT ctrib_naml, ctrib_namf, ctrib_date, amount, 's497_cd'
+    FROM s497_cd
+) combined
+ORDER BY
+    COALESCE(ctrib_naml, '') || COALESCE(ctrib_namf, ''),
+    rcpt_date::date,
+    amount,
+    CASE source WHEN 'rcpt_cd' THEN 0 ELSE 1 END;
+```
