@@ -6,7 +6,7 @@ Covers:
 - describe_table (valid / unknown / invalid names)
 - get_server_docs (serves docs/mcp_server.md)
 - _person_predicate (field-aware, word-anchored matching)
-- server registration (15 tools, instructions block)
+- server registration (16 tools, instructions block)
 
 Mocked dispatch (unit) + live-DB regression (skipped when Postgres is not
 reachable) using the known Michael Gomez Daly / Tubbs 2026 ground truth.
@@ -364,12 +364,13 @@ class TestGetServerDocs:
 
 
 class TestServerRegistration:
-    def test_fifteen_tools(self):
-        assert len(TOOLS) == 15
+    def test_sixteen_tools(self):
+        assert len(TOOLS) == 16
         for t in (
             "payments_to_person",
             "rapid_expense_vendors",
             "describe_table",
+            "run_sql",
             "get_server_docs",
         ):
             assert t in TOOLS

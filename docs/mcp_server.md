@@ -2,9 +2,10 @@
 
 Read-only MCP (Model Context Protocol) server over the **CAL-ACCESS**
 California Secretary of State campaign finance disclosure database
-(PostgreSQL 16). 15 query tools covering contributions, expenditures,
-committees, people, ballot measures, filing deadlines, and the 24-hour
-rapid-disclosure reports.
+(PostgreSQL 16). 16 query tools covering contributions, expenditures,
+committees, people, ballot measures, filing deadlines, the 24-hour
+rapid-disclosure reports, and a guarded read-only SQL escape hatch
+(`run_sql`) for edge-case queries no dedicated tool covers.
 
 > **Agents: this document is also served in-band.** Call the
 > `get_server_docs` tool after connecting — it returns exactly this text,
@@ -12,10 +13,10 @@ rapid-disclosure reports.
 
 ## 1. Attaching an agent
 
-The server speaks MCP over **SSE**. Point any MCP client at:
+The server speaks MCP over **Streamable HTTP**. Point any MCP client at:
 
 ```
-http://<host>:9527/sse
+http://<host>:9527/mcp
 ```
 
 Example client config (Claude Desktop / most harnesses):
@@ -24,7 +25,7 @@ Example client config (Claude Desktop / most harnesses):
 {
   "mcpServers": {
     "cfdb": {
-      "url": "http://<host>:9527/sse"
+      "url": "http://<host>:9527/mcp"
       }
   }
 }
@@ -35,7 +36,7 @@ Operational details:
 | Item | Value |
 |---|---|
 | Default port | `9527` (override: `MCP_PORT` env var or `--port`) |
-| SSE endpoint | `/sse` (messages arrive on `/messages/`) |
+| Transport | Streamable HTTP at `/mcp` (JSON-RPC POSTs; SSE-style responses) |
 | Database auth | `cfdb_reader` (read-only role, `READ ONLY` transactions) |
 | DB config | `DATABASE_URL`, or `DB_USER`/`DB_PASSWORD`/`DB_HOST`/`DB_PORT`/`DB_NAME` |
 | Log level | `LOG_LEVEL` env var (default `INFO`) |
@@ -54,6 +55,7 @@ MCP_PORT=9527 python -m core.mcp.server
 |---|---|---|
 | `get_server_docs` | This guide (call first) | — |
 | `describe_table` | Columns + gotchas for any table/view, before ad-hoc reasoning | `table_name` |
+| `run_sql` | Ad-hoc read-only SQL (single `SELECT`/`WITH`/`EXPLAIN` statement) for edge cases no dedicated tool covers — guarded: read-only role, 15 s timeout, capped rows | `sql`, `row_limit?` |
 | `find_committees` | Committee ID(s) from a (partial) name | `name`, `limit` |
 | `committee_profile` | Name, type, totals (contributions incl. 24-hr, expenditures, cash) | `committee_id`, `as_of_date?` |
 | `contributions_by_donor` | All contributions by a donor in a cycle | `donor_name`, `cycle`, `include_aliases?` |
