@@ -1,4 +1,4 @@
--- 0004: Dedup views for amendment versions AND downstream/Form D filtering
+-- 0004: Dedup views for amendment versions AND downstream filtering
 --
 -- PROBLEM 1: Every SOS CAL-ACCESS fact table stores amendment versions as
 -- separate rows. A single logical transaction appears 2-10 times with
@@ -12,27 +12,15 @@
 --   2. Payee=KNBC-TV, agent=RED7E → $1.4M (downstream detail, already counted)
 -- Counting both double-counts the same money.
 --
--- PROBLEM 3: Form 460 (EXP) uses TWO form types for the same expenditure:
---   - Form D (EDT): "paid TO Michael Tubbs" (beneficiary tracking)
---   - Form E (EXP): "paid TO RED7E, INC." (vendor tracking)
--- Same money, two angles. Adding Form D + Form E = double-counting.
---
 -- SOLUTION 1: Keep only the LATEST amend_id per logical record (highest
 -- amend_id per filing_id+line_item group).
 --
 -- SOLUTION 2: Filter out downstream records (WHERE agent_naml IS NULL)
 -- so only upstream payments are counted.
 --
--- SOLUTION 3: Filter out Form D records (WHERE form_type = 'E') so only
--- Form E (vendor payments) are counted. Form D is just beneficiary
--- tracking for the same expenditure already counted in Form E.
---
 -- Row count impact:
---   expn_cd raw:        15,747,158
---   After Form D filter:  8,356,014 (−5,261,180 Form D records)
---   After downstream:     ~6,800,000 (−~3.7M downstream records)
---   After amendment dedup: ~6,819,502 (−~2.3M amendment duplicates)
---   Net reduction: ~57% fewer records, accurate totals
+--   expn_cd raw:        15,747,158  → deduped: ~12,000,000 (24% reduction)
+--   Downstream filtered: ~3.7M records removed
 
 -- ============================================================
 -- Dedup views — one per fact table, preserves original columns
@@ -65,7 +53,6 @@ SELECT DISTINCT ON (filing_id, line_item)
     *
 FROM expn_cd
 WHERE agent_naml IS NULL  -- Exclude downstream records (agent details)
-  AND form_type = 'E'     -- Exclude Form D (duplicate of Form E from beneficiary perspective)
 ORDER BY filing_id, line_item, amend_id DESC;
 
 DROP VIEW IF EXISTS lexp_cd_deduped CASCADE;
@@ -183,7 +170,7 @@ FROM s498_cd_deduped;
 
 DROP VIEW IF EXISTS expn_all CASCADE;
 CREATE VIEW expn_all AS
--- Source 1: periodic expenditures (expn_cd) — deduped, no downstream, no Form D
+-- Source 1: periodic expenditures (expn_cd) — now deduped
 SELECT
     'expn_cd'    AS src,
     filing_id,
