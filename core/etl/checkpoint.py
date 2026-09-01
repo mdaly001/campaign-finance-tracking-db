@@ -93,15 +93,19 @@ class LoadCheckpoint:
     # -- queries ----------------------------------------------------------- #
 
     def get_checkpoint(self, table_name: str, file_hash: str) -> str | None:
-        """Return last_processed_date if checkpoint exists, else None.
+        """Return last_processed_date for a loaded file, or None.
+
+        Compares ``table_name`` case-insensitively (the loader stores the
+        lower-cased target table name while callers may query with the
+        upper-case table code) and the exact ``file_hash``.
 
         Args:
-            table_name: Target table name.
+            table_name: Target table name (case-insensitive).
             file_hash: SHA-256 hex digest of the source file.
         """
         stmt = text(
             "SELECT processed_date FROM load_checkpoint "
-            "WHERE table_name = :table_name AND file_hash = :file_hash "
+            "WHERE LOWER(table_name) = LOWER(:table_name) AND file_hash = :file_hash "
             "ORDER BY checkpoint_id DESC LIMIT 1"
         )
         with self._conn.begin() as conn:
@@ -134,11 +138,13 @@ class LoadCheckpoint:
     def get_last_date(self, table_name: str) -> str | None:
         """Return the latest processed_date for a table, or None.
 
-        Useful for incremental loaders to know where to resume.
+        Useful for incremental loaders to know where to resume. Case-
+        insensitive in ``table_name`` (stores lower-case, callers may pass
+        the upper-case table code).
         """
         stmt = text(
             "SELECT MAX(processed_date) FROM load_checkpoint "
-            "WHERE table_name = :table_name"
+            "WHERE LOWER(table_name) = LOWER(:table_name)"
         )
         with self._conn.begin() as conn:
             row = conn.execute(
