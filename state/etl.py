@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import logging
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -27,12 +28,44 @@ from pathlib import Path
 
 from sqlalchemy import create_engine
 
+from core.etl.adapter import SourceAdapter, SourceFileInfo
 from core.etl.checkpoint import LoadCheckpoint
 from core.etl.loader import LoadConfig, TableLoader
 from core.etl.logging import setup_logging
+from state.adapter import LocalSourceAdapter, StateSourceAdapter
 from state.tables import TABLE_DEFINITIONS
 
 logger = logging.getLogger(__name__)
+
+
+def _create_engine(database_url: str):
+    """Create a SQLAlchemy engine for a runner.
+
+    Production uses Postgres (QueuePool with bounded pool). SQLite URLs
+    (in-memory or embedded) take the dialect's default pool — the queue
+    pool kwargs raise ``TypeError`` there, and sqlite is used for tests
+    and embedded deployments.
+    """
+    if str(database_url).startswith("sqlite"):
+        return create_engine(str(database_url))
+    return create_engine(database_url, pool_size=5, max_overflow=10)
+
+
+def _make_adapter(
+    cache_dir: Path | None,
+    source_dir: Path | str | None = None,
+    adapter: SourceAdapter | None = None,
+) -> SourceAdapter:
+    """Resolve the source adapter for a run.
+
+    Precedence: explicit adapter instance > local source directory >
+    cached/remote dbwebexport.zip (``StateSourceAdapter``).
+    """
+    if adapter is not None:
+        return adapter
+    if source_dir is not None:
+        return LocalSourceAdapter(Path(source_dir))
+    return StateSourceAdapter(cache_dir=cache_dir)
 
 
 # ------------------------------------------------------------------ #
@@ -192,12 +225,16 @@ class FullLoadRunner:
         cache_dir: Path,
         batch_size: int = 1000,
         watchdog: bool = True,
+        source_dir: Path | str | None = None,
+        adapter: SourceAdapter | None = None,
     ):
         self.database_url = database_url
         self.cache_dir = cache_dir
         self.batch_size = batch_size
         self.watchdog = watchdog
-        self.engine = create_engine(database_url, pool_size=5, max_overflow=10)
+        self.source_dir = Path(source_dir) if source_dir else None
+        self.adapter = adapter
+        self.engine = _create_engine(database_url)
 
     def run(
         self,
@@ -223,24 +260,26 @@ class FullLoadRunner:
 
         logger.info("Starting full load: %d tables", len(order))
 
-        # Get the source archive (reuses the on-disk cache when present;
-        # delete the cache or call adapter.refresh() to force a re-download)
-        from state.adapter import StateSourceAdapter
-
-        adapter = StateSourceAdapter(cache_dir=self.cache_dir)
+        # Get the source adapter (local dir when source_dir/adapter given,
+        # otherwise the cached/remote dbwebexport.zip)
+        adapter = _make_adapter(self.cache_dir, self.source_dir, self.adapter)
         file_infos = adapter.get_source_files()
 
         if not file_infos:
             logger.error("No source files found — cannot load")
             return result
 
-        # Compute zip-level hash (used for checkpoint)
-        zip_hash = adapter._cached_file.checksum if adapter._cached_file else None
-        logger.info("Source checksum: %s (zip level)", zip_hash[:12] if zip_hash else "none")
+        # Source-level checksum (used for checkpoint grouping)
+        checksum = (
+            adapter.source_checksum()
+            if hasattr(adapter, "source_checksum")
+            else None
+        )
+        logger.info("Source checksum: %s (source level)", checksum[:12] if checksum else "none")
 
         # Build table → file-info map (metadata only — bytes are fetched
         # per-table just-in-time so memory stays bounded to one table)
-        info_by_code: dict[str, "SourceFileInfo"] = {}
+        info_by_code: dict[str, SourceFileInfo] = {}
         for info in file_infos:
             tsv_code = Path(info.name).stem
             if tsv_code in TABLE_DEFINITIONS:
@@ -359,13 +398,17 @@ class IncrementalLoadRunner:
     def __init__(
         self,
         database_url: str,
-        cache_dir: Path,
+        cache_dir: Path | None,
         batch_size: int = 1000,
+        source_dir: Path | str | None = None,
+        adapter: SourceAdapter | None = None,
     ):
         self.database_url = database_url
         self.cache_dir = cache_dir
         self.batch_size = batch_size
-        self.engine = create_engine(database_url, pool_size=5, max_overflow=10)
+        self.source_dir = Path(source_dir) if source_dir else None
+        self.adapter = adapter
+        self.engine = _create_engine(database_url)
 
     def run(
         self,
@@ -386,27 +429,27 @@ class IncrementalLoadRunner:
 
         logger.info("Starting incremental load: %d tables", len(order))
 
-        from state.adapter import StateSourceAdapter
+        adapter = _make_adapter(self.cache_dir, self.source_dir, self.adapter)
 
-        adapter = StateSourceAdapter(cache_dir=self.cache_dir)
-
-        # Check whether the remote archive changed since the cached copy.
-        # If so, refresh; otherwise reuse the cache. The per-file content
-        # hash comparison below remains the authoritative load gate.
-        try:
-            if adapter.is_up_to_date():
-                logger.info("Cached dbwebexport.zip is current — reusing it")
-            else:
-                logger.info("Remote dbwebexport.zip appears newer — downloading")
-                adapter.refresh()
-        except Exception as e:
-            logger.warning(
-                "Could not verify zip freshness: %s — using cache as-is", e
-            )
+        # For the remote (zip) source only: check whether the archive
+        # changed since the cached copy. If so, refresh; otherwise reuse
+        # the cache. The per-file content hash comparison below remains
+        # the authoritative load gate.
+        if isinstance(adapter, StateSourceAdapter):
+            try:
+                if adapter.is_up_to_date():
+                    logger.info("Cached dbwebexport.zip is current — reusing it")
+                else:
+                    logger.info("Remote dbwebexport.zip appears newer — downloading")
+                    adapter.refresh()
+            except Exception as e:
+                logger.warning(
+                    "Could not verify zip freshness: %s — using cache as-is", e
+                )
 
         # Build table → file-info map (bytes fetched per-table just-in-time)
         file_infos = adapter.get_source_files()
-        info_by_code: dict[str, "SourceFileInfo"] = {}
+        info_by_code: dict[str, SourceFileInfo] = {}
         for info in file_infos:
             tsv_code = Path(info.name).stem
             if tsv_code in TABLE_DEFINITIONS:
@@ -501,19 +544,31 @@ class ResumeRunner:
 
     After a successful run, all tables are checkpointed. After a failed
     run, some tables are checkpointed and others are not. This runner
-    loads only the non-checkpointed tables in the correct order.
+    loads only the non-checkpointed tables in the correct order: a table
+    is skipped only when its current source file's SHA-256 exactly
+    matches the ``file_hash`` recorded in ``load_checkpoint`` for that
+    table (so a re-run after an interruption finishes the remaining
+    tables without re-upserting completed ones).
+
+    Source selection mirrors :class:`FullLoadRunner`: pass an ``adapter``
+    instance or a ``source_dir`` (local extracted export directory) to
+    resume against local data; otherwise the cached/remote zip is used.
     """
 
     def __init__(
         self,
         database_url: str,
-        cache_dir: Path,
+        cache_dir: Path | None,
         batch_size: int = 1000,
+        source_dir: Path | str | None = None,
+        adapter: SourceAdapter | None = None,
     ):
         self.database_url = database_url
         self.cache_dir = cache_dir
         self.batch_size = batch_size
-        self.engine = create_engine(database_url, pool_size=5, max_overflow=10)
+        self.source_dir = Path(source_dir) if source_dir else None
+        self.adapter = adapter
+        self.engine = _create_engine(database_url)
 
     def run(
         self,
@@ -530,40 +585,25 @@ class ResumeRunner:
 
         logger.info("Resuming load: %d tables", len(order))
 
-        from state.adapter import StateSourceAdapter
-
-        adapter = StateSourceAdapter(cache_dir=self.cache_dir)
+        adapter = _make_adapter(self.cache_dir, self.source_dir, self.adapter)
         file_infos = adapter.get_source_files()
 
-        # Build table → tsv mapping
-        table_tsv_map: dict[str, bytes] = {}
+        # Build table → file-info map. Bytes are fetched per table
+        # (just-in-time) so peak memory stays at one source file.
+        info_by_code: dict[str, SourceFileInfo] = {}
         for info in file_infos:
             tsv_code = Path(info.name).stem
             if tsv_code in TABLE_DEFINITIONS:
-                raw = adapter.fetch_file(info)
-                table_tsv_map[tsv_code] = raw
+                info_by_code[tsv_code] = info
 
-        # Find tables not yet loaded for this zip hash
-        zip_hash = adapter._cached_file.checksum if adapter._cached_file else None
         checkpoint = LoadCheckpoint(self.engine)
-        unchecked = checkpoint.get_unchecked_tables(zip_hash) if zip_hash else order
-
-        # Filter order to only unchecked tables, preserving order
-        pending = [t for t in order if t in unchecked]
-
-        if not pending:
-            logger.info("All tables already loaded — nothing to resume")
-            return result
-
-        logger.info("Resuming %d tables: %s", len(pending), pending[:5])
-        if len(pending) > 5:
-            logger.info("... and %d more", len(pending) - 5)
 
         result.tables = []
-        for code in pending:
+        for code in order:
             table_start = time.monotonic()
 
-            if code not in table_tsv_map:
+            info = info_by_code.get(code)
+            if info is None:
                 logger.warning("Table %s: TSV not found — skipping", code)
                 result.tables_skipped += 1
                 result.tables.append({
@@ -573,8 +613,24 @@ class ResumeRunner:
                 })
                 continue
 
-            tsv_bytes = table_tsv_map[code]
+            tsv_bytes = adapter.fetch_file(info)
             file_hash = hashlib.sha256(tsv_bytes).hexdigest()
+
+            # Already loaded from identical bytes? Skip without loading.
+            if checkpoint.is_loaded(code, file_hash):
+                logger.debug(
+                    "Table %s: already loaded (hash %s) — skipping",
+                    code,
+                    file_hash[:12],
+                )
+                result.tables_skipped += 1
+                result.tables.append({
+                    "code": code,
+                    "status": "skipped",
+                    "reason": "already_loaded",
+                })
+                continue
+
             config = _build_load_config(code, tsv_bytes, file_hash)
             loader = TableLoader(self.engine, batch_size=self.batch_size)
 
@@ -635,6 +691,15 @@ def main() -> None:
     full_p.add_argument(
         "--tables", nargs="+", default=None, help="Only load these table codes"
     )
+    full_p.add_argument(
+        "--source-dir",
+        default=None,
+        help=(
+            "Load from an already-extracted local CAL-ACCESS export directory "
+            "(export root or its DATA subdir) instead of downloading the zip. "
+            "Defaults to $CFDB_SOURCE_DIR when set."
+        ),
+    )
     full_p.add_argument("--log-level", default="INFO")
 
     # -- incremental --
@@ -645,6 +710,11 @@ def main() -> None:
     inc_p.add_argument(
         "--tables", nargs="+", default=None, help="Only check these table codes"
     )
+    inc_p.add_argument(
+        "--source-dir",
+        default=None,
+        help="Load from a local export directory instead of the cached/remote zip.",
+    )
     inc_p.add_argument("--log-level", default="INFO")
 
     # -- resume --
@@ -652,6 +722,11 @@ def main() -> None:
     res_p.add_argument("--database-url", default=None, help="Postgres connection URL")
     res_p.add_argument("--cache-dir", default="/app/state/cache", help="Cache directory for zip")
     res_p.add_argument("--batch-size", type=int, default=1000, help="Rows per batch")
+    res_p.add_argument(
+        "--source-dir",
+        default=None,
+        help="Resume from a local export directory instead of the cached/remote zip.",
+    )
     res_p.add_argument("--log-level", default="INFO")
 
     # -- list --
@@ -683,12 +758,22 @@ def main() -> None:
     database_url = args.database_url or "postgresql://cfdb:cfdb@localhost:5432/cfdb"
     cache_dir = Path(args.cache_dir)
 
+    # Local source wins over the remote zip: --source-dir wins over env.
+    source_dir_arg = getattr(args, "source_dir", None)
+    source_dir_env = os.environ.get("CFDB_SOURCE_DIR", "").strip()
+    source_dir = (
+        Path(source_dir_arg)
+        if source_dir_arg
+        else (Path(source_dir_env) if source_dir_env else None)
+    )
+
     if args.command == "full":
         runner = FullLoadRunner(
             database_url=database_url,
             cache_dir=cache_dir,
             batch_size=args.batch_size,
             watchdog=not args.no_watchdog,
+            source_dir=source_dir,
         )
         result = runner.run(tables_only=args.tables)
         _print_summary(result)
@@ -699,6 +784,7 @@ def main() -> None:
             database_url=database_url,
             cache_dir=cache_dir,
             batch_size=args.batch_size,
+            source_dir=source_dir,
         )
         result = runner.run(tables_only=args.tables)
         _print_incremental_summary(result)
@@ -712,6 +798,7 @@ def main() -> None:
             database_url=database_url,
             cache_dir=cache_dir,
             batch_size=args.batch_size,
+            source_dir=source_dir,
         )
         result = runner.run()
         _print_summary(result)

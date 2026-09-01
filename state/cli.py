@@ -44,11 +44,18 @@ def cmd_verify(args: argparse.Namespace) -> None:
 
 
 def cmd_discover(args: argparse.Namespace) -> None:
-    """List all discovered CAL-ACCESS tables."""
-    setup_logging(level=args.log_level)
-    from state.adapter import StateSourceAdapter
+    """List all discovered CAL-ACCESS tables.
 
-    adapter = StateSourceAdapter(cache_dir=Path(args.cache_dir))
+    With ``--source-dir`` (or ``$CFDB_SOURCE_DIR``), lists the tables found
+    in a local, already-extracted export directory instead of the cached zip.
+    """
+    setup_logging(level=args.log_level)
+    from state.adapter import LocalSourceAdapter, StateSourceAdapter
+
+    if args.source_dir:
+        adapter = LocalSourceAdapter(args.source_dir)
+    else:
+        adapter = StateSourceAdapter(cache_dir=Path(args.cache_dir))
     files = adapter.get_source_files()
 
     print(f"Discovered {len(files)} tables:")
@@ -76,6 +83,11 @@ def main() -> None:
     # discover
     discover_parser = subparsers.add_parser("discover", help="List discovered tables")
     discover_parser.add_argument("--cache-dir", default="/app/state/cache")
+    discover_parser.add_argument(
+        "--source-dir",
+        default=None,
+        help="List tables from a local extracted export dir instead of the cached zip",
+    )
     discover_parser.add_argument("--log-level", default="INFO")
     discover_parser.set_defaults(func=cmd_discover)
 
