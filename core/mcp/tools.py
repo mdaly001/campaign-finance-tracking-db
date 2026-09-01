@@ -498,6 +498,266 @@ class MeasureSpending(BaseModel):
     measure_name: str | None = None
     measure_short_name: str | None = None
     election_date: str | None = None
+
+
+# --------------------------------------------------------------------------- #
+#  Expenditure tools (prevent double-counting)
+# --------------------------------------------------------------------------- #
+"""
+Expenditure MCP tools that prevent double-counting.
+
+These four tools encode the correct query logic for each expenditure question,
+so users don't have to remember the caveats from data_caveats.md:
+
+  - total_expenditures(committee_id, cycle) → "How much did Committee X spend?"
+  - expenditures_by_vendor(committee_id, cycle) → "Who was paid by Committee X?"
+  - expenditures_by_candidate(committee_id, cycle) → "Who benefited from Committee X spending?"
+  - expenditures_by_outlet(committee_id, cycle) → "Which outlets received money?"
+
+Form type rules:
+  - Form E (vendor payments): actual money paid to vendors/ad buyers
+  - Form F461P5 (independent expenditure reports): money spent on behalf of candidates
+  - Form D (beneficiary tracking): who benefited — duplicates E from beneficiary perspective
+  - Form G (outlet detail): station-level breakdown — already counted in E
+
+Deduplication: All tools query expn_cd_deduped (latest amend_id only) to prevent
+amendment version inflation.
+"""
+
+
+def expenditures_by_vendor(
+    committee_id: str,
+    cycle: int,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Return expenditures by vendor/payee for a committee in a cycle.
+
+    Uses Form E (vendor payments) and Form F461P5 (independent expenditure
+    reports) from the deduped view (latest amendment only).
+
+    This answers: "Who actually received money from Committee X?"
+
+    Args:
+        committee_id: Committee ID (e.g. ``1479071``).
+        cycle: Election cycle year (derived from ``expn_date``).
+        limit: Maximum rows (default 50).
+
+    Returns:
+        List of dicts with expn_date, amount, purpose, payee_name, cmte_id,
+        tran_id, filing_id, form_type — newest first.
+    """
+    sql = f"""
+        SELECT
+            e.expn_date,
+            e.amount,
+            e.expn_dscr AS purpose,
+            COALESCE(
+                NULLIF(TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, '')), ''),
+                '(unknown payee)'
+            ) AS payee_name,
+            e.cmte_id,
+            e.tran_id,
+            e.filing_id,
+            e.form_type
+        FROM expn_cd_deduped e
+        WHERE e.cmte_id = :committee_id
+          AND e.form_type IN ('E', 'F461P5')
+          AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle
+        ORDER BY e.expn_date DESC
+    """
+    rows = execute_read(
+        sql, {"committee_id": committee_id, "cycle": cycle}
+    )
+    out: list[dict[str, Any]] = []
+    for row in rows[:limit]:
+        out.append({
+            "expn_date": _dtos(row.get("expn_date")),
+            "amount": _money(row.get("amount")),
+            "purpose": row.get("purpose"),
+            "payee_name": row.get("payee_name"),
+            "cmte_id": row.get("cmte_id"),
+            "tran_id": row.get("tran_id"),
+            "filing_id": row.get("filing_id"),
+            "form_type": row.get("form_type"),
+        })
+    return out
+
+
+def expenditures_by_candidate(
+    committee_id: str,
+    cycle: int,
+    candidate_name: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Return expenditures by beneficiary candidate for a committee in a cycle.
+
+    Uses Form D (beneficiary tracking), Form E (vendor payments), and
+    Form F461P5 (independent expenditure reports) from the deduped view
+    (latest amendment only).
+
+    This answers: "How much did Committee X spend on Candidate Y?"
+
+    Args:
+        committee_id: Committee ID (e.g. ``1479071``).
+        cycle: Election cycle year.
+        candidate_name: Optional candidate name filter (e.g. ``"Tubbs"``).
+        limit: Maximum rows (default 50).
+
+    Returns:
+        List of dicts with expn_date, amount, purpose, candidate_name,
+        payee_name, cmte_id, tran_id, filing_id, form_type — newest first.
+    """
+    cand_clause = (
+        "" if candidate_name is None
+        else "AND e.cand_naml ILIKE :candidate"
+    )
+    sql = f"""
+        SELECT
+            e.expn_date,
+            e.amount,
+            e.expn_dscr AS purpose,
+            COALESCE(e.cand_naml, '(unknown candidate)') AS candidate_name,
+            COALESCE(
+                NULLIF(TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, '')), ''),
+                '(unknown payee)'
+            ) AS payee_name,
+            e.cmte_id,
+            e.tran_id,
+            e.filing_id,
+            e.form_type
+        FROM expn_cd_deduped e
+        WHERE e.cmte_id = :committee_id
+          AND e.form_type IN ('D', 'E', 'F461P5')
+          AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle
+          {cand_clause}
+        ORDER BY e.expn_date DESC
+    """
+    params: dict[str, Any] = {"committee_id": committee_id, "cycle": cycle}
+    if candidate_name is not None:
+        params["candidate"] = f"%{candidate_name}%"
+    rows = execute_read(sql, params)
+    out: list[dict[str, Any]] = []
+    for row in rows[:limit]:
+        out.append({
+            "expn_date": _dtos(row.get("expn_date")),
+            "amount": _money(row.get("amount")),
+            "purpose": row.get("purpose"),
+            "candidate_name": row.get("candidate_name"),
+            "payee_name": row.get("payee_name"),
+            "cmte_id": row.get("cmte_id"),
+            "tran_id": row.get("tran_id"),
+            "filing_id": row.get("filing_id"),
+            "form_type": row.get("form_type"),
+        })
+    return out
+
+
+def expenditures_by_outlet(
+    committee_id: str,
+    cycle: int,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Return outlet-level expenditure details for a committee in a cycle.
+
+    Uses Form G (outlet-level detail) from the deduped view (latest amendment
+    only).
+
+    This answers: "Which specific outlets (TV stations, newspapers, etc.)
+    received advertising money from Committee X?"
+
+    Note: Form G amounts are already counted in Form E vendor payments, so
+    do NOT sum Form G with Form E to get a total.
+
+    Args:
+        committee_id: Committee ID (e.g. ``1479071``).
+        cycle: Election cycle year.
+        limit: Maximum rows (default 100).
+
+    Returns:
+        List of dicts with expn_date, amount, purpose, outlet_name, cmte_id,
+        tran_id, filing_id, form_type — newest first.
+    """
+    sql = f"""
+        SELECT
+            e.expn_date,
+            e.amount,
+            e.expn_dscr AS purpose,
+            COALESCE(
+                NULLIF(TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, '')), ''),
+                '(unknown outlet)'
+            ) AS outlet_name,
+            e.cmte_id,
+            e.tran_id,
+            e.filing_id,
+            e.form_type
+        FROM expn_cd_deduped e
+        WHERE e.cmte_id = :committee_id
+          AND e.form_type = 'G'
+          AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle
+        ORDER BY e.expn_date DESC
+    """
+    rows = execute_read(
+        sql, {"committee_id": committee_id, "cycle": cycle}
+    )
+    out: list[dict[str, Any]] = []
+    for row in rows[:limit]:
+        out.append({
+            "expn_date": _dtos(row.get("expn_date")),
+            "amount": _money(row.get("amount")),
+            "purpose": row.get("purpose"),
+            "outlet_name": row.get("outlet_name"),
+            "cmte_id": row.get("cmte_id"),
+            "tran_id": row.get("tran_id"),
+            "filing_id": row.get("filing_id"),
+            "form_type": row.get("form_type"),
+        })
+    return out
+
+
+def total_expenditures(
+    committee_id: str,
+    cycle: int,
+) -> dict[str, Any]:
+    """Return total expenditures for a committee in a cycle.
+
+    Uses Form E (vendor payments) and Form F461P5 (independent expenditure
+    reports) from the deduped view (latest amendment only). This gives the
+    actual total spending, excluding Form D (duplicate beneficiary tracking)
+    and Form G (outlet detail already counted in vendor payment).
+
+    This answers: "How much did Committee X spend in total?"
+
+    Args:
+        committee_id: Committee ID (e.g. ``1479071``).
+        cycle: Election cycle year.
+
+    Returns:
+        Dict with ``transaction_count``, ``total_amount``, ``form_types``.
+    """
+    sql = f"""
+        SELECT
+            COUNT(*) AS transaction_count,
+            ROUND(COALESCE(SUM(amount), 0), 2) AS total_amount,
+            jsonb_agg(DISTINCT form_type) AS form_types
+        FROM expn_cd_deduped
+        WHERE cmte_id = :committee_id
+          AND form_type IN ('E', 'F461P5')
+          AND EXTRACT(YEAR FROM expn_date)::int = :cycle
+    """
+    row = execute_read(
+        sql, {"committee_id": committee_id, "cycle": cycle}
+    )
+    if not row:
+        return {"transaction_count": 0, "total_amount": 0.0, "form_types": []}
+    r = row[0]
+    return {
+        "transaction_count": r.get("transaction_count", 0),
+        "total_amount": _money(r.get("total_amount")),
+        "form_types": r.get("form_types", []),
+    }
+
+
+# -- 6. measure_spending -------------------------------------------------------- #
     jurisdiction: str | None = None
     total_reported: float
     top_committees: list[MeasureSpender] = []
