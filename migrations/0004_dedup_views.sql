@@ -52,7 +52,6 @@ CREATE VIEW expn_cd_deduped AS
 SELECT DISTINCT ON (filing_id, line_item)
     *
 FROM expn_cd
-WHERE agent_naml IS NULL  -- Exclude downstream records (agent details)
 ORDER BY filing_id, line_item, amend_id DESC;
 
 DROP VIEW IF EXISTS lexp_cd_deduped CASCADE;
