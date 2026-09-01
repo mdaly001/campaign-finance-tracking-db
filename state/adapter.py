@@ -2,6 +2,11 @@
 
 Downloads dbwebexport.zip from SOS CDN, extracts TSV file list,
 computes checksums for incremental detection.
+
+Also provides ``LocalSourceAdapter`` — a drop-in source that reads TSV
+files from an already-extracted local copy of the export (e.g. an
+unzipped ``CalAccess/DATA`` directory) so local/testing ETL runs need
+no network download at all.
 """
 
 from __future__ import annotations
@@ -263,6 +268,17 @@ class StateSourceAdapter(SourceAdapter):
         """Compute SHA-256 checksum of raw bytes."""
         return hashlib.sha256(raw).hexdigest()
 
+    def source_checksum(self) -> str | None:
+        """Stable checksum of the current source (zip-level, not per-file).
+
+        For the remote adapter this is the cached zip's SHA-256 once the
+        zip has been fetched/cached, or ``None`` before the first fetch.
+        Runners use it as the checkpoint grouping key for a full load.
+        """
+        if self._cached_file is not None:
+            return self._cached_file.checksum
+        return None
+
     # -- incremental helpers ----------------------------------------------- #
 
     def refresh(self) -> None:
@@ -327,3 +343,159 @@ class StateSourceAdapter(SourceAdapter):
         if zip_path.exists():
             zip_path.unlink()
             logger.info("Cleared cached dbwebexport.zip")
+
+
+class LocalSourceAdapter(SourceAdapter):
+    """Read TSV source files from an already-extracted local export.
+
+    Drop-in replacement for :class:`StateSourceAdapter` when the raw
+    ``CalAccess/DATA`` export already lives on disk (dev/testing runs,
+    air-gapped machines, re-runs after a previous download). No network
+    access happens: ``get_source_files`` lists the ``*.TSV`` files under
+    ``data_dir`` (or ``data_dir/DATA`` when the export root is given)
+    and ``fetch_file`` reads them straight from disk.
+
+    Example::
+
+        from state.adapter import LocalSourceAdapter
+        from state.etl import FullLoadRunner
+
+        runner = FullLoadRunner(
+            database_url="postgresql://cfdb:cfdb@localhost:5432/cfdb",
+            adapter=LocalSourceAdapter("/data/CalAccess"),
+        )
+        runner.run()
+    """
+
+    source = "local"
+
+    def __init__(self, data_dir: Path | str) -> None:
+        """
+        Args:
+            data_dir: Directory holding the extracted export. Either the
+                export root (containing a ``DATA`` subdir) or the ``DATA``
+                directory itself — both are accepted.
+        """
+        root = Path(data_dir).expanduser().resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(f"Local source directory not found: {root}")
+        if (root / "DATA").is_dir():
+            root = root / "DATA"
+        self.data_dir = root
+        self.reader = TSVReader(has_header=True, empty_to_none=True)
+        self._paths: dict[str, Path] | None = None
+
+    # -- SourceAdapter interface -------------------------------------------- #
+
+    def get_source_files(self) -> list[SourceFileInfo]:
+        """List every ``*.TSV`` file (case-insensitive) under the data dir."""
+        self._paths = {}
+        infos: list[SourceFileInfo] = []
+        for path in sorted(self.data_dir.iterdir()):
+            if not path.is_file() or path.suffix.lower() != ".tsv":
+                continue
+            info = SourceFileInfo(
+                name=path.name,
+                url=f"file://{path}",
+                checksum=self._file_checksum(path),
+                size=path.stat().st_size,
+            )
+            self._paths[path.name.lower()] = path
+            infos.append(info)
+        logger.info(
+            "Local source: found %d TSV files under %s", len(infos), self.data_dir
+        )
+        return sorted(infos, key=lambda f: f.name)
+
+    def fetch_file(self, info: SourceFileInfo) -> bytes:
+        """Read a single TSV file from disk and return its raw bytes."""
+        path = self._resolve(info.name)
+        raw_bytes = path.read_bytes()
+        logger.debug("Read %s from local dir: %d bytes", path.name, len(raw_bytes))
+        return raw_bytes
+
+    def parse_file(self, raw: bytes) -> Iterator[dict[str, Any]]:
+        """Parse raw TSV bytes into an iterator of dicts (TSVReader)."""
+        return iter(self.reader.read_bytes(raw))
+
+    def upsert_records(
+        self,
+        records: Iterator[dict[str, Any]],
+        session: Any,
+    ) -> LoadSummary:
+        """Upsert parsed records (delegates to core.etl.upsert.upsert_records)."""
+        from core.etl.upsert import upsert_records
+
+        records_list = list(records)
+        if records_list:
+            table_name = records_list[0].get("__table__", "unknown")
+            conflict_columns = records_list[0].get("__conflict_cols__", [])
+            if conflict_columns:
+                upserted = upsert_records(
+                    session,
+                    table_name,
+                    records_list,
+                    conflict_columns,
+                )
+                return LoadSummary(rows_read=len(records_list), rows_upserted=upserted)
+        return LoadSummary(rows_read=len(records_list))
+
+    def compute_checksum(self, raw: bytes) -> str:
+        """Compute SHA-256 checksum of raw bytes."""
+        return hashlib.sha256(raw).hexdigest()
+
+    # -- local-specific helpers --------------------------------------------- #
+
+    def is_up_to_date(self) -> bool:
+        """Local sources are up to date by definition (nothing to refresh)."""
+        return True
+
+    def refresh(self) -> None:
+        """No-op: a local source has no remote to re-fetch from."""
+        logger.info("LocalSourceAdapter.refresh() is a no-op (source is on disk)")
+
+    def source_checksum(self) -> str | None:
+        """Stable digest over the file inventory (name + size + mtime).
+
+        Stable across runs as long as no file on disk changed — so
+        checkpoint grouping is deterministic for the same data set and a
+        re-run with modified files produces fresh checkpoint entries.
+        """
+        paths = self._all_files()
+        if not paths:
+            return None
+        h = hashlib.sha256()
+        for path in paths:
+            stat = path.stat()
+            h.update(f"{path.name}:{stat.st_size}:{stat.st_mtime_ns}".encode())
+        return h.hexdigest()
+
+    # -- internals ----------------------------------------------------------- #
+
+    def _file_checksum(self, path: Path) -> str:
+        """Content-addressed checksum for one source file."""
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def _all_files(self) -> list[Path]:
+        """All .tsv files in the data dir, case-insensitive, sorted by name."""
+        return sorted(
+            (
+                p
+                for p in self.data_dir.iterdir()
+                if p.is_file() and p.suffix.lower() == ".tsv"
+            ),
+            key=lambda p: p.name,
+        )
+
+    def _resolve(self, name: str) -> Path:
+        """Resolve a source-file name to a path on disk (case-insensitive)."""
+        if self._paths is None:
+            self.get_source_files()
+        path = (self._paths or {}).get(name.lower())
+        if path is not None:
+            return path
+        # Fallback: direct path lookup (case-sensitive) for ad-hoc infos
+        direct = self.data_dir / name
+        if direct.is_file():
+            return direct
+        raise FileNotFoundError(f"File {name} not found in local source dir {self.data_dir}")
