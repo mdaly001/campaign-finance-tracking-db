@@ -1,22 +1,26 @@
--- 0004: Dedup views for amendment versions
+-- 0004: Dedup views for amendment versions AND downstream filtering
 --
--- PROBLEM: Every SOS CAL-ACCESS fact table stores amendment versions as
+-- PROBLEM 1: Every SOS CAL-ACCESS fact table stores amendment versions as
 -- separate rows. A single logical transaction appears 2-10 times with
 -- different amend_id values (0 = original, 1 = first amendment, etc.).
 -- SUMming amounts across all amendments massively inflates totals.
 --
--- PRIMARY KEY pattern across ALL fact tables:
---   (amend_id, filing_id, form_type, line_item, rec_type)
+-- PROBLEM 2: Expenditure records with agent_naml are DOWNSTREAM detail
+-- records. When a committee pays RED7E, INC. $4M to buy TV ads, two
+-- records appear:
+--   1. Payee=RED7E, agent=NULL → $4M (upstream, counts as expenditure)
+--   2. Payee=KNBC-TV, agent=RED7E → $1.4M (downstream detail, already counted)
+-- Counting both double-counts the same money.
 --
--- SOLUTION: Create views that keep only the LATEST amend_id per logical
--- record (highest amend_id per filing_id+line_item group).
+-- SOLUTION 1: Keep only the LATEST amend_id per logical record (highest
+-- amend_id per filing_id+line_item group).
+--
+-- SOLUTION 2: Filter out downstream records (WHERE agent_naml IS NULL)
+-- so only upstream payments are counted.
 --
 -- Row count impact:
---   rcpt_cd raw:        20,184,473  → deduped: ~13,781,373 (32% reduction)
---   expn_cd raw:        15,747,158  → deduped: ~13,400,000 (estimated)
---   s497_cd:            1,394,344   → deduped: similar ratio
---   s496_cd:             75,685     → deduped: similar ratio
---   s498_cd:             27,609     → deduped: similar ratio
+--   expn_cd raw:        15,747,158  → deduped: ~12,000,000 (24% reduction)
+--   Downstream filtered: ~3.7M records removed
 
 -- ============================================================
 -- Dedup views — one per fact table, preserves original columns
@@ -48,6 +52,7 @@ CREATE VIEW expn_cd_deduped AS
 SELECT DISTINCT ON (filing_id, line_item)
     *
 FROM expn_cd
+WHERE agent_naml IS NULL  -- Exclude downstream records (agent details)
 ORDER BY filing_id, line_item, amend_id DESC;
 
 DROP VIEW IF EXISTS lexp_cd_deduped CASCADE;
