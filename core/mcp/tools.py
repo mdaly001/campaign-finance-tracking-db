@@ -498,6 +498,9 @@ class MeasureSpending(BaseModel):
     measure_name: str | None = None
     measure_short_name: str | None = None
     election_date: str | None = None
+    jurisdiction: str | None = None
+    total_reported: float = 0.0
+    top_committees: list[MeasureSpender] = []
 
 
 # --------------------------------------------------------------------------- #
@@ -758,10 +761,6 @@ def total_expenditures(
 
 
 # -- 6. measure_spending -------------------------------------------------------- #
-    jurisdiction: str | None = None
-    total_reported: float
-    top_committees: list[MeasureSpender] = []
-
 
 # -- 7. donor_watch_since -------------------------------------------------------- #
 
