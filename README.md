@@ -17,15 +17,7 @@ This project ingests and normalizes campaign finance disclosure data from Califo
 
 ### Quick Start
 
-**Prefer one command?** The installer auto-detects your OS, RAM and GPU, then sets up Docker (if needed), PostgreSQL, the CAL-ACCESS data, the MCP server, a local LLM sized to your hardware, and a browser chat UI at <http://localhost:3000>. The chat arrives **pre-wired**: a default model named "Campaign Finance AI" carries all 15 cfdb tools, so users just ask questions — no MCP configuration, and nothing leaves the machine:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/mdaly001/campaign-finance-tracking-db/master/install.sh | bash
-```
-
-Useful flags: `--lite` (no local LLM), `--db-only` (just PostgreSQL + ETL + MCP — no LLM, no chat UI; ideal for a server when you already host models/agents on your network), `--llm-url URL` (use a model you already serve, e.g. `http://192.168.1.20:8080/v1`), `--no-chat`, `--no-etl` (skip the long data load for now), `--model NAME` (qwen3-14b | gpt-oss-20b | qwen3.6-35b-a3b | coder-next-80b | none), `--model-url URL` (any GGUF), `--dir PATH`, `--yes`. It is idempotent — re-run it to resume or repair. Windows users: run it inside WSL2 (the script will tell you how).
-
-Otherwise, step by step:
+Step by step:
 
 ```bash
 # 1. Clone and configure (optional — compose has sane defaults)
@@ -127,18 +119,14 @@ that are invisible from the schema alone.
 
 **How to inject these into an agent:**
 
-- **OpenWebUI (chat UI):** The installer sets a system prompt (see below).
-  To add more context, edit the `DEFAULT_SYSTEM_PROMPT` env var in the
-  `docker run` command or set it via the Admin Settings.
-
-- **CLI harnesses (Hermes, OpenCode, etc.):** Put the docs in your session
+- **CLI / GUI harnesses (Hermes, OpenCode, etc.):** Put the docs in your session
   as context or a `.agents.md` / `AGENTS.md` file in the repo root. Most
   harnesses auto-inject these on session start.
 
 - **Programmatic:** Include the docs as system messages in your API calls
   before any tool-invocation turns.
 
-**Minimum system prompt for OpenWebUI (the installer already sets this):**
+**Recommended minimum system prompt for any agent connected to the MCP server:**
 
 ```
 You are a California campaign-finance analyst. For ANY factual question

@@ -10,7 +10,7 @@ name: publish-image
 #
 # NOTE for first publish: a new GHCR package under a personal account is
 # created private. Set the package (or repo) to Public before telling users to
-# curl the installer, or anonymous pulls will 403/401.
+# pull the image (docker compose pulls it anonymously), or pulls will 403/401.
 
 on:
   workflow_dispatch: {}
