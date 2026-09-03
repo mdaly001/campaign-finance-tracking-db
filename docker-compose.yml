@@ -32,6 +32,10 @@ services:
     restart: unless-stopped
 
   mcp:
+    # `image:` first so installs can pull the published image; `build:` stays
+    # so local dev can `docker compose build` and run the same service from a
+    # local build tagged with the same image reference.
+    image: cfdb-app:${CFDB_IMAGE_TAG:-latest}
     build: .
     container_name: cfdb-mcp
     depends_on:
@@ -48,6 +52,7 @@ services:
     restart: unless-stopped
 
   etl:
+    image: cfdb-app:${CFDB_IMAGE_TAG:-latest}
     build: .
     container_name: cfdb-etl
     depends_on:
