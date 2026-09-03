@@ -16,7 +16,9 @@ RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuse
 COPY --chown=appuser:appuser pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev
 
-# Copy application source
+# Copy application source. `config/` is a top-level package imported at runtime
+# (core/migrations/migrate.py -> config.settings), so it must ship in the image.
+COPY --chown=appuser:appuser config/ ./config/
 COPY --chown=appuser:appuser core/ ./core/
 COPY --chown=appuser:appuser state/ ./state/
 COPY --chown=appuser:appuser migrations/ ./migrations/
