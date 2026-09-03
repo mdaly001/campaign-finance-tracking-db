@@ -352,9 +352,9 @@ def main() -> None:
     server = _create_server()
 
     # Serve the Streamable HTTP transport (current MCP spec) — the only transport
-    # the Open WebUI MCP client speaks (it POSTs the initialize handshake to the
-    # connection url; on an SSE-only server it got a 404 and silently attached
-    # zero tools, so chats hallucinated instead of querying the database).
+    # Streamable-HTTP MCP clients speak (they POST the initialize handshake to the
+    # connection url; on an SSE-only server they get a 404 and silently attach
+    # zero tools, so the agent hallucinates instead of querying the database).
     # The SDK's own runner is used (no uvicorn import here — uvicorn is not a
     # hard dependency of this image; importing it at runtime would crash-loop
     # the container). Legacy SSE consumers must point at /mcp now.
