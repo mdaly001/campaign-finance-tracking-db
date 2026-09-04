@@ -15,34 +15,63 @@ This project ingests and normalizes campaign finance disclosure data from Califo
 - Docker & Docker Compose (v2)
 - `uv` for local development (`pip install uv`)
 
-### Quick Start
+### Quick Start (Docker Compose — recommended)
 
-Step by step:
+> **Run every command below from the repo root** (the directory containing
+> `docker-compose.yml`). Compose only looks for its file in the current
+> directory — running from anywhere else fails with
+> `no configuration file provided: not found`. Deploying from a copied-out
+> compose file? Run `docker compose -f /full/path/to/docker-compose.yml ...`
+> from anywhere, but pick **one** project name (`-p <name>`) and use it for
+> *all* commands — volumes are named `<project>_pgdata` / `<project>_statecache`,
+> so changing the project name starts a fresh, empty database.
 
 ```bash
-# 1. Clone and configure (optional — compose has sane defaults)
+# 1. Clone and configure
 git clone https://github.com/mdaly001/campaign-finance-tracking-db.git
 cd campaign-finance-tracking-db
 cp .env.example .env
-# Edit .env — set DB_PASSWORD at minimum
+# Edit .env — set DB_PASSWORD BEFORE first `up`: the password is baked into the
+# db at first boot; changing it later means recreating the db volume.
 
-# 2. Start PostgreSQL (schema + cfdb_reader role auto-applied on first boot)
+# 2. Start PostgreSQL (first boot applies migration 0001 + creates cfdb_reader)
 docker compose up -d db
 
-# 3. Load data (initial full load — downloads ~1.5 GB, may take hours).
-#    Give the etl container/host ≥ 8 GB RAM (RCPT_CD is a ~3.8 GB TSV).
+# 3. Apply the remaining migrations (views, roles) — run once on a fresh database
+docker compose run --rm --no-deps --entrypoint python etl \
+  -m core.migrations.migrate --direction=up
+
+# 4. Full load — downloads ~1.5 GB from the State of California; may take hours.
+#    Give the ETL container/host ≥ 8 GB RAM (RCPT_CD is a ~3.8 GB TSV).
+#    This runs `full` with the DB URL interpolated from .env — no args needed.
 docker compose run --rm etl
 
-# 4. Start the MCP server
+# 5. Start the MCP server (Streamable HTTP on :9527)
 docker compose up -d mcp
 
-# 5. Query at http://localhost:9527/mcp
+# 6. Point an MCP client at http://localhost:9527/mcp — that's the whole API.
 
-# Re-check for updates (no-op unless the SOS export changed);
-# substitute the DB_PASSWORD you set in .env:
+# Later — incremental re-check (re-downloads only if the export changed).
+# NOTE: passing a subcommand after `--` replaces the default full-load command,
+# so the DB URL must be passed here — substitute your real DB_PASSWORD:
 docker compose run --rm etl -- incremental \
-  --database-url postgresql://cfdb:YOUR_DB_PASSWORD@db:5432/cfdb
+  --database-url "postgresql://cfdb:<DB_PASSWORD from .env>@db:5432/cfdb"
 ```
+
+### Running from the published image (no repo checkout)
+
+`db` is stock Postgres; the `mcp` and `etl` services run the published image.
+From a deploy folder holding a copy of `docker-compose.yml` and a `.env`:
+
+```bash
+docker pull ghcr.io/mdaly001/cfdb-app:latest
+docker tag ghcr.io/mdaly001/cfdb-app:latest cfdb-app:latest  # compose resolves the app services to this local tag; with the tag present no build is attempted
+
+# then run steps 2-6 above from that folder (pass -f <path> and one shared -p <name>)
+```
+
+To pin an immutable release instead of `:latest`, prefix any command with
+`CFDB_IMAGE_TAG=<tag>` (e.g. `CFDB_IMAGE_TAG=1.0.0 docker compose -p cfdb up -d db`).
 
 ## Querying the database with an MCP client or AI agent
 
