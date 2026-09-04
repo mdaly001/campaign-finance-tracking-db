@@ -15,7 +15,31 @@ This project ingests and normalizes campaign finance disclosure data from Califo
 - Docker & Docker Compose (v2)
 - `uv` for local development (`pip install uv`)
 
-### Quick Start (Docker Compose — recommended)
+### Install (one command)
+
+Run this in one terminal on a machine with Docker + git installed:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mdaly001/campaign-finance-tracking-db/HEAD/install.sh | bash
+```
+
+That's the whole install. The script clones this repo to `~/campaign-finance-db`,
+generates a random `DB_PASSWORD` into `.env` (keep it — it can't be recovered),
+starts PostgreSQL, applies every migration, runs the **full ETL load** (downloads
+the ~1.5 GB State of California export; can take a few hours — safe to Ctrl+C,
+re-running resumes from its checkpoint), then brings up the MCP server on
+**port 9527**. Re-running the installer later upgrades in place (pulls the
+latest published image; migrations and the load step are idempotent).
+
+Flags: `--dir <path>` (install dir), `--project <name>` (compose project name),
+`--no-etl` (skip the full load; bring up db + MCP only), `--yes`. Env overrides:
+`CFDB_REPO_URL`, `CFDB_PROJECT`, `CFDB_INSTALL_DIR`. Point your MCP client at
+`http://localhost:9527/mcp` when it finishes.
+
+### Manual step-by-step install
+
+If you'd rather see every step (or you're deploying from a copied-out
+`docker-compose.yml`), here is exactly what the script does:
 
 > **Run every command below from the repo root** (the directory containing
 > `docker-compose.yml`). Compose only looks for its file in the current
