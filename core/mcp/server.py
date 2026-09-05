@@ -1,6 +1,6 @@
 """MCP server entry point for the Campaign Finance Database.
 
-Launches an MCP server with 16 read-only query tools (15 domain tools + a
+Launches an MCP server with 19 read-only query tools (18 domain tools + a
 run_sql escape hatch for edge-case queries).
 Runs on port 9527 (configurable via MCP_PORT env var); serves the Streamable
 HTTP transport at /mcp (point MCP clients at http://<host>:9527/mcp).
@@ -26,6 +26,7 @@ from core.mcp.tools import (
     committee_profile,
     committees_paying_vendor,
     contributions_by_donor,
+    data_freshness,
     describe_table,
     donor_watch_since,
     filing_due_soon,
@@ -34,8 +35,10 @@ from core.mcp.tools import (
     measure_spending,
     payments_to_person,
     rapid_expense_vendors,
+    refunds_to_donors,
     run_sql,
     top_donors_for_committee_or_candidate,
+    total_expenditures,
     upcoming_filings,
     vendor_revenue,
 )
@@ -57,6 +60,9 @@ TOOLS: list[str] = [
     "filing_due_soon",
     "payments_to_person",
     "rapid_expense_vendors",
+    "total_expenditures",
+    "refunds_to_donors",
+    "data_freshness",
     "describe_table",
     "run_sql",
     "get_server_docs",
@@ -87,8 +93,10 @@ Essentials:
   committees have (run rapid_expense_vendors on those committees).
 - Committee ids (cmte_id, e.g. C0695132) resolve to filer ids internally;
   find_committees() looks them up from names.
-- Data is a snapshot (not live); check the newest transaction date for
-  freshness. Snapshot: newest reports received ~2026-08-24.
+- Data is a snapshot (not live): call data_freshness() before quoting
+  "current" totals — it reports the newest receipt/expenditure dates,
+  the last ETL load, and how many future-dated corrupt rows it excludes
+  from the freshness figure (the caveats' data-hygiene quirk).
 """
 
 
@@ -303,6 +311,48 @@ def _create_server() -> MCPServer:
             "tool when one fits; use this for edge-case/ad-hoc questions. "
             "Guards: single statement, 15s timeout, capped rows; runs as a "
             "read-only role so writes are impossible."
+        ),
+    )
+
+    # 17. total_expenditures — dedup-safe total spend for a committee/cycle
+    server.add_tool(
+        total_expenditures,
+        name="total_expenditures",
+        description=(
+            "Total expenditures of a committee in an election cycle, read "
+            "from the amendment-deduplicated expenditure view (Form E + "
+            "F461P5 only; Form D/G tracking copies excluded so nothing "
+            "double-counts). Scoped by filing ownership through "
+            "filer_filings_cd — not the detail-line cmte_id. Set "
+            "exclude_refunds=True to drop 'return of contribution' refund "
+            "lines and see pure vendor spend."
+        ),
+    )
+
+    # 18. refunds_to_donors — refund lines separated from vendor spend
+    server.add_tool(
+        refunds_to_donors,
+        name="refunds_to_donors",
+        description=(
+            "Refund lines ('return of contribution' style memo codes) filed "
+            "by a committee in a cycle, grouped by the payee that received "
+            "the refund (the original donor or their agent). Refunds live in "
+            "the expenditure tables and inflate vendor-spend totals if not "
+            "separated out."
+        ),
+    )
+
+    # 19. data_freshness — snapshot freshness + data-hygiene anomaly counts
+    server.add_tool(
+        data_freshness,
+        name="data_freshness",
+        description=(
+            "Snapshot freshness report: newest receipt and expenditure dates "
+            "(capped at today — corrupt future-dated rows are excluded and "
+            "counted separately as a data-hygiene signal), the last ETL load "
+            "timestamp, and approximate row counts for the core fact "
+            "tables. Call this before quoting 'current' totals so answers "
+            "can state how current the snapshot actually is."
         ),
     )
 

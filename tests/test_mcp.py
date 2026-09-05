@@ -834,9 +834,9 @@ class TestServer:
 
         tools = asyncio.run(server.list_tools())
         # Count is derived from the TOOLS list so it stays correct as tools
-        # are added (currently 15).
+        # are added (19 as of the caveats-gap fixes).
         assert len(tools) == len(TOOLS)
-        assert len(tools) >= 15
+        assert len(tools) == 19
 
     def test_tool_names_registered(self, server):
         """All expected tool names should be present."""
@@ -899,3 +899,176 @@ class TestExports:
 
         assert callable(get_engine)
         assert callable(execute_read)
+
+
+# ------------------------------------------------------------------ #
+#  Tests: data_caveats fixes — filing-scoped expenditure tools,
+#  refunds tool, and data_freshness
+# ------------------------------------------------------------------ #
+
+
+class TestTotalExpendituresFilingScoped:
+    """Tool: total_expenditures(committee_id, cycle, exclude_refunds=False).
+
+    The aggregate must be scoped by filing ownership through
+    filer_filings_cd (data_caveats.md §3.3: cmte_id on detail lines is
+    NOT the filing owner), never by ``e.cmte_id = :committee_id``.
+    """
+
+    def test_scoped_by_filer_not_cmte_id(self, patched_db):
+        from core.mcp.tools import total_expenditures
+
+        result = total_expenditures("C001", 2024)
+        # mock rows carry no aggregate keys -> zero-shaped result
+        assert result == {
+            "transaction_count": 0,
+            "total_amount": 0.0,
+            "form_types": [],
+        }
+        agg = [
+            c for c in _mock_db.calls
+            if "FROM EXPN_CD_DEDUPED E" in c["sql"]
+        ]
+        assert agg, "expected an aggregate query against expn_cd_deduped"
+        sql = agg[0]["sql"]
+        assert "FF.FILER_ID = :FILER" in sql
+        assert "E.CMTE_ID = :COMMITTEE_ID" not in sql
+        # the xref lookup resolved the committee id to a filer id first
+        assert agg[0]["params"]["filer"] == 4242
+
+    def test_exclude_refunds_flag(self, patched_db):
+        from core.mcp.tools import total_expenditures, _REFUND_DSCR_REGEX
+        import re
+
+        total_expenditures("C001", 2024)
+        params = _mock_db.calls[-1]["params"]
+        assert "refund_rx" not in params
+
+        total_expenditures("C001", 2024, exclude_refunds=True)
+        params = _mock_db.calls[-1]["params"]
+        assert params["refund_rx"] == _REFUND_DSCR_REGEX
+        # refund memo codes match; normal vendor spend does not
+        assert re.search(_REFUND_DSCR_REGEX, "return of contribution")
+        assert re.search(_REFUND_DSCR_REGEX, "rtn of contribution")
+        assert re.search(_REFUND_DSCR_REGEX, "refund of over-contrib.")
+        assert not re.search(_REFUND_DSCR_REGEX, "media advertising")
+
+
+class TestExpenditureToolsFilingScoped:
+    """The detail-level expenditure tools must filter through
+    filer_filings_cd (via _committee_predicate), not cmte_id."""
+
+    def test_by_vendor_scoped_by_filer(self, patched_db):
+        from core.mcp.tools import expenditures_by_vendor
+
+        expenditures_by_vendor("C001", 2024)
+        call = _mock_db.calls[-1]
+        assert "FF.FILER_ID = :FILER" in call["sql"]
+        assert "E.CMTE_ID = :COMMITTEE_ID" not in call["sql"]
+
+    def test_by_candidate_and_outlet_scoped_by_filer(self, patched_db):
+        from core.mcp.tools import (
+            expenditures_by_candidate,
+            expenditures_by_outlet,
+        )
+
+        expenditures_by_candidate("C001", 2024, candidate_name="Tubbs")
+        call = _mock_db.calls[-1]
+        assert "FF.FILER_ID = :FILER" in call["sql"]
+        assert call["params"]["candidate"] == "%Tubbs%"
+
+        expenditures_by_outlet("C001", 2024)
+        call = _mock_db.calls[-1]
+        assert "FF.FILER_ID = :FILER" in call["sql"]
+
+
+class TestRefundsToDonors:
+    """Tool: refunds_to_donors(committee_id, cycle, limit=50)."""
+
+    def test_returns_shape_and_regex_param(self, patched_db):
+        from core.mcp.tools import refunds_to_donors, _REFUND_DSCR_REGEX
+
+        result = refunds_to_donors("C001", 2024)
+        assert result["committee_id"] == "C001"
+        # mock resolves any xref to filer 4242 -> committee resolved
+        assert result["committee"] == "Test, Jane M"
+        # the mock's canned rows do not carry the aggregate keys the
+        # tool reads, so the summary is zero and the payee group falls
+        # back to "(unknown payee)"
+        assert result["refund_lines"] == 0
+        assert result["total_refunded"] == 0.0
+        # every data query must bind the refund regex as a parameter
+        # (parameterized, never string-interpolated into SQL)
+        data_calls = [
+            c for c in _mock_db.calls if c["params"] and "refund_rx" in c["params"]
+        ]
+        assert data_calls, "expected a refunds query bound to the regex"
+        assert all(c["params"]["refund_rx"] == _REFUND_DSCR_REGEX for c in data_calls)
+
+    def test_unresolvable_committee_returns_empty(self, patched_db):
+        from core.mcp.tools import refunds_to_donors
+
+        with patch("core.mcp.tools.execute_read", return_value=[]):
+            result = refunds_to_donors("NOT_AN_ID", 2024)
+        assert result["committee"] is None
+        assert result["refund_lines"] == 0
+        assert "could not be resolved" in result["note"]
+
+
+class TestDataFreshness:
+    """Tool: data_freshness() — snapshot freshness + hygiene counts."""
+
+    def test_shape_with_empty_db(self, patched_db):
+        from core.mcp.tools import data_freshness
+
+        result = data_freshness()
+        assert result["newest_receipt_date"] is None
+        assert result["newest_expenditure_date"] is None
+        assert result["future_dated_rows"] == {"receipts": 0, "expenditures": 0}
+        assert result["last_etl_load"] is None
+        assert result["row_counts"] == {}
+        assert result["notes"]  # explanatory notes always present
+
+    def test_full_shape_with_fake_rows(self):
+        import core.mcp.tools as tools
+        from core.mcp.tools import data_freshness
+
+        def fake(sql, params=None):
+            u = " ".join(str(sql).upper().split())
+            if u.startswith("SELECT COUNT(*) AS N, MAX(CASE WHEN RECEIPT_DATE"):
+                return [{"n": 100, "newest": "2026-08-24", "future_dated": 2}]
+            if u.startswith("SELECT COUNT(*) AS N, MAX(CASE WHEN EXPN_DATE"):
+                return [{"n": 50, "newest": "2026-08-23", "future_dated": 1}]
+            if "LOAD_CHECKPOINT" in u:
+                raise AssertionError("no such table")
+            if "PG_CLASS" in u:
+                return [
+                    {"table_name": "rcpt_cd", "approx_rows": 123456},
+                    {"table_name": "expn_cd", "approx_rows": 654321},
+                ]
+            return []
+
+        with patch.object(tools, "execute_read", side_effect=fake):
+            r = data_freshness()
+        assert r["newest_receipt_date"] == "2026-08-24"
+        assert r["newest_expenditure_date"] == "2026-08-23"
+        assert r["future_dated_rows"] == {"receipts": 2, "expenditures": 1}
+        assert r["last_etl_load"] is None  # query raised -> graceful None
+        assert any("load_checkpoint" in n for n in r["notes"])
+        assert r["row_counts"] == {"rcpt_cd": 123456, "expn_cd": 654321}
+
+
+class TestServerRegistrations:
+    """New tools are exposed through the server registration surface."""
+
+    def test_new_tools_registered(self):
+        server = _create_server()
+        import asyncio
+
+        names = {t.name for t in asyncio.run(server.list_tools())}
+        assert {
+            "total_expenditures",
+            "refunds_to_donors",
+            "data_freshness",
+        } <= names
+        assert len(names) == len(TOOLS)

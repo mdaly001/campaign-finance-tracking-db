@@ -275,6 +275,12 @@ def _committee_predicate(alias: str) -> str:
 
 _SRC_PRIORITY = "CASE src WHEN 'rcpt_cd' THEN 1 WHEN 's497_cd' THEN 2 ELSE 3 END"
 
+# "Return of contribution" style refunds are recorded in the expenditure
+# tables with the donor (or the donor's agent) as payee; they are not vendor
+# spend. Match the standard CAL-ACCESS memo-code wording case-insensitively
+# (used with the SQL ``~*`` operator): RETURN/RTN/REFUND [OF] [OVER]CONTRIB...
+_REFUND_DSCR_REGEX = r"(return|rtn|refund)[^a-z]+(of[^a-z]+)?(over-?contrib|contrib)"
+
 
 def _donor_match_predicate(alias: str, alias_clauses: str) -> str:
     """WHERE fragment matching a donor by name across all receipt sources.
@@ -563,13 +569,13 @@ def expenditures_by_vendor(
             e.filing_id,
             e.form_type
         FROM expn_cd_deduped e
-        WHERE e.cmte_id = :committee_id
+        WHERE {_committee_predicate('e')}
           AND e.form_type IN ('E', 'F461P5')
           AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle
         ORDER BY e.expn_date DESC
     """
     rows = execute_read(
-        sql, {"committee_id": committee_id, "cycle": cycle}
+        sql, {"filer": _resolve_filer_id(committee_id), "cycle": cycle}
     )
     out: list[dict[str, Any]] = []
     for row in rows[:limit]:
@@ -629,13 +635,13 @@ def expenditures_by_candidate(
             e.filing_id,
             e.form_type
         FROM expn_cd_deduped e
-        WHERE e.cmte_id = :committee_id
+        WHERE {_committee_predicate('e')}
           AND e.form_type IN ('D', 'E', 'F461P5')
           AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle
           {cand_clause}
         ORDER BY e.expn_date DESC
     """
-    params: dict[str, Any] = {"committee_id": committee_id, "cycle": cycle}
+    params: dict[str, Any] = {"filer": _resolve_filer_id(committee_id), "cycle": cycle}
     if candidate_name is not None:
         params["candidate"] = f"%{candidate_name}%"
     rows = execute_read(sql, params)
@@ -694,13 +700,13 @@ def expenditures_by_outlet(
             e.filing_id,
             e.form_type
         FROM expn_cd_deduped e
-        WHERE e.cmte_id = :committee_id
+        WHERE {_committee_predicate('e')}
           AND e.form_type = 'G'
           AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle
         ORDER BY e.expn_date DESC
     """
     rows = execute_read(
-        sql, {"committee_id": committee_id, "cycle": cycle}
+        sql, {"filer": _resolve_filer_id(committee_id), "cycle": cycle}
     )
     out: list[dict[str, Any]] = []
     for row in rows[:limit]:
@@ -720,6 +726,7 @@ def expenditures_by_outlet(
 def total_expenditures(
     committee_id: str,
     cycle: int,
+    exclude_refunds: bool = False,
 ) -> dict[str, Any]:
     """Return total expenditures for a committee in a cycle.
 
@@ -728,28 +735,43 @@ def total_expenditures(
     actual total spending, excluding Form D (duplicate beneficiary tracking)
     and Form G (outlet detail already counted in vendor payment).
 
+    Scope is filing-based (see ``_committee_predicate``): the committee's
+    filer id is resolved via ``filer_xref_cd`` and rows are attributed
+    through ``filer_filings_cd``, so independent-expenditure lines filed by
+    other committees for this candidate are included and other committees'
+    rows carrying this id in ``cmte_id`` are not.
+
     This answers: "How much did Committee X spend in total?"
 
     Args:
         committee_id: Committee ID (e.g. ``1479071``).
         cycle: Election cycle year.
+        exclude_refunds: When True, drop "return of contribution" refund
+            lines (refund memo codes matched on the expenditure description)
+            so the total reflects true vendor spend, not refunds back to
+            donors.
 
     Returns:
         Dict with ``transaction_count``, ``total_amount``, ``form_types``.
     """
+    refund_clause = (
+        " AND NOT (COALESCE(e.expn_dscr, '') ~* :refund_rx)" if exclude_refunds
+        else ""
+    )
     sql = f"""
         SELECT
             COUNT(*) AS transaction_count,
-            ROUND(COALESCE(SUM(amount), 0), 2) AS total_amount,
-            jsonb_agg(DISTINCT form_type) AS form_types
-        FROM expn_cd_deduped
-        WHERE cmte_id = :committee_id
-          AND form_type IN ('E', 'F461P5')
-          AND EXTRACT(YEAR FROM expn_date)::int = :cycle
+            ROUND(COALESCE(SUM(e.amount), 0), 2) AS total_amount,
+            jsonb_agg(DISTINCT e.form_type) AS form_types
+        FROM expn_cd_deduped e
+        WHERE {_committee_predicate('e')}
+          AND e.form_type IN ('E', 'F461P5')
+          AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle{refund_clause}
     """
-    row = execute_read(
-        sql, {"committee_id": committee_id, "cycle": cycle}
-    )
+    params = {"filer": _resolve_filer_id(committee_id), "cycle": cycle}
+    if exclude_refunds:
+        params["refund_rx"] = _REFUND_DSCR_REGEX
+    row = execute_read(sql, params)
     if not row:
         return {"transaction_count": 0, "total_amount": 0.0, "form_types": []}
     r = row[0]
@@ -979,6 +1001,7 @@ def committee_outlays_to(
     vendor_name: str,
     cycle: int,
     limit: int = 50,
+    exclude_refunds: bool = False,
 ) -> list[dict[str, Any]]:
     """Return expenditures from a committee to a vendor/payee in a cycle.
 
@@ -993,6 +1016,10 @@ def committee_outlays_to(
     Returns:
         List of OutlayRecord dicts (newest first).
     """
+    refund_clause = (
+        " AND NOT (COALESCE(e.expn_dscr, '') ~* :refund_rx)" if exclude_refunds
+        else ""
+    )
     sql = f"""
         SELECT
             e.expn_date,
@@ -1009,15 +1036,17 @@ def committee_outlays_to(
         WHERE {_committee_predicate('e')}
           AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle
           AND TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, ''))
-               ~* :vendor
+               ~* :vendor{refund_clause}
         ORDER BY e.expn_date DESC
         LIMIT :lim
     """
-    rows = execute_read(
-        sql,
-        {"filer": _resolve_filer_id(committee_id), "cycle": cycle, "lim": limit,
-         "vendor": _vendor_regex(vendor_name)},
-    )
+    params: dict[str, Any] = {
+        "filer": _resolve_filer_id(committee_id), "cycle": cycle, "lim": limit,
+        "vendor": _vendor_regex(vendor_name),
+    }
+    if exclude_refunds:
+        params["refund_rx"] = _REFUND_DSCR_REGEX
+    rows = execute_read(sql, params)
     out: list[dict[str, Any]] = []
     for row in rows:
         c = _coerce_row(row)
@@ -1224,12 +1253,17 @@ def committee_profile(
     # but no expenditures (or vice versa), so the two maxima are merged
     # with MAX() over a UNION ALL, which ignores NULLs. The receipts branch
     # uses receipts_all so 24-hour report activity counts as activity.
+    # Bounded at CURRENT_DATE: a minority of rows carry corrupt far-future
+    # dates (data_caveats §4.1), and an unbounded MAX would report a future
+    # date as the committee's last real activity.
     last_row = execute_read(
         f"""
         SELECT MAX(d) AS last_activity FROM (
             SELECT x.receipt_date AS d FROM receipts_all x WHERE {_committee_predicate('x')}
+              AND x.receipt_date <= CURRENT_DATE
             UNION ALL
             SELECT e.expn_date AS d FROM expn_cd_deduped e WHERE {_committee_predicate('e')}
+              AND e.expn_date <= CURRENT_DATE
         ) t
         """,
         {"filer": filer_id},
@@ -1952,6 +1986,58 @@ def rapid_expense_vendors(
 
     name = _committee_name(committee_id)
     returned = len(resolved) + len(unresolved)
+
+    # Step-3 playbook (data_caveats.md §1.2): for lines whose payee never
+    # resolves (the periodic re-filing has not been filed yet), group the
+    # recurring descriptions so the *shape* of the spend is visible even when
+    # the payee name is missing — recurring identical descriptions are
+    # typically a standing vendor engagement (monthly retainer etc.).
+    # The roll-up covers the FULL scope (not just the returned slice).
+    desc_rows = execute_read(
+        f"""
+        WITH f AS (
+            SELECT DISTINCT filing_id FROM filer_filings_cd
+            WHERE filer_id = :fid
+        ),
+        s496 AS (
+            SELECT s.exp_date::date AS d, s.amount,
+                   LOWER(TRIM(COALESCE(s.expn_dscr, ''))) AS dscr
+            FROM s496_cd_deduped s
+            WHERE s.filing_id IN (SELECT filing_id FROM f){since_sql}
+        ),
+        expn AS (
+            SELECT DISTINCT e.expn_date::date AS d, e.amount
+            FROM expn_cd_deduped e
+            WHERE e.filing_id IN (SELECT filing_id FROM f)
+              AND TRIM(COALESCE(e.payee_naml, '') || ' '
+                       || COALESCE(e.payee_namf, '')) <> ''
+        )
+        SELECT s.dscr AS description,
+               COUNT(*) AS occurrences,
+               ROUND(SUM(s.amount), 2) AS total,
+               MIN(s.d) AS first_seen,
+               MAX(s.d) AS last_seen
+        FROM s496 s
+        WHERE NOT EXISTS (
+            SELECT 1 FROM expn p WHERE p.d = s.d AND p.amount = s.amount
+        )
+        GROUP BY 1
+        ORDER BY occurrences DESC, total DESC
+        LIMIT 50
+        """,
+        {"fid": fid, **({"since": since_date} if since_date else {})},
+    )
+    description_rollup = [
+        {
+            "description": (c := _coerce_row(r)).get("description") or "(blank)",
+            "occurrences": int(c.get("occurrences") or 0),
+            "total": _money(c.get("total")),
+            "first_seen": c.get("first_seen"),
+            "last_seen": c.get("last_seen"),
+        }
+        for r in desc_rows
+    ]
+
     # When truncated, the pct is a floor (only over the returned rows).
     pct = round(100.0 * n_resolved / returned, 1) if returned else 0.0
     note = (
@@ -1971,7 +2057,127 @@ def rapid_expense_vendors(
         "resolved": resolved,
         "unresolved": unresolved,
         "resolution_pct": pct,
+        "description_rollup": description_rollup,
         "note": note,
+    }
+
+
+def refunds_to_donors(
+    committee_id: str,
+    cycle: int,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Report "return of contribution" refund lines filed by a committee.
+
+    Refunds are recorded in the expenditure tables with the donor (or the
+    donor's agent) as payee and a refund memo code (e.g. "RETURN OF
+    CONTRIBUTION", "Rtn of Contribution") as the description, so they
+    inflate vendor-spend totals if not examined (data_caveats.md §4.3).
+    This tool scopes to the committee's filings (filer id resolved via
+    ``filer_xref_cd``; attribution through ``filer_filings_cd``) and
+    groups the refund lines by the payee who received the refund.
+
+    Args:
+        committee_id: Committee ID (``cmte_id``/``xref_id`` or a numeric
+            ``filer_id``).
+        cycle: Election cycle year (derived from ``expn_date``).
+        limit: Max payee groups to return (default 50).
+
+    Returns:
+        Dict with ``committee_id``, ``committee``, ``cycle``,
+        ``refund_lines``, ``total_refunded``, ``first_refund``,
+        ``last_refund``, ``top_recipients`` (payee groups ordered by total,
+        each with refunds/total/first_date/last_date), and a ``note``.
+    """
+    fid = _resolve_filer_id(committee_id)
+    if fid < 0:
+        return {
+            "committee_id": committee_id,
+            "committee": None,
+            "cycle": cycle,
+            "refund_lines": 0,
+            "total_refunded": 0.0,
+            "top_recipients": [],
+            "note": "committee id could not be resolved; no filings matched.",
+        }
+
+    summary = execute_read(
+        f"""
+        WITH f AS (
+            SELECT DISTINCT filing_id FROM filer_filings_cd
+            WHERE filer_id = :fid
+        )
+        SELECT COUNT(*) AS n,
+               ROUND(COALESCE(SUM(e.amount), 0), 2) AS total,
+               MIN(e.expn_date) AS first_refund,
+               MAX(e.expn_date) AS last_refund
+        FROM expn_cd_deduped e
+        WHERE e.filing_id IN (SELECT filing_id FROM f)
+          AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle
+          AND LOWER(TRIM(e.expn_dscr)) ~ :refund_rx
+        """,
+        {"fid": fid, "cycle": cycle, "refund_rx": _REFUND_DSCR_REGEX},
+    )
+    groups = execute_read(
+        f"""
+        WITH f AS (
+            SELECT DISTINCT filing_id FROM filer_filings_cd
+            WHERE filer_id = :fid
+        ),
+        refunds AS (
+            SELECT TRIM(COALESCE(e.payee_naml, '') || ' '
+                        || COALESCE(e.payee_namf, '')) AS payee_name,
+                   e.expn_date, e.amount
+            FROM expn_cd_deduped e
+            WHERE e.filing_id IN (SELECT filing_id FROM f)
+              AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle
+              AND LOWER(TRIM(e.expn_dscr)) ~ :refund_rx
+        )
+        SELECT payee_name,
+               COUNT(*) AS refunds,
+               COALESCE(SUM(amount), 0) AS total,
+               MIN(expn_date) AS first_date,
+               MAX(expn_date) AS last_date
+        FROM refunds
+        GROUP BY payee_name
+        ORDER BY total DESC
+        LIMIT :lim
+        """,
+        {
+            "fid": fid,
+            "cycle": cycle,
+            "refund_rx": _REFUND_DSCR_REGEX,
+            "lim": limit,
+        },
+    )
+
+    s = _coerce_row(summary[0]) if summary else {}
+    top = []
+    for r in groups:
+        c = _coerce_row(r)
+        top.append(
+            {
+                "payee_name": c.get("payee_name") or "(unknown payee)",
+                "refunds": int(c.get("refunds") or 0),
+                "total": _money(c.get("total")),
+                "first_date": c.get("first_date"),
+                "last_date": c.get("last_date"),
+            }
+        )
+    return {
+        "committee_id": committee_id,
+        "committee": _committee_display(_committee_name(committee_id)) or None,
+        "cycle": cycle,
+        "refund_lines": int(s.get("n") or 0),
+        "total_refunded": _money(s.get("total")),
+        "first_refund": s.get("first_refund"),
+        "last_refund": s.get("last_refund"),
+        "top_recipients": top,
+        "note": (
+            "Refund lines are matched by refund memo codes in expn_dscr "
+            "(return/rtn/refund + contribution). They are not vendor spend; "
+            "the payee is the original donor or the donor's agent."
+        ),
     }
 
 
@@ -1989,7 +2195,10 @@ _TABLE_NOTES: dict[str, str] = {
         "for individuals; organizations in payee_naml. There is NO payee "
         "description field (only expn_dscr for the purpose). expn_date can "
         "be NULL or corrupt (some rows carry 1900/3000-era dates) — never "
-        "use unbounded MAX(expn_date)."
+        "use unbounded MAX(expn_date). For totals read expn_cd_deduped: "
+        "the raw table stores every amended version of a transaction "
+        "(amend_id) and inflates SUMs by 30-60% on amendment-heavy "
+        "committees."
     ),
     "s496_cd": (
         "24-hour EXPENDITURE reports (Form 496). amount, date and free-text "
@@ -2036,6 +2245,90 @@ _TABLE_NOTES: dict[str, str] = {
         "substitute for searching rcpt_cd/expn_cd."
     ),
 }
+
+
+def data_freshness() -> dict[str, Any]:
+    """Report how fresh the database content is (snapshot freshness).
+
+    The database is a snapshot, not live: answers about "current" totals
+    must state the snapshot date. The newest transaction dates are reported
+    capped at ``CURRENT_DATE`` — a minority of rows carry corrupt far-future
+    dates (data_caveats.md §4.1), and those are excluded from the freshness
+    date and reported instead in ``future_dated_rows`` (a data-hygiene
+    signal, never a freshness signal).
+
+    Returns:
+        Dict with ``newest_receipt_date``, ``newest_expenditure_date``,
+        ``future_dated_rows`` (receipts + expenditures beyond today),
+        ``last_etl_load`` (max ``load_checkpoint.processed_date``; ``None``
+        when the checkpoint table is absent/empty) and ``row_counts`` for
+        the core fact tables (approximate ``pg_class.reltuples`` counts).
+    """
+    out: dict[str, Any] = {
+        "newest_receipt_date": None,
+        "newest_expenditure_date": None,
+        "future_dated_rows": {"receipts": 0, "expenditures": 0},
+        "last_etl_load": None,
+        "row_counts": {},
+        "notes": [
+            "newest_* are capped at CURRENT_DATE: future-dated rows "
+            "(data-quality corruption) are counted in future_dated_rows, "
+            "not reported as freshness.",
+            "row_counts are approximate (pg_class.reltuples) and only "
+            "updated by ANALYZE/VACUUM.",
+        ],
+    }
+
+    for key, table, col in (
+        ("newest_receipt_date", "receipts_all", "receipt_date"),
+        ("newest_expenditure_date", "expn_cd_deduped", "expn_date"),
+    ):
+        rows = execute_read(
+            f"SELECT COUNT(*) AS n,"
+            f" MAX(CASE WHEN {col} <= CURRENT_DATE THEN {col} END) AS newest,"
+            f" SUM(CASE WHEN {col} > CURRENT_DATE THEN 1 ELSE 0 END) AS future_dated"
+            f" FROM {table}"
+            f" WHERE {col} IS NOT NULL"
+        )
+        if not rows:
+            continue
+        r = _coerce_row(rows[0])
+        out[key] = r.get("newest")
+        out["future_dated_rows"][
+            "receipts" if key == "newest_receipt_date" else "expenditures"
+        ] = int(r.get("future_dated") or 0)
+
+    try:
+        rows = execute_read("SELECT MAX(processed_date) AS t FROM load_checkpoint")
+        out["last_etl_load"] = _dtos(rows[0]["t"]) if rows and rows[0].get("t") else None
+    except Exception as e:  # checkpoint table missing in some deployments
+        out["notes"].append(f"load_checkpoint not queryable: {e}")
+
+    try:
+        rows = execute_read(
+            "SELECT c.relname AS table_name,"
+            " COALESCE(c.reltuples::bigint, 0) AS approx_rows"
+            " FROM pg_class c"
+            " JOIN pg_namespace n ON n.oid = c.relnamespace"
+            " WHERE n.nspname = 'public'"
+            " AND c.relkind IN ('r', 'm')"
+            " AND c.reltuples > 0"
+            " ORDER BY approx_rows DESC"
+        )
+        fact = {
+            "rcpt_cd", "expn_cd", "s496_cd", "s497_cd", "s498_cd",
+            "rcpt_cd_deduped", "expn_cd_deduped",
+            "filername_cd", "filer_xref_cd", "filer_filings_cd",
+        }
+        out["row_counts"] = {
+            r["table_name"]: int(r["approx_rows"])
+            for r in rows
+            if r.get("table_name") in fact
+        }
+    except Exception as e:
+        out["notes"].append(f"pg_class not queryable: {e}")
+
+    return out
 
 
 def describe_table(table_name: str) -> dict[str, Any]:

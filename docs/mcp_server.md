@@ -2,7 +2,7 @@
 
 Read-only MCP (Model Context Protocol) server over the **CAL-ACCESS**
 California Secretary of State campaign finance disclosure database
-(PostgreSQL 16). 16 query tools covering contributions, expenditures,
+(PostgreSQL 16). 19 query tools covering contributions, expenditures,
 committees, people, ballot measures, filing deadlines, the 24-hour
 rapid-disclosure reports, and a guarded read-only SQL escape hatch
 (`run_sql`) for edge-case queries no dedicated tool covers.
@@ -69,6 +69,9 @@ MCP_PORT=9527 python -m core.mcp.server
 | `rapid_expense_vendors` | Recover payee names for a committee's 24-hr (Form 496) expenses | `committee_id`, `since_date?` |
 | `upcoming_filings` | Filing deadlines within N days (from `filing_period_cd`) | `committee_id`, `days_ahead?` |
 | `filing_due_soon` | Scraper-tracked deadlines within N days | `days_ahead?` |
+| `total_expenditures` | Total spend by a committee in a cycle (deduped Form E/F461P5; optional refund exclusion) | `committee_id`, `cycle`, `exclude_refunds?` |
+| `refunds_to_donors` | "Return of contribution" refund lines by a committee in a cycle | `committee_id`, `cycle`, `limit?` |
+| `data_freshness` | Snapshot freshness: newest transaction dates (corrupt future-dated rows excluded), last ETL load, row counts | — |
 
 ### Choosing a tool — common questions
 
@@ -123,7 +126,10 @@ MCP_PORT=9527 python -m core.mcp.server
    dates (1900/3000 era). Never use unbounded `MAX(date)` for freshness;
    the snapshot's newest *received* reports are the freshness signal.
 10. **Snapshot, not live.** The database is a periodic extract of SOS
-    filings (current extract: reports received through ~2026-08-24).
+    filings; the snapshot date moves with each ETL load. Call
+    `data_freshness` to get the current newest receipt/expenditure dates
+    (corrupt future-dated rows are excluded and counted separately), the
+    last ETL load, and row counts before quoting any "current" totals.
 11. **Empty until built.** `filing_calendar` and `election_results`
     currently have no rows; `ballot_measures_cd` covers 2000–2009 only.
     Recent ballot measures resolve via committee names, not measure IDs.
