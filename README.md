@@ -248,19 +248,6 @@ Ingest FEC campaign finance data. Cross-reference with California data for multi
 
 ### Phase 3 — California Counties
 Ingest county-level disclosure data for comprehensive local coverage.
-
-## Architecture
-
-```
-┌──────────┐     ┌──────────┐     ┌──────────┐
-│   ETL    │────▶│  POSTGRES│◀───▶│   MCP    │
-│  (daily) │     │   (16)   │     │  Server  │
-└──────────┘     └──────────┘     └──────────┘
-                       │
-                  ┌──────────┐
-                  │   MCP    │
-                  │ clients  │
-                  └──────────┘
 ```
 
 ## License
