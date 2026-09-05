@@ -137,6 +137,19 @@ class MockDB:
                 {"d": date(2026, 4, 21), "amount": 6500.0,
                  "dscr": "DOORHANGERS (ESTIMATE)", "payees": None},
             ]
+        # -- rapid_expense_vendors: description roll-up for unresolved lines - #
+        # the roll-up is the only query starting with the CTE prefix; the
+        # resolved-lines query (with ARRAY_AGG) is matched above first
+        if norm.startswith("WITH F AS ( SELECT DISTINCT FILING_ID"):
+            return [
+                {
+                    "description": "TELEVISION ADS",
+                    "occurrences": 4,
+                    "total": 18000.0,
+                    "first_seen": date(2026, 1, 15),
+                    "last_seen": date(2026, 6, 3),
+                },
+            ]
 
         # -- describe_table -------------------------------------------------- #
         if "FROM INFORMATION_SCHEMA.COLUMNS" in norm:
@@ -365,7 +378,8 @@ class TestGetServerDocs:
 
 class TestServerRegistration:
     def test_sixteen_tools(self):
-        assert len(TOOLS) == 16
+        assert len(TOOLS) == 19  # 16 Phase-1/2 tools + total_expenditures,
+        # refunds_to_donors, data_freshness (caveats-gap fixes)
         for t in (
             "payments_to_person",
             "rapid_expense_vendors",
