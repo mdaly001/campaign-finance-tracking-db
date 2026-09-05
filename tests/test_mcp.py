@@ -1072,3 +1072,176 @@ class TestServerRegistrations:
             "data_freshness",
         } <= names
         assert len(names) == len(TOOLS)
+
+
+# ------------------------------------------------------------------ #
+#  Tests: issue #2 — committee_outlays_to and the aggregate vendor tools
+#  must share ONE attribution basis (filing ownership via
+#  filer_filings_cd), never the detail-line cmte_id column.
+# ------------------------------------------------------------------ #
+
+
+class TestIssue2FilingScopedAttribution:
+    """Regression tests for GitHub issue #2.
+
+    Bug (deployed build): ``committee_outlays_to`` filtered the detail-line
+    ``cmte_id`` column (``WHERE e.cmte_id = :committee_id``) while the
+    aggregate (``committees_paying_vendor``) attributed payments to the filer
+    that FILED the report (``JOIN filings ON filing_id``). On agent-filed
+    reports the line's ``cmte_id`` carries the paying committee's id while the
+    filing belongs to a different filer — so the aggregate showed non-zero
+    payments for the same (committee, vendor) pair while the detail returned
+    0 rows. All five tools now scope by filing ownership (the predicate
+    ``WHERE e.filing_id IN (SELECT ff.filing_id FROM filer_filings_cd ff
+    WHERE ff.filer_id = :filer)``), so aggregate and detail answer the same
+    question from the same basis. These tests pin that invariant so a
+    regression to ``cmte_id`` scoping fails loudly.
+    """
+
+    def test_committee_outlays_to_scopes_by_filing_filer(self, patched_db):
+        from core.mcp import tools
+
+        rows = tools.committee_outlays_to("C9900001", "ACME MEDIA", 2026)
+
+        # first query resolves the committee id through filer_xref_cd
+        # (the mock resolves any xref lookup to filer 4242)…
+        resolve = patched_db.calls[0]
+        assert "FROM FILER_XREF_CD WHERE XREF_ID = :CMTE" in resolve["sql"]
+        assert resolve["params"] == {"cmte": "C9900001"}
+
+        # …then the detail query is scoped to that filer's filings — never to
+        # the cmte_id column on the detail lines.
+        data = patched_db.calls[-1]
+        assert "FROM EXPN_CD_DEDUPED E" in data["sql"]
+        assert "FILER_FILINGS_CD FF WHERE FF.FILER_ID = :FILER" in data["sql"]
+        assert "E.CMTE_ID = :COMMITTEE_ID" not in data["sql"]
+        assert data["params"] == {
+            "filer": 4242,
+            "cycle": 2026,
+            "lim": 50,
+            "vendor": tools._vendor_regex("ACME MEDIA"),
+        }
+        # the rows the aggregate counted for this (committee, vendor) pair are
+        # exactly the rows this detail query can return
+        assert rows == [
+            {
+                "date": "2026-03-10",
+                "amount": 500.0,
+                "purpose": "Office rent",
+                "payee_name": "Acme Consulting",
+                "cmte_id": "C1",
+                "tran_id": "E1",
+                "memo_refno": None,
+            }
+        ]
+
+    def test_expenditure_detail_tools_share_the_same_basis(self, patched_db):
+        from core.mcp import tools
+
+        for tool in (
+            tools.expenditures_by_vendor,
+            tools.expenditures_by_candidate,
+            tools.expenditures_by_outlet,
+            tools.total_expenditures,
+        ):
+            before = len(patched_db.calls)
+            out = tool("C9900001", 2024)
+            assert out is not None
+            data = [
+                c
+                for c in patched_db.calls[before:]
+                if "FROM EXPN_CD_DEDUPED E" in c["sql"]
+            ]
+            assert data, f"{tool.__name__} must read the deduped expn view"
+            sql, params = data[-1]["sql"], data[-1]["params"]
+            # scoped by the filing-owner filer…
+            assert (
+                "FILER_FILINGS_CD FF WHERE FF.FILER_ID = :FILER" in sql
+            ), tool.__name__
+            assert params["filer"] == 4242
+            assert params["cycle"] == 2024
+            # …never by the cmte_id column on the detail line
+            assert "E.CMTE_ID = :COMMITTEE_ID" not in sql, tool.__name__
+
+    def test_committees_paying_vendor_groups_by_filing_owner(self, patched_db):
+        from core.mcp import tools
+
+        out = tools.committees_paying_vendor("Acme Consulting")
+
+        agg = next(
+            c
+            for c in patched_db.calls
+            if "FROM FILER_TO_FILER_TYPE_CD" in c["sql"] and "~* :VENDOR" in c["sql"]
+        )
+        # attribution basis: the filing owner (JOIN filings ON filing_id), not
+        # the line's cmte_id column; rows whose filing_id matches no filing
+        # ("unattributed" rows) are dropped by the inner join by design so the
+        # aggregate can never count a payment the detail tools cannot reach.
+        assert "FROM EXPN_CD_DEDUPED E" in agg["sql"]
+        assert "JOIN FILINGS FF ON FF.FILING_ID = E.FILING_ID" in agg["sql"]
+        assert "E.CMTE_ID = :COMMITTEE_ID" not in agg["sql"]
+
+        # the emitted cmte_id is the filing-owner filer's xref id — the id the
+        # detail tools accept as committee_id (round trip below)
+        assert out[0]["committee"] == "Test Committee"
+        assert out[0]["cmte_id"] == "C1234"
+        assert out[0]["is_candidate"] is True
+        assert out[1]["cmte_id"] == "C5678"
+        assert out[1]["is_candidate"] is False
+        assert out[0]["payments"] == 3
+        assert out[0]["total"] == 1500.0
+        assert out[1]["payments"] == 2
+        assert out[1]["total"] == 700.0
+
+    def test_vendor_revenue_has_no_committee_filter(self, patched_db):
+        from core.mcp import tools
+
+        out = tools.vendor_revenue("Acme Consulting")
+
+        data = [
+            c for c in patched_db.calls if "FROM EXPN_CD_DEDUPED E" in c["sql"]
+        ]
+        assert data
+        # vendor-keyed aggregate: groups over ALL filings, no committee scoping,
+        # no filer parameter — the query itself cannot disagree with the detail
+        # tools' scoping.
+        assert "GROUP BY 1" in data[-1]["sql"]
+        assert all(
+            not (c["params"] and "filer" in c["params"]) for c in data
+        )
+        assert out == [{"vendor_name": "Acme Consulting", "payments": 2, "total": 5000.0}]
+
+    def test_committee_id_emitted_by_aggregate_flows_to_detail(self, patched_db):
+        """The cmte_id the aggregate tool emits must be a valid input for the
+        detail tool and must scope it to exactly the filings the aggregate
+        counted — the tools round-trip through the same id space via
+        filer_xref_cd."""
+        from core.mcp import tools
+
+        agg = tools.committees_paying_vendor("Acme Consulting")
+        cmte_id = agg[0]["cmte_id"]  # "C1234" from the mock aggregate row
+        assert cmte_id is not None
+
+        before = len(patched_db.calls)
+        rows = tools.committee_outlays_to(cmte_id, "Acme Consulting", 2024)
+
+        resolve = patched_db.calls[before]
+        assert "FROM FILER_XREF_CD WHERE XREF_ID = :CMTE" in resolve["sql"]
+        assert resolve["params"] == {"cmte": "C1234"}
+        data = patched_db.calls[-1]
+        assert data["params"]["filer"] == 4242  # the resolved filer's filings
+        assert len(rows) == 1
+        assert rows[0]["payee_name"] == "Acme Consulting"
+
+    def test_resolve_filer_id_numeric_passthrough_and_unknown_id(self):
+        from core.mcp import tools
+
+        # with no xref rows at all, bare numeric ids still resolve to
+        # themselves (they ARE filer ids); unknown non-numeric ids resolve to
+        # -1, which matches no filings — an empty scope, never "everything".
+        from unittest.mock import patch
+
+        with patch.object(tools, "execute_read", return_value=[]):
+            assert tools._resolve_filer_id("900532") == 900532
+            assert tools._resolve_filer_id("C0695132") == -1
+            assert "ff.filer_id = :filer" in tools._committee_predicate("e")
