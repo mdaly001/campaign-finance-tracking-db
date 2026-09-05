@@ -8,6 +8,25 @@ This project ingests and normalizes campaign finance disclosure data from Califo
 
 **Privacy-first design:** Redacted data is loaded by default. Unredacted PII is opt-in and isolated in a separate schema with guardrails to prevent accidental exposure.
 
+## ⚠️ Disclaimer — verify before you trust or share
+
+**This project is a pipeline and a query surface, not a source of truth.**
+An LLM agent or MCP client that queries this database is reasoning from the
+context it was given. When that context is wrong — a misunderstood table
+structure, a malformed table on load, a model that isn't the right tool for
+the task — the output will be wrong, and it will be wrong *confidently*.
+Tone is not evidence.
+
+Before you rely on anything the agent reports — a figure, a name, a filing
+date, an "audit finding" — **verify it against the source data:** re-run the
+query, open the underlying filing, compare it to the public record. If you
+republish what an agent produced, you are now a publisher of it, and you're
+accountable for it.
+
+**Don't be an asshole — double-check the output before you share it.**
+
+Full text: [`DISCLAIMER.md`](DISCLAIMER.md).
+
 ## Setup
 
 ### Prerequisites
