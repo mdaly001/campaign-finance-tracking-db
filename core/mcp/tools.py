@@ -241,10 +241,15 @@ def _committee_predicate(alias: str) -> str:
     (e.g. independent-expenditure committees carry a candidate's committee
     id on their lines), so matching it pulls in other committees' filings.
     """
+    # ``= ANY (ARRAY(SELECT ...))`` instead of ``IN (SELECT ...)``:
+    # PostgreSQL runs the subquery once as an InitPlan and then pushes the
+    # semi-join down as an index scan on idx_expn_cd_filing_id; a plain
+    # ``IN (SELECT ...)`` over a DISTINCT subquery defeats that push-down and
+    # degrades to a full scan + sort of the whole table.
     return (
-        f"{alias}.filing_id IN ("
+        f"{alias}.filing_id = ANY (ARRAY("
         "SELECT ff.filing_id FROM filer_filings_cd ff "
-        "WHERE ff.filer_id = :filer)"
+        "WHERE ff.filer_id = :filer))"
     )
 
 
@@ -1919,9 +1924,9 @@ def rapid_expense_vendors(
         f"""
         SELECT COUNT(*) AS n
         FROM s496_cd_deduped s
-        WHERE s.filing_id IN (
+        WHERE s.filing_id = ANY (ARRAY(
             SELECT DISTINCT filing_id FROM filer_filings_cd WHERE filer_id = :fid
-        ){since_sql}
+        )){since_sql}
         """,
         {"fid": fid, **({"since": since_date} if since_date else {})},
     )
@@ -1941,14 +1946,14 @@ def rapid_expense_vendors(
                    s.exp_date::date AS d, s.amount,
                    LEFT(TRIM(COALESCE(s.expn_dscr, '')), 120) AS dscr
             FROM s496_cd_deduped s
-            WHERE s.filing_id IN (SELECT filing_id FROM f){since_sql}
+            WHERE s.filing_id = ANY (ARRAY(SELECT filing_id FROM f)){since_sql}
         ),
         expn AS (
             SELECT DISTINCT e.expn_date::date AS d, e.amount,
                    TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, ''))
                        AS payee
             FROM expn_cd_deduped e
-            WHERE e.filing_id IN (SELECT filing_id FROM f)
+            WHERE e.filing_id = ANY (ARRAY(SELECT filing_id FROM f))
               AND TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, ''))
                   <> ''
         )
@@ -2003,12 +2008,12 @@ def rapid_expense_vendors(
             SELECT s.exp_date::date AS d, s.amount,
                    LOWER(TRIM(COALESCE(s.expn_dscr, ''))) AS dscr
             FROM s496_cd_deduped s
-            WHERE s.filing_id IN (SELECT filing_id FROM f){since_sql}
+            WHERE s.filing_id = ANY (ARRAY(SELECT filing_id FROM f)){since_sql}
         ),
         expn AS (
             SELECT DISTINCT e.expn_date::date AS d, e.amount
             FROM expn_cd_deduped e
-            WHERE e.filing_id IN (SELECT filing_id FROM f)
+            WHERE e.filing_id = ANY (ARRAY(SELECT filing_id FROM f))
               AND TRIM(COALESCE(e.payee_naml, '') || ' '
                        || COALESCE(e.payee_namf, '')) <> ''
         )
@@ -2112,7 +2117,7 @@ def refunds_to_donors(
                MIN(e.expn_date) AS first_refund,
                MAX(e.expn_date) AS last_refund
         FROM expn_cd_deduped e
-        WHERE e.filing_id IN (SELECT filing_id FROM f)
+        WHERE e.filing_id = ANY (ARRAY(SELECT filing_id FROM f))
           AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle
           AND LOWER(TRIM(e.expn_dscr)) ~ :refund_rx
         """,
@@ -2129,7 +2134,7 @@ def refunds_to_donors(
                         || COALESCE(e.payee_namf, '')) AS payee_name,
                    e.expn_date, e.amount
             FROM expn_cd_deduped e
-            WHERE e.filing_id IN (SELECT filing_id FROM f)
+            WHERE e.filing_id = ANY (ARRAY(SELECT filing_id FROM f))
               AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle
               AND LOWER(TRIM(e.expn_dscr)) ~ :refund_rx
         )
