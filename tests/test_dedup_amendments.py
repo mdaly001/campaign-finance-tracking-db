@@ -1,14 +1,21 @@
-"""Tests for amendment-version dedup (migration 0004).
+"""Tests for amendment-version dedup (migrations 0004 + 0007).
 
 CAL-ACCESS fact tables key rows by
 (amend_id, filing_id, form_type, line_item, rec_type): when a filing is
 amended, every line is re-published with a higher amend_id. Loading must
 keep every version in the raw base table (upsert key includes amend_id),
-while the query surface reads *_deduped views that keep only the highest
-amend_id per (filing_id, line_item) group.
+while the query surface reads *_deduped views.
+
+Migration 0004 keyed the views on (filing_id, line_item) — a *slot* key that
+double-counts a transaction refiled across multiple filings (same
+cmte_id + tran_id, new line_item per amending filing). Migration 0007
+re-keys transaction-carrying views to the transaction itself:
+DISTINCT ON (cmte_id, tran_id) ORDER BY amend_id DESC — each logical
+transaction survives exactly once, as its current version.
 
 These tests are hermetic (in-memory SQLite); the production views use
-Postgres DISTINCT ON, replicated here with an equivalent GROUP BY view.
+Postgres DISTINCT ON, replicated here with an equivalent GROUP BY view
+(highest amend_id per transaction, lowest filing_id/line_item breaks ties).
 """
 
 from __future__ import annotations
@@ -71,6 +78,7 @@ def _engine_with_rcpt() -> object:
                     line_item INTEGER NOT NULL,
                     form_type TEXT NOT NULL,
                     rec_type TEXT NOT NULL,
+                    cmte_id TEXT,
                     tran_id TEXT,
                     ctrib_naml TEXT,
                     rcpt_date TEXT,
@@ -80,16 +88,37 @@ def _engine_with_rcpt() -> object:
                 """
             )
         )
-        # SQLite-equivalent of the Postgres dedup view:
-        # keep the row with the highest amend_id per (filing_id, line_item).
+        # SQLite-equivalent of the Postgres dedup view (migration 0007):
+        # keep the row with the highest amend_id per transaction — the current
+        # version — and the latest version per (filing_id, line_item) slot for
+        # rows with no committee/transaction attribution (null or blank
+        # cmte_id/tran_id). Test data keeps max-amend unique per transaction,
+        # so the max-amend join matches DISTINCT ON exactly; the production
+        # view breaks ties deterministically on (filing_id, line_item).
         conn.execute(
             text(
                 """
                 CREATE VIEW rcpt_cd_deduped AS
                 SELECT r.* FROM rcpt_cd r
                 JOIN (
+                    SELECT cmte_id, tran_id, MAX(amend_id) AS max_amend
+                    FROM rcpt_cd
+                    WHERE cmte_id IS NOT NULL
+                      AND tran_id IS NOT NULL
+                      AND TRIM(tran_id) <> ''
+                    GROUP BY cmte_id, tran_id
+                ) m
+                  ON m.cmte_id = r.cmte_id
+                 AND m.tran_id = r.tran_id
+                 AND m.max_amend = r.amend_id
+                UNION ALL
+                SELECT r.* FROM rcpt_cd r
+                JOIN (
                     SELECT filing_id, line_item, MAX(amend_id) AS max_amend
                     FROM rcpt_cd
+                    WHERE cmte_id IS NULL
+                       OR tran_id IS NULL
+                       OR TRIM(tran_id) = ''
                     GROUP BY filing_id, line_item
                 ) m
                   ON m.filing_id = r.filing_id
@@ -111,13 +140,15 @@ ROWS = [
 ]
 
 
-def _insert_rows(engine, table: str, rows) -> None:
+def _insert_rows(engine, table: str, rows, cmte_id: str = "C1") -> None:
+    """Insert fixture rows; all fixture rows belong to committee C1."""
+    cols = ("cmte_id, filing_id, amend_id, line_item, form_type,"
+            " rec_type, tran_id, ctrib_naml, rcpt_date, amount")
     with engine.begin() as conn:
         conn.exec_driver_sql(
-            f"INSERT INTO {table} (filing_id, amend_id, line_item, form_type,"
-            " rec_type, tran_id, ctrib_naml, rcpt_date, amount)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            list(rows),
+            f"INSERT INTO {table} ({cols})"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [(cmte_id, *row) for row in rows],
         )
 
 
@@ -131,7 +162,10 @@ class TestDedupViewSemantics:
             n = conn.execute(text("SELECT COUNT(*) FROM rcpt_cd")).scalar()
         assert n == 5  # every amendment version is stored
 
-    def test_dedup_keeps_latest_version_per_line_item(self):
+    def test_dedup_keeps_current_version_per_transaction(self):
+        """Post-transition pin: winners are per-transaction (cmte_id, tran_id),
+        not per filing line slot. Fixture expectations are unchanged because
+        the highest-amend version of each transaction sits at its slot."""
         with self.engine.connect() as conn:
             rows = conn.execute(
                 text(
@@ -230,7 +264,72 @@ class TestLoaderKeepsAmendmentVersions:
         assert n == 2  # both versions coexist — dedup is query-time only
 
 
-class TestDedupViewNameMapping:
+class TestTransactionLevelDedup:
+    """Issue #4 regression: a transaction refiled by an amended filing must
+    be counted exactly once at its current value — not once per (filing_id,
+    line_item) slot it has appeared on. The old slot-keyed view summed the
+    original and every refile, inflating totals (the issue's ~2x symptom)."""
+
+    def test_refiled_transaction_counted_once_in_totals(self):
+        engine = _engine_with_rcpt()
+        rows = [
+            # T1: filed on filing 100 at $500, then refiled by amended
+            # filing 101 at $350 (same transaction: same cmte_id + tran_id,
+            # new line_item on the amending filing).
+            (100, 0, 1, "460", "I", "T1", "ACME INC", "2024-01-05", 500.00),
+            (101, 1, 3, "460", "I", "T1", "ACME INC", "2024-02-01", 350.00),
+            # T2: never amended, still on its original filing.
+            (100, 0, 2, "460", "I", "T2", "JOHN DOE", "2024-01-06", 100.00),
+        ]
+        _insert_rows(engine, "rcpt_cd", rows)
+        with engine.connect() as conn:
+            raw = float(
+                conn.execute(text("SELECT SUM(amount) FROM rcpt_cd")).scalar()
+            )
+            winners = conn.execute(
+                text(
+                    "SELECT tran_id, filing_id, amend_id, amount"
+                    " FROM rcpt_cd_deduped ORDER BY tran_id"
+                )
+            ).fetchall()
+            deduped = float(
+                conn.execute(
+                    text("SELECT SUM(amount) FROM rcpt_cd_deduped")
+                ).scalar()
+            )
+        # Raw sum double-counts T1 (500 + 350); the true current total is 450.
+        assert raw == 950.00
+        assert [(r[0], r[1], r[2], float(r[3])) for r in winners] == [
+            ("T1", 101, 1, 350.00),  # current version of T1, filed on 101
+            ("T2", 100, 0, 100.00),  # single version of T2
+        ]
+        assert deduped == 450.00
+
+    def test_unattributed_rows_keep_latest_version_per_slot(self):
+        """Rows with no committee or transaction attribution (null/blank
+        cmte_id or tran_id) cannot be grouped by transaction; they keep the
+        old slot semantics — nothing is dropped, nothing is double-counted."""
+        engine = _engine_with_rcpt()
+        rows = [
+            (200, 0, 9, "496", "I", "", "UNKNOWN PAYEE", "2024-03-01", 50.00),
+            (200, 1, 9, "496", "I", "", "UNKNOWN PAYEE", "2024-03-02", 40.00),
+        ]
+        _insert_rows(engine, "rcpt_cd", rows, cmte_id="")
+        with engine.connect() as conn:
+            winners = conn.execute(
+                text(
+                    "SELECT filing_id, amend_id, amount"
+                    " FROM rcpt_cd_deduped WHERE tran_id = ''"
+                    " ORDER BY amend_id"
+                )
+            ).fetchall()
+        # Exactly one row survives for the (200, 9) slot: the $50 version was
+        # superseded by the $40 version; both would double-count if kept.
+        assert [(r[0], r[1], float(r[2])) for r in winners] == [
+            (200, 1, 40.00),
+        ]
+
+
     def test_fact_tables_map_to_deduped_views(self):
         for table in DEDUP_FACT_TABLES:
             assert dedup_view_name(table) == f"{table}_deduped"
