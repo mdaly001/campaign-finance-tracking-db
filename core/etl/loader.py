@@ -34,10 +34,17 @@ logger = logging.getLogger(__name__)
 # re-filed after the initial load land as new rows with amend_id > 0 and
 # supersede the earlier version at query time, not on write.
 #
-# The query surface must read from the `*_deduped` views (migration
-# 0004_dedup_views.sql), which keep only the latest amend_id per
-# (filing_id, line_item) group. Use dedup_view_name() to map a base
-# table to its deduped view.
+# The query surface must read from the `*_deduped` views (created by
+# migration 0004, re-keyed by 0007_transaction_dedup.sql): views over
+# transaction-carrying tables (rcpt_cd, expn_cd, s497_cd, s498_cd, loan_cd,
+# debt_cd) keep the highest-amend_id version per (cmte_id, tran_id)
+# transaction — the transaction's current value — so re-filed transactions
+# are counted exactly once. Rows with no committee or transaction
+# attribution (null/blank cmte_id or tran_id) fall back to the latest
+# version per (filing_id, line_item) slot. Views over tables with no
+# committee column (lexp_cd, s496_cd, splt_cd, text_memo_cd) keep the
+# (filing_id, line_item) slot key for all rows.
+# Use dedup_view_name() to map a base table to its deduped view.
 DEDUP_FACT_TABLES: tuple[str, ...] = (
     "rcpt_cd",
     "expn_cd",
