@@ -1,6 +1,6 @@
 """MCP server entry point for the Campaign Finance Database.
 
-Launches an MCP server with 19 read-only query tools (18 domain tools + a
+Launches an MCP server with 20 read-only query tools (19 domain tools + a
 run_sql escape hatch for edge-case queries).
 Runs on port 9527 (configurable via MCP_PORT env var); serves the Streamable
 HTTP transport at /mcp (point MCP clients at http://<host>:9527/mcp).
@@ -31,6 +31,7 @@ from core.mcp.tools import (
     donor_watch_since,
     filing_due_soon,
     find_committees,
+    fuzzy_name_search,
     get_server_docs,
     measure_spending,
     payments_to_person,
@@ -60,6 +61,7 @@ TOOLS: list[str] = [
     "filing_due_soon",
     "payments_to_person",
     "rapid_expense_vendors",
+    "fuzzy_name_search",
     "total_expenditures",
     "refunds_to_donors",
     "data_freshness",
@@ -353,6 +355,23 @@ def _create_server() -> MCPServer:
             "timestamp, and approximate row counts for the core fact "
             "tables. Call this before quoting 'current' totals so answers "
             "can state how current the snapshot actually is."
+        ),
+    )
+
+    server.add_tool(
+        fuzzy_name_search,
+        name="fuzzy_name_search",
+        description=(
+            "Resolve-first lookup of a person or organization: every "
+            "transaction a name touched, grouped by canonical entity. "
+            "Word-anchored, order-insensitive matching across every stored "
+            "name variant ('Michael Daly' == 'DALY, MICHAEL' == "
+            "'Daly M. Michael'); transactions are deduplicated per "
+            "(cmte_id, tran_id) and totals are grouped by year and entity. "
+            "Call this FIRST for 'who paid whom' / 'what did X pay or get' "
+            "questions — the answer is complete on the first call, no "
+            "variant guessing. entity_type: all|donor|payee|committee|"
+            "candidate."
         ),
     )
 

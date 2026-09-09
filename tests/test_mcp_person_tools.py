@@ -378,8 +378,8 @@ class TestGetServerDocs:
 
 class TestServerRegistration:
     def test_sixteen_tools(self):
-        assert len(TOOLS) == 19  # 16 Phase-1/2 tools + total_expenditures,
-        # refunds_to_donors, data_freshness (caveats-gap fixes)
+        assert len(TOOLS) == 20  # 16 Phase-1/2 tools + total_expenditures,
+        # refunds_to_donors, data_freshness (caveats-gap fixes), fuzzy_name_search
         for t in (
             "payments_to_person",
             "rapid_expense_vendors",

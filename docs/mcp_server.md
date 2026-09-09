@@ -57,6 +57,7 @@ MCP_PORT=9527 python -m core.mcp.server
 | `describe_table` | Columns + gotchas for any table/view, before ad-hoc reasoning | `table_name` |
 | `run_sql` | Ad-hoc read-only SQL (single `SELECT`/`WITH`/`EXPLAIN` statement) for edge cases no dedicated tool covers — guarded: read-only role, 15 s timeout, capped rows | `sql`, `row_limit?` |
 | `find_committees` | Committee ID(s) from a (partial) name | `name`, `limit` |
+| `fuzzy_name_search` | Resolve-first lookup of a person or organization: every transaction the name touched, grouped by canonical entity — whole-word matching, dedup-safe, honest empty when nothing resolves | `name_query`, `start_date?`, `end_date?`, `entity_type?`, `limit?` |
 | `committee_profile` | Name, type, totals (contributions incl. 24-hr, expenditures, cash) | `committee_id`, `as_of_date?` |
 | `contributions_by_donor` | All contributions by a donor in a cycle | `donor_name`, `cycle`, `include_aliases?` |
 | `top_donors_for_committee_or_candidate` | Top N donors to a committee | `committee_id`, `cycle`, `limit?` |
@@ -88,6 +89,11 @@ MCP_PORT=9527 python -m core.mcp.server
   `top_donors_for_committee_or_candidate(..., cycle=2024)`.
 - **"Did committee C's 24-hr reports hide any big vendor spend?"** →
   `rapid_expense_vendors(committee_id=...)`.
+- **"Who paid whom / what did X pay or receive?"** (person or org, not a
+  committee id) → `fuzzy_name_search(name_query="X")` — resolves the name to
+  canonical filer entities first (name + alias tables), then reports their
+  transactions, per-year totals, and top recipients; never guesses a first
+  match.
 
 ## 3. Data conventions (read this before trusting any result)
 
