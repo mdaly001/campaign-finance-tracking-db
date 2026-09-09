@@ -834,9 +834,9 @@ class TestServer:
 
         tools = asyncio.run(server.list_tools())
         # Count is derived from the TOOLS list so it stays correct as tools
-        # are added (19 as of the caveats-gap fixes).
+        # are added (20 as of the fuzzy_name_search addition).
         assert len(tools) == len(TOOLS)
-        assert len(tools) == 19
+        assert len(tools) == 20
 
     def test_tool_names_registered(self, server):
         """All expected tool names should be present."""

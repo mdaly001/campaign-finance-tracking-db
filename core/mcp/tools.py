@@ -2464,3 +2464,381 @@ def run_sql(sql: str, row_limit: int = 200) -> dict[str, Any]:
         }
     except Exception as exc:  # surface SQL errors as data, never as transport errors
         return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+# --------------------------------------------------------------------- #
+#  fuzzy_name_search — resolve-first person/organization lookup        #
+# --------------------------------------------------------------------- #
+
+
+def _name_tokens(name: str) -> list[str]:
+    """Split a free-text person/organization name into uppercase word tokens.
+
+    Tokens are pure alphanumeric words with internal apostrophes preserved, so
+    "O'Brien", "3M", "St. Jude" become whole-word tokens ("O'BRIEN", "3M",
+    "ST", "JUDE"). Each token must match as a whole word (word-boundary regex
+    ``\\m...\\y``), in any order, case- and punctuation-insensitive, so "DALY"
+    matches "DALY, M. QUINN" but never "ODALYS" or "BRENDALYN", and "M."
+    behaves exactly like "M" (trailing punctuation never becomes a regex
+    wildcard).
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9'.&]+", " ", (name or "").upper())
+    return re.findall(r"[A-Z0-9]+(?:'[A-Z0-9]+)*", cleaned)
+
+
+def _all_tokens_sql(col: str, n_tokens: int, prefix: str = "fnq_t") -> str:
+    """SQL predicate requiring every bound token ``:<prefix>0..N-1`` to appear
+    in ``col`` (already UPPER(TRIM(...))-ed) as a whole word, in any order."""
+    return "(" + " AND ".join(f"{col} ~* :{prefix}{i}" for i in range(n_tokens)) + ")"
+
+
+def _quoted_csv(values: list) -> str:
+    """Render text values as an inline SQL IN-list (single quotes escaped)."""
+    return ", ".join("'" + str(v).replace("'", "''") + "'" for v in values)
+
+
+def fuzzy_name_search(
+    name_query: str,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    entity_type: str = "all",
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Resolve-first lookup of a person/organization: every transaction the
+    name touched, grouped by canonical entity.
+
+    This is the tool to call FIRST for any "who paid whom" / "what did X
+    pay/get" question: instead of the caller guessing name variants
+    ("Quinn Delaney" vs "DELANEY, M. QUINN" vs "Daly M. Michael"), the
+    match happens here, once, deterministically: every word of the query
+    must appear as a whole word in the stored name, in any order, case- and
+    punctuation-insensitive — and the result is aggregated by canonical filer
+    entity, not by stored spelling.
+
+    Guarantees (rely on them; do not re-implement in client SQL):
+      - only the deduped query views are queried (``receipts_all`` over the
+        rcpt/s497/s498 dedup views, ``expn_cd_deduped`` keyed by
+        ``(cmte_id, tran_id)``); amends/duplicates cannot double-count, and
+        no base table is ever queried (so a ``tran_id`` collision across
+        committees cannot silently drop rows either),
+      - totals cover ALL matched rows even when ``limit`` caps the detail
+        rows — totals_by_year is never skewed by the cap,
+      - when nothing matches, the answer is an honest empty result with a
+        note; nothing is guessed.
+
+    Args:
+        name_query: Free-text person or org name, any word order
+            ("Daly, Michael", "Michael Daly", "DALY M.").
+        start_date: Optional inclusive lower bound on the transaction date.
+        end_date: Optional inclusive upper bound on the transaction date.
+        entity_type: One of "all" (default), "donor", "payee", "committee",
+            "candidate". Unknown values are treated as "all", so a sloppy
+            client argument never turns into a SQL error.
+        limit: Maximum detail rows to return per source (default 50; totals
+            and entity resolution are never capped by this).
+
+    Returns:
+        dict with: query, entity_type, resolved_via ("entity"|"alias"|"name"|
+        "none"), matched_entities ([{filer_id, xref_id, name, filer_type}]),
+        matches (transaction rows with the reporting committee and the
+        matched name variant), totals_by_year ({year: {in, out, net, n}} over
+        ALL matching rows), top_recipients (when entities resolved),
+        related_names (all known aliases rolled up per resolved entity),
+        and notes (e.g. alias table unavailable).
+    """
+    tokens = _name_tokens(name_query)
+    etype = (entity_type or "all").strip().lower()
+    if etype not in ("all", "donor", "payee", "committee", "candidate"):
+        etype = "all"
+    result: dict[str, Any] = {
+        "query": name_query,
+        "entity_type": etype,
+        "resolved_via": "none",
+        "matched_entities": [],
+        "matches": [],
+        "totals_by_year": {},
+        "top_recipients": [],
+        "related_names": [],
+        "notes": [],
+    }
+    if not tokens:
+        result["notes"].append("empty query — nothing to search")
+        return result
+
+    ntok = len(tokens)
+    try:
+        cap = max(1, int(limit))
+    except (TypeError, ValueError):
+        cap = 50
+
+    params: dict[str, Any] = {f"fnq_t{i}": rf"\m{re.escape(tok)}\y" for i, tok in enumerate(tokens)}
+    dp_r = ""
+    dp_e = ""
+    if start_date is not None:
+        params["fnq_start"] = start_date
+        dp_r += " AND x.receipt_date >= :fnq_start"
+        dp_e += " AND e.expn_date >= :fnq_start"
+    if end_date is not None:
+        params["fnq_end"] = end_date
+        dp_r += " AND x.receipt_date <= :fnq_end"
+        dp_e += " AND e.expn_date <= :fnq_end"
+
+    def _q(sql: str) -> list[dict[str, Any]]:
+        return list(execute_read(sql, params) or [])
+
+    # ---- 1. entity resolution: filername_cd (canonical) then entity_alias --- #
+    filer_expr = (
+        "UPPER(TRIM(COALESCE(f.naml, '') || ' ' || COALESCE(f.namf, '') "
+        "|| ' ' || COALESCE(f.namt, '') || ' ' || COALESCE(f.nams, '')))"
+    )
+    entities: list[dict[str, Any]] = []
+    seen_filer_ids: set = set()
+    name_hits = False
+    try:
+        rows = _q(
+            "SELECT f.filer_id, f.xref_filer_id, f.filer_type, f.naml, "
+            "f.namf, f.namt, f.nams "
+            f"FROM filername_cd f WHERE {_all_tokens_sql(filer_expr, ntok)} "
+            "ORDER BY f.filer_id"
+        )
+        name_hits = bool(rows)
+        for r in rows:
+            if r.get("filer_id") is not None:
+                seen_filer_ids.add(r.get("filer_id"))
+            entities.append(
+                {
+                    "filer_id": r.get("filer_id"),
+                    "xref_id": r.get("xref_filer_id"),
+                    "name": _committee_display(r),
+                    "filer_type": r.get("filer_type"),
+                }
+            )
+    except Exception as exc:
+        result["notes"].append(f"filername resolution unavailable: {type(exc).__name__}")
+
+    alias_rows: list = []
+    try:
+        alias_rows = _q(
+            "SELECT alias_name, source_filer_id FROM entity_alias "
+            f"WHERE {_all_tokens_sql('UPPER(TRIM(alias_name))', ntok)} "
+            f"ORDER BY alias_name LIMIT {cap}"
+        )
+    except Exception as exc:
+        result["notes"].append(
+            f"entity_alias unavailable — name-only matching: {type(exc).__name__}"
+        )
+    alias_filer_ids = sorted({a["source_filer_id"] for a in alias_rows if a.get("source_filer_id")})
+    if alias_filer_ids:
+        try:
+            for r in _q(
+                "SELECT f.filer_id, f.xref_filer_id, f.filer_type, f.naml, f.namf, f.namt, f.nams "
+                f"FROM filername_cd f WHERE f.filer_id IN ({_quoted_csv([str(i) for i in alias_filer_ids])}) "
+                "ORDER BY f.filer_id"
+            ):
+                if r.get("filer_id") in seen_filer_ids:
+                    continue
+                seen_filer_ids.add(r.get("filer_id"))
+                entities.append(
+                    {
+                        "filer_id": r.get("filer_id"),
+                        "xref_id": r.get("xref_filer_id"),
+                        "name": _committee_display(r),
+                        "filer_type": r.get("filer_type"),
+                        "matched_via": "alias",
+                    }
+                )
+        except Exception as exc:
+            result["notes"].append(f"alias filername lookup unavailable: {type(exc).__name__}")
+    if entities:
+        result["resolved_via"] = "entity" if name_hits else "alias"
+        result["matched_entities"] = entities
+        result["related_names"] = [
+            {"filer_id": e["filer_id"], "xref_id": e["xref_id"], "name": e["name"]} for e in entities
+        ]
+
+    # ---- 2. fact queries over the deduped views (never base tables) -------- #
+    donor_expr = "UPPER(TRIM(COALESCE(x.donor_naml, '') || ' ' || COALESCE(x.donor_namf, '')))"
+    payee_expr = "UPPER(TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, '')))"
+    cand_expr = "UPPER(TRIM(COALESCE(e.cand_naml, '') || ' ' || COALESCE(e.cand_namf, '')))"
+
+    match_rows: list[dict[str, Any]] = []
+    totals: dict[int, dict[str, Any]] = {}
+
+    def _accumulate_totals(rows: list, direction: str) -> None:
+        for row in rows:
+            yr = int(row.get("yr"))
+            slot = totals.setdefault(yr, {"in": 0.0, "out": 0.0, "net": 0.0, "n": 0})
+            amount = float(row.get("total") or 0.0)
+            slot[direction] = round(slot[direction] + amount, 2)
+            slot["net"] = round(slot["in"] - slot["out"], 2)
+            slot["n"] += int(row.get("n") or 0)
+
+    if etype in ("all", "donor"):
+        rows = _q(
+            "SELECT 'rcpt' AS tbl, x.src AS source, x.tran_id, x.filing_id, x.amend_id, "
+            "x.receipt_date AS txn_date, x.amount, x.ctrib_dscr AS purpose, NULL::text AS code, "
+            "x.cmte_id, x.donor_name AS name_variant "
+            f"FROM receipts_all x WHERE {_all_tokens_sql(donor_expr, ntok)}{dp_r} "
+            f"ORDER BY x.receipt_date DESC NULLS LAST, x.filing_id LIMIT {cap}"
+        )
+        match_rows.extend(rows)
+        _accumulate_totals(
+            _q(
+                f"SELECT EXTRACT(YEAR FROM x.receipt_date)::int AS yr, "
+                f"COALESCE(SUM(x.amount), 0) AS total, COUNT(*) AS n "
+                f"FROM receipts_all x WHERE {_all_tokens_sql(donor_expr, ntok)}{dp_r} "
+                "GROUP BY 1"
+            ),
+            "in",
+        )
+
+    if etype in ("all", "payee"):
+        rows = _q(
+            "SELECT 'expn' AS tbl, 'expn_cd'::text AS source, e.tran_id, e.filing_id, e.amend_id, "
+            "e.expn_date AS txn_date, e.amount, e.expn_dscr AS purpose, e.expn_code AS code, "
+            "e.cmte_id, TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, '')) AS name_variant "
+            f"FROM expn_cd_deduped e WHERE {_all_tokens_sql(payee_expr, ntok)}{dp_e} "
+            f"ORDER BY e.expn_date DESC NULLS LAST, e.filing_id LIMIT {cap}"
+        )
+        match_rows.extend(rows)
+        _accumulate_totals(
+            _q(
+                f"SELECT EXTRACT(YEAR FROM e.expn_date)::int AS yr, "
+                f"COALESCE(SUM(e.amount), 0) AS total, COUNT(*) AS n "
+                f"FROM expn_cd_deduped e WHERE {_all_tokens_sql(payee_expr, ntok)}{dp_e} "
+                "GROUP BY 1"
+            ),
+            "out",
+        )
+
+    if etype in ("committee", "candidate"):
+        # Both modes answer through the resolved entities (the filers whose
+        # name matches the query); candidate mode additionally answers the
+        # "what was spent on/against the named candidate" questions with the
+        # candidate-named filings filed by the candidate's own committee —
+        # those are exactly the rows NOT in the entity aggregation, so no
+        # row is counted twice.
+        xrefs = sorted({e["xref_id"] for e in entities if e.get("xref_id")})
+        if etype == "committee" and not xrefs:
+            result["notes"].append("query did not resolve to any filer entity; no transactions reported")
+            return result
+        if xrefs:
+            in_sql = f"WHERE x.cmte_id IN ({_quoted_csv(xrefs)}){dp_r}"
+            out_sql = f"WHERE e.cmte_id IN ({_quoted_csv(xrefs)}){dp_e}"
+            rows = _q(
+                "SELECT 'rcpt' AS tbl, x.src AS source, x.tran_id, x.filing_id, x.amend_id, "
+                "x.receipt_date AS txn_date, x.amount, x.ctrib_dscr AS purpose, NULL::text AS code, "
+                f"x.cmte_id, x.donor_name AS name_variant FROM receipts_all x {in_sql} "
+                f"ORDER BY x.receipt_date DESC NULLS LAST, x.filing_id LIMIT {cap}"
+            )
+            match_rows.extend(rows)
+            _accumulate_totals(
+                _q(
+                    f"SELECT EXTRACT(YEAR FROM x.receipt_date)::int AS yr, "
+                    f"COALESCE(SUM(x.amount), 0) AS total, COUNT(*) AS n FROM receipts_all x {in_sql} "
+                    "GROUP BY 1"
+                ),
+                "in",
+            )
+            rows = _q(
+                "SELECT 'expn' AS tbl, 'expn_cd'::text AS source, e.tran_id, e.filing_id, e.amend_id, "
+                "e.expn_date AS txn_date, e.amount, e.expn_dscr AS purpose, e.expn_code AS code, "
+                "e.cmte_id, TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, '')) AS name_variant "
+                f"FROM expn_cd_deduped e {out_sql} "
+                f"ORDER BY e.expn_date DESC NULLS LAST, e.filing_id LIMIT {cap}"
+            )
+            match_rows.extend(rows)
+            _accumulate_totals(
+                _q(
+                    f"SELECT EXTRACT(YEAR FROM e.expn_date)::int AS yr, "
+                    f"COALESCE(SUM(e.amount), 0) AS total, COUNT(*) AS n "
+                    f"FROM expn_cd_deduped e {out_sql} "
+                    "GROUP BY 1"
+                ),
+                "out",
+            )
+            if etype == "candidate":
+                excl = f" AND e.cmte_id NOT IN ({_quoted_csv(xrefs)})"
+                rows = _q(
+                    "SELECT 'expn' AS tbl, 'expn_cd'::text AS source, e.tran_id, e.filing_id, e.amend_id, "
+                    "e.expn_date AS txn_date, e.amount, e.expn_dscr AS purpose, e.expn_code AS code, "
+                    "e.cmte_id, e.cand_naml || ' ' || COALESCE(e.cand_namf, '') AS name_variant "
+                    f"FROM expn_cd_deduped e WHERE {_all_tokens_sql(cand_expr, ntok)}{dp_e}{excl} "
+                    f"ORDER BY e.expn_date DESC NULLS LAST, e.filing_id LIMIT {cap}"
+                )
+                match_rows.extend(rows)
+                _accumulate_totals(
+                    _q(
+                        f"SELECT EXTRACT(YEAR FROM e.expn_date)::int AS yr, "
+                        f"COALESCE(SUM(e.amount), 0) AS total, COUNT(*) AS n "
+                        f"FROM expn_cd_deduped e WHERE {_all_tokens_sql(cand_expr, ntok)}{dp_e}{excl} "
+                        "GROUP BY 1"
+                    ),
+                    "out",
+                )
+            top = _q(
+                "SELECT TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, '')) AS recipient, "
+                f"SUM(e.amount) AS amount, COUNT(*) AS payments FROM expn_cd_deduped e {out_sql} "
+                f"GROUP BY 1 ORDER BY SUM(e.amount) DESC NULLS LAST LIMIT {min(cap, 10)}"
+            )
+            result["top_recipients"] = [
+                {"recipient": r.get("recipient"), "amount": _money(r.get("amount")), "payments": r.get("payments")}
+                for r in top
+            ]
+    elif etype in ("all", "payee"):
+        xrefs = sorted({e["xref_id"] for e in entities if e.get("xref_id")})
+        if xrefs:
+            top = _q(
+                "SELECT TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, '')) AS recipient, "
+                f"SUM(e.amount) AS amount, COUNT(*) AS payments FROM expn_cd_deduped e "
+                f"WHERE e.cmte_id IN ({_quoted_csv(xrefs)}){dp_e} "
+                f"GROUP BY 1 ORDER BY SUM(e.amount) DESC NULLS LAST LIMIT {min(cap, 10)}"
+            )
+            result["top_recipients"] = [
+                {
+                    "recipient": r.get("recipient"),
+                    "amount": _money(r.get("amount")),
+                    "payments": r.get("payments"),
+                }
+                for r in top
+            ]
+
+    # ---- 4. assemble: committee names resolved in ONE batch query ----------- #
+    cmte_ids = sorted({r.get("cmte_id") for r in match_rows if r.get("cmte_id")})
+    name_by_cmte: dict[str, str] = {}
+    if cmte_ids:
+        try:
+            for r in _q(
+                "SELECT DISTINCT ON (x.xref_id) x.xref_id, n.naml, n.namf, n.namt, n.nams "
+                "FROM filer_xref_cd x "
+                "JOIN filername_cd n ON n.filer_id = x.filer_id "
+                f"WHERE x.xref_id IN ({_quoted_csv(cmte_ids)}) "
+                "ORDER BY x.xref_id, x.effect_dt DESC NULLS LAST"
+            ):
+                name_by_cmte[str(r.get("xref_id"))] = _committee_display(r)
+        except Exception as exc:
+            result["notes"].append(f"committee name resolution unavailable: {type(exc).__name__}")
+
+    match_rows.sort(key=lambda r: (r.get("txn_date") is None, str(r.get("txn_date") or "")), reverse=True)
+
+    result["matches"] = [
+        {
+            "table": r.get("tbl"),
+            "source": r.get("source"),
+            "transaction_id": r.get("tran_id"),
+            "filing_id": r.get("filing_id"),
+            "amend_id": r.get("amend_id"),
+            "date": _dtos(r.get("txn_date")),
+            "amount": _money(r.get("amount")),
+            "purpose": r.get("purpose"),
+            "code": r.get("code"),
+            "cmte_id": r.get("cmte_id"),
+            "committee_name": name_by_cmte.get(str(r.get("cmte_id"))) or (r.get("cmte_id") or ""),
+            "matched_name": (r.get("name_variant") or "").strip(),
+        }
+        for r in match_rows[: cap + 10]
+    ]
+    result["totals_by_year"] = {str(y): totals[y] for y in sorted(totals)}
+    if not entities and not alias_rows and match_rows:
+        result["resolved_via"] = "name"
+    return result
