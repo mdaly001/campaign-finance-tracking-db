@@ -16,7 +16,6 @@ import argparse
 import asyncio
 import logging
 import os
-import sys
 
 from mcp.server import MCPServer  # type: ignore[import-untyped]
 

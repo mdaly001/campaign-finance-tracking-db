@@ -30,6 +30,7 @@ from sqlalchemy import create_engine
 
 from core.etl.adapter import SourceAdapter, SourceFileInfo
 from core.etl.checkpoint import LoadCheckpoint
+from core.etl.committee_id import refresh_committee_views
 from core.etl.loader import LoadConfig, TableLoader
 from core.etl.logging import setup_logging
 from state.adapter import LocalSourceAdapter, StateSourceAdapter
@@ -777,6 +778,7 @@ def main() -> None:
         )
         result = runner.run(tables_only=args.tables)
         _print_summary(result)
+        _refresh_committee_views(database_url)
         sys.exit(1 if result.total_rows_failed > 0 else 0)
 
     elif args.command == "incremental":
@@ -788,6 +790,7 @@ def main() -> None:
         )
         result = runner.run(tables_only=args.tables)
         _print_incremental_summary(result)
+        _refresh_committee_views(database_url)
         failed = sum(
             1 for d in (result.details or []) if d.get("status") == "failed"
         )
@@ -802,7 +805,31 @@ def main() -> None:
         )
         result = runner.run()
         _print_summary(result)
+        _refresh_committee_views(database_url)
         sys.exit(1 if result.total_rows_failed > 0 else 0)
+
+
+def _refresh_committee_views(database_url: str) -> None:
+    """Refresh the committee-id materialized views after a load.
+
+    WHY: migration 0020 creates receipts_all / expn_all / filing_filer as
+    MATERIALIZED VIEWS. On a fresh install the migration runs BEFORE the data
+    load, so those views are empty until refreshed here. They must be refreshed
+    after every load (full/incremental/resume) or the recipient-based MCP tools
+    return nothing. A refresh failure is logged loudly but does not change the
+    load's own exit code — the load result is what the caller is checking.
+    """
+    try:
+        engine = create_engine(database_url)
+        refresh_committee_views(engine)
+        engine.dispose()
+    except Exception as exc:  # noqa: BLE001 - surface but don't mask load result
+        logger.error(
+            "Committee-id view refresh FAILED — recipient-based tools will be "
+            "stale/empty until it succeeds. Re-run: python -m core.etl."
+            "committee_id (or re-run the load). Error: %s",
+            exc,
+        )
 
 
 def _print_summary(result: FullLoadResult) -> None:
