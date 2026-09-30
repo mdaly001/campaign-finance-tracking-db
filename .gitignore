@@ -24,6 +24,12 @@ __pycache__/
 *.tsv
 *.zip
 *.db
+*.psv
+
+# Runtime logs and bulk-load artifacts (NOT part of the app — some are GBs)
+*.log
+fec_cache/
+federal/cache/
 
 # Node modules (for any frontend tooling)
 node_modules/

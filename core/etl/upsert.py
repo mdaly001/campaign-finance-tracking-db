@@ -92,6 +92,13 @@ def _execute_batch(
     col_list = ", ".join(f'"{c}"' for c in columns)
     rows_written = 0
 
+    # Handle schema-qualified table names
+    if "." in table:
+        schema, tbl = table.split(".", 1)
+        table_ref = f'"{schema}"."{tbl}"'
+    else:
+        table_ref = f'"{table}"'
+
     for start in range(0, len(batch), _ROWS_PER_STATEMENT):
         chunk = batch[start : start + _ROWS_PER_STATEMENT]
         tuples: list[str] = []
@@ -104,7 +111,7 @@ def _execute_batch(
                 col_params.append(f":{param_name}")
             tuples.append("(" + ", ".join(col_params) + ")")
 
-        sql = f'INSERT INTO "{table}" ({col_list}) VALUES ' + ", ".join(tuples)
+        sql = f'INSERT INTO {table_ref} ({col_list}) VALUES ' + ", ".join(tuples)
         if suffix:
             sql += " " + suffix
         conn.execute(text(sql), params)

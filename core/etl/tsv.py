@@ -28,6 +28,7 @@ class TSVReader:
         has_header: bool = True,
         empty_to_none: bool = True,
         coercion_hints: dict[str, type] | None = None,
+        delimiter: str = "\t",
     ):
         """
         Args:
@@ -35,10 +36,12 @@ class TSVReader:
             empty_to_none: If True, replace empty strings with None.
             coercion_hints: Optional dict mapping column names to desired
                 Python types (int, float, str, bool, date).
+            delimiter: Field delimiter character (default: tab for TSV).
         """
         self.has_header = has_header
         self.empty_to_none = empty_to_none
         self.coercion_hints = coercion_hints or {}
+        self.delimiter = delimiter
 
     # -- streaming API (memory-safe) ---------------------------------------- #
 
@@ -79,7 +82,7 @@ class TSVReader:
             if not line.strip():
                 continue
 
-            fields = line.split("\t")
+            fields = line.split(self.delimiter)
 
             if fieldnames is None:
                 if self.has_header:
@@ -96,7 +99,7 @@ class TSVReader:
             # Ragged-row handling identical to the historical behaviour:
             # excess fields merge into the final column, short rows pad.
             if len(fields) > n_cols:
-                fields = fields[: n_cols - 1] + ["\t".join(fields[n_cols - 1 :])]
+                fields = fields[: n_cols - 1] + [self.delimiter.join(fields[n_cols - 1 :])]
             elif len(fields) < n_cols:
                 fields = fields + [None] * (n_cols - len(fields))
 

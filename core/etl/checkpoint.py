@@ -92,7 +92,7 @@ class LoadCheckpoint:
 
     # -- queries ----------------------------------------------------------- #
 
-    def get_checkpoint(self, table_name: str, file_hash: str) -> str | None:
+    def get_checkpoint(self, table_name: str, file_hash: str, source: str | None = None) -> str | None:
         """Return last_processed_date for a loaded file, or None.
 
         Compares ``table_name`` case-insensitively (the loader stores the
@@ -102,17 +102,24 @@ class LoadCheckpoint:
         Args:
             table_name: Target table name (case-insensitive).
             file_hash: SHA-256 hex digest of the source file.
+            source: Optional source filter (e.g., "fec" or "calaccess").
         """
-        stmt = text(
-            "SELECT processed_date FROM load_checkpoint "
-            "WHERE LOWER(table_name) = LOWER(:table_name) AND file_hash = :file_hash "
-            "ORDER BY checkpoint_id DESC LIMIT 1"
-        )
+        if source is not None:
+            stmt = text(
+                "SELECT processed_date FROM load_checkpoint "
+                "WHERE LOWER(table_name) = LOWER(:table_name) AND file_hash = :file_hash "
+                "AND source = :source ORDER BY checkpoint_id DESC LIMIT 1"
+            )
+            params = {"table_name": table_name, "file_hash": file_hash, "source": source}
+        else:
+            stmt = text(
+                "SELECT processed_date FROM load_checkpoint "
+                "WHERE LOWER(table_name) = LOWER(:table_name) AND file_hash = :file_hash "
+                "ORDER BY checkpoint_id DESC LIMIT 1"
+            )
+            params = {"table_name": table_name, "file_hash": file_hash}
         with self._conn.begin() as conn:
-            row = conn.execute(
-                stmt,
-                {"table_name": table_name, "file_hash": file_hash},
-            ).fetchone()
+            row = conn.execute(stmt, params).fetchone()
             return row[0] if row else None
 
     def get_unchecked_tables(self, file_hash: str) -> list[str]:
@@ -152,6 +159,24 @@ class LoadCheckpoint:
             ).fetchone()
             return row[0] if row and row[0] else None
 
-    def is_loaded(self, table_name: str, file_hash: str) -> bool:
-        """Return True if the file has already been loaded for this table."""
-        return self.get_checkpoint(table_name, file_hash) is not None
+    def is_loaded(self, table_name: str, file_hash: str, source: str | None = None) -> bool:
+        """Return True if the file has already been loaded for this table with rows processed."""
+        if source is not None:
+            stmt = text(
+                "SELECT rows_processed FROM load_checkpoint "
+                "WHERE LOWER(table_name) = LOWER(:table_name) AND file_hash = :file_hash "
+                "AND source = :source ORDER BY checkpoint_id DESC LIMIT 1"
+            )
+            params = {"table_name": table_name, "file_hash": file_hash, "source": source}
+        else:
+            stmt = text(
+                "SELECT rows_processed FROM load_checkpoint "
+                "WHERE LOWER(table_name) = LOWER(:table_name) AND file_hash = :file_hash "
+                "ORDER BY checkpoint_id DESC LIMIT 1"
+            )
+            params = {"table_name": table_name, "file_hash": file_hash}
+        with self._conn.begin() as conn:
+            row = conn.execute(stmt, params).fetchone()
+            if row is None or row[0] is None:
+                return False
+            return row[0] > 0
