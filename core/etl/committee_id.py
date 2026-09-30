@@ -26,8 +26,9 @@ they must see the freshly refreshed mapping.
 from __future__ import annotations
 
 import logging
+import os
 
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine, create_engine, text
 
 logger = logging.getLogger(__name__)
 
@@ -51,3 +52,23 @@ def refresh_committee_views(engine: Engine, *, concurrent: bool = True) -> None:
         with engine.begin() as conn:
             conn.execute(text(f"{verb} {name}"))
     logger.info("Committee-id views refreshed.")
+
+
+def _main() -> None:
+    """Standalone entry: refresh the committee-id views from DATABASE_URL.
+
+    Useful after a manual data change or if a load's refresh step failed:
+        python -m core.etl.committee_id
+    Reads DATABASE_URL (falls back to the same env the MCP server uses).
+    """
+    logging.basicConfig(level=logging.INFO)
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise SystemExit("DATABASE_URL is not set")
+    engine = create_engine(url)
+    refresh_committee_views(engine)
+    engine.dispose()
+
+
+if __name__ == "__main__":
+    _main()

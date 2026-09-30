@@ -273,7 +273,8 @@ def entity_expenditures(
         dedup24 = (
             f"SELECT target, side, amount FROM ("
             f"  SELECT DISTINCT ON (committee_id, transaction_id) "
-            f"  coalesce(nullif(candidate_name,''),'(2024 load: candidate not captured)') AS target, "
+            f"  coalesce(nullif(candidate_name,''),"
+            f"'(2024 load: candidate not captured)') AS target, "
             f"  CASE supported_opposed WHEN 'S' THEN 'for' WHEN 'O' THEN 'against' "
             f"  ELSE 'unknown' END AS side, expenditure_amount AS amount "
             f"  FROM fec.fec_independent_expenditures "
