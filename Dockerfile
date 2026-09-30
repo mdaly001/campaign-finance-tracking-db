@@ -21,6 +21,7 @@ RUN uv sync --frozen --no-dev
 COPY --chown=appuser:appuser config/ ./config/
 COPY --chown=appuser:appuser core/ ./core/
 COPY --chown=appuser:appuser state/ ./state/
+COPY --chown=appuser:appuser federal/ ./federal/
 COPY --chown=appuser:appuser migrations/ ./migrations/
 COPY --chown=appuser:appuser scripts/ ./scripts/
 

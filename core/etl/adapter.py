@@ -15,12 +15,14 @@ class SourceFileInfo:
         url: Download URL for the file
         checksum: Expected SHA-256 hex digest (None if unknown)
         size: File size in bytes (optional, set after download)
+        zip_member: If the file is inside a zip, the member name to extract
     """
 
     name: str
     url: str
     checksum: str | None = None
     size: int = 0
+    zip_member: str | None = None
 
 
 @dataclass

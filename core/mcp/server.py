@@ -21,6 +21,19 @@ import sys
 from mcp.server import MCPServer  # type: ignore[import-untyped]
 
 from core.etl.logging import setup_logging
+from core.mcp.entity_tools import (
+    entity_contributions,
+    entity_expenditures,
+    returned_contributions,
+)
+from core.mcp.federal_tools import (
+    fec_find_candidate,
+    fec_ie_by_org,
+    fec_ie_summary,
+    fec_race_overview,
+    fec_spender_breakdown,
+    fec_top_spending,
+)
 from core.mcp.tools import (
     committee_outlays_to,
     committee_profile,
@@ -68,6 +81,17 @@ TOOLS: list[str] = [
     "describe_table",
     "run_sql",
     "get_server_docs",
+    # Federal (FEC) independent-expenditure tools
+    "fec_find_candidate",
+    "fec_ie_summary",
+    "fec_top_spending",
+    "fec_spender_breakdown",
+    "fec_race_overview",
+    "fec_ie_by_org",
+    # Cross-source (state + federal) entity money tools
+    "entity_contributions",
+    "entity_expenditures",
+    "returned_contributions",
 ]
 
 # Delivered to the client in the MCP initialize response so a freshly
@@ -99,6 +123,42 @@ Essentials:
   "current" totals — it reports the newest receipt/expenditure dates,
   the last ETL load, and how many future-dated corrupt rows it excludes
   from the freshness figure (the caveats' data-hygiene quirk).
+
+FEDERAL (FEC) — candidate-targeted independent expenditures (Schedule E):
+- Federal IE tools are prefixed fec_. They read the de-duplicated,
+  name-resolved view fec.fec_ie_targeted_resolved, which collapses the F24
+  48-hour-notice / F3X periodic-report double-count AND cross-filing
+  re-filings, and folds NULL-id records into their named candidate. NEVER sum
+  the raw fec.fec_ie_targeted table for a total.
+- fec_find_candidate(name, state, district, cycle) resolves a name to a FEC
+  candidate_id (substring OR fuzzy trigram; each hit has a `match` score).
+- fec_ie_summary(candidate_id, cycle, start_date, end_date) gives
+  for/against totals (start inclusive, end exclusive).
+- fec_top_spending(candidate_id, side='against'|'for', cycle, limit) ranks
+  spenders; fec_spender_breakdown(spender_id, ...) shows what they bought
+  (payee / purpose / target); fec_race_overview(state, district, cycle)
+  gives the whole for/against picture across a race.
+- fec_ie_by_org(state, district, cycle, election_type, min_amount) lists
+  every (org -> candidate -> side) combination above a threshold, one row
+  each — so a committee that spent for one candidate and against another
+  shows as two rows, with a human `purpose` string.
+- cycle is the FEC two-year PERIOD (e.g. 2026); it does NOT pick the
+  election. Pass election_type='primary'|'general'|'special'|'runoff'|
+  'convention'|'other' (or a P/G/R/S/C/O code) to isolate one election
+  within the cycle. Omit cycle to span all loaded cycles.
+
+CROSS-SOURCE (state + federal) — one entity, both registries:
+- entity_contributions(entity, year, min_amount) = who gave TO an entity,
+  and entity_expenditures(entity, year, min_amount) = what it spent, each
+  looking at BOTH the California (CAL-ACCESS) and federal (FEC) systems.
+  The entity is resolved by NAME across both registries (it may be filed in
+  one, the other, or both). Use these when you don't know where an org files,
+  or want its whole money picture in one call. `total`/`by_source`/`by_year`
+  are full totals; the contributors/expenditures lists are the top-N view.
+- returned_contributions(entity, year, min_amount) = the money the entity gave
+  BACK to donors. Refunds live OUTSIDE the contribution ledger (state: Schedule
+  E refund/return expenditures; federal: negative contributions), so this is
+  how you reconcile what a committee actually kept vs. what it received.
 """
 
 
@@ -117,10 +177,12 @@ def _create_server() -> MCPServer:
         name="cfdb",
         title="Campaign Finance Database",
         description=(
-            "Read-only query tools for California campaign finance "
-            "disclosure data (CAL-ACCESS): contributions, expenditures, "
-            "committees, people, filing deadlines, and 24-hour-report "
-            "vendor resolution."
+            "Read-only query tools for campaign finance disclosure data: "
+            "California (CAL-ACCESS) contributions, expenditures, committees, "
+            "people, filing deadlines and 24-hour-report vendor resolution, "
+            "PLUS federal (FEC) candidate-targeted independent expenditures "
+            "(Schedule E) — for/against totals, top spenders, and "
+            "spender/race breakdowns, all de-duplicated."
         ),
         instructions=INSTRUCTIONS,
     )
@@ -372,6 +434,106 @@ def _create_server() -> MCPServer:
             "questions — the answer is complete on the first call, no "
             "variant guessing. entity_type: all|donor|payee|committee|"
             "candidate."
+        ),
+    )
+
+    # ---- Federal (FEC) independent-expenditure tools ---- #
+    server.add_tool(
+        fec_find_candidate,
+        name="fec_find_candidate",
+        description=(
+            "Resolve a federal candidate name to FEC candidate id(s) from "
+            "Schedule E records. Optional state/district/cycle filters. Use "
+            "the returned candidate_id in the other fec_* tools."
+        ),
+    )
+    server.add_tool(
+        fec_ie_summary,
+        name="fec_ie_summary",
+        description=(
+            "De-duplicated for/against independent-expenditure totals for a "
+            "federal candidate. Optional date window (start inclusive, end "
+            "exclusive, ISO YYYY-MM-DD) and cycle. Answers 'how much was "
+            "spent for and against candidate X' without double-counting."
+        ),
+    )
+    server.add_tool(
+        fec_top_spending,
+        name="fec_top_spending",
+        description=(
+            "Top N committees spending for or against a federal candidate "
+            "(de-duplicated). side='against' (default) or 'for'."
+        ),
+    )
+    server.add_tool(
+        fec_spender_breakdown,
+        name="fec_spender_breakdown",
+        description=(
+            "What a given federal spending committee bought, de-duplicated: "
+            "by payee, by purpose (ad buy vs production vs other), and by "
+            "target candidate. Optionally scope to one candidate/cycle."
+        ),
+    )
+    server.add_tool(
+        fec_race_overview,
+        name="fec_race_overview",
+        description=(
+            "All federal independent expenditures in a state/district race, "
+            "grouped by candidate and for/against side (de-duplicated). "
+            "Gives the whole race's for/against picture at once."
+        ),
+    )
+    server.add_tool(
+        fec_ie_by_org,
+        name="fec_ie_by_org",
+        description=(
+            "Every (org -> candidate -> side) independent-expenditure "
+            "combination above a threshold in a race, one row each. Shows how "
+            "much a committee spent and whether it was in support of or in "
+            "opposition to a specific candidate. A committee that spent for one "
+            "candidate and against another appears as two separate rows. "
+            "De-duplicated and name-resolved. Filter by election phase "
+            "(primary/general/special) and min_amount."
+        ),
+    )
+    server.add_tool(
+        entity_contributions,
+        name="entity_contributions",
+        description=(
+            "Who gave TO an entity (money IN), across BOTH California "
+            "(CAL-ACCESS) and federal (FEC) filings. Resolves the entity by "
+            "name in both registries (it may exist in one, the other, or both) "
+            "and returns full totals plus the top contributors. Optional year "
+            "(calendar year, or all) and min_amount (only contributors whose "
+            "aggregated total meets it). Use to see an org's funding base in "
+            "one call regardless of where it files."
+        ),
+    )
+    server.add_tool(
+        entity_expenditures,
+        name="entity_expenditures",
+        description=(
+            "What an entity spent (money OUT), across BOTH California "
+            "(CAL-ACCESS) and federal (FEC) filings. Resolves the entity by "
+            "name in both registries and returns full totals plus the top "
+            "spending targets (federal IEs by candidate+side; state by "
+            "payee/purpose). Optional year and min_amount. Federal 2026 is the "
+            "de-duplicated targeted view; 2024 is the full load deduped by "
+            "transaction_id (candidate targeting not captured in that load)."
+        ),
+    )
+    server.add_tool(
+        returned_contributions,
+        name="returned_contributions",
+        description=(
+            "Contributions an entity RETURNED / REFUNDED to donors, across BOTH "
+            "California and federal filings. A refund is not on the contribution "
+            "side: state refunds are Schedule E expenditures whose purpose is a "
+            "contribution refund/return (recipient = payee); federal refunds are "
+            "negative contributions (reported as a positive refund magnitude). "
+            "Use to reconcile what a committee actually kept vs. received, and "
+            "to find committees that return a lot of money. Optional year and "
+            "min_amount (threshold on the refund to each recipient)."
         ),
     )
 

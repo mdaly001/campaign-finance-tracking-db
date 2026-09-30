@@ -83,6 +83,7 @@ _DT_FORMATS = (
     "%Y-%m-%dT%H:%M:%S",      # ISO T-separated
     "%m/%d/%Y",               # 1/27/2000 (CAL-ACCESS date)
     "%Y-%m-%d",               # ISO date
+    "%m%d%Y",                 # 01272000 (FEC MMDDYYYY)
 )
 
 
@@ -113,6 +114,8 @@ class LoadConfig:
     required_columns: list[str] | None = None  # columns that must be present
     skip_columns: list[str] | None = None  # columns to exclude from load
     row_filter: Callable[[dict], bool] | None = None  # function to filter rows
+    source: str = "calaccess"  # data source tag for checkpointing
+    cycle: int | None = None  # FEC election cycle (for partition key injection)
 
 
 class TableLoader:
@@ -128,18 +131,19 @@ class TableLoader:
     - Progress logging per batch
     """
 
-    def __init__(self, engine: Engine, batch_size: int = 1000):
+    def __init__(self, engine: Engine, batch_size: int = 1000, reader: TSVReader | None = None):
         """Initialize with a SQLAlchemy engine.
 
         Args:
             engine: SQLAlchemy engine for Postgres (or SQLite for tests).
             batch_size: Number of rows per batch upsert.
+            reader: Optional custom TSVReader for non-standard formats.
         """
         self.engine = engine
         self.batch_size = batch_size
         self.checkpoint = LoadCheckpoint(engine)
         self.dead_letter = DeadLetter(engine)
-        self.reader = TSVReader(has_header=True, empty_to_none=True)
+        self.reader = reader or TSVReader(has_header=True, empty_to_none=True)
 
     def _coerce_types(
         self, record: dict, coercions: dict[str, str] | None
@@ -234,16 +238,13 @@ class TableLoader:
 
         summary = LoadSummary()
 
-        # Checkpoint: has this file already been loaded?
+        # Checkpoint: has this file already been loaded with rows processed?
         file_hash = self._compute_hash(raw_bytes)
-        checkpoint_date = self.checkpoint.get_checkpoint(config.table_name, file_hash)
-
-        if checkpoint_date:
+        if self.checkpoint.is_loaded(config.table_name, file_hash, source=config.source):
             logger.info(
-                "Skipping %s (already loaded for file hash %s, checkpoint: %s)",
+                "Skipping %s (already loaded for file hash %s)",
                 config.table_name,
                 file_hash[:12],
-                checkpoint_date,
             )
             # Cheap row count — avoid re-parsing a large file just to count.
             summary.rows_skipped = max(raw_bytes.count(b"\n") - 1, 0)
@@ -290,9 +291,15 @@ class TableLoader:
             # Type coercion
             record = self._coerce_types(record, config.type_coercions)
 
+            # Inject cycle value for partitioned fact tables (FEC)
+            if config.cycle is not None and "two_year_transaction_period" not in record:
+                record["two_year_transaction_period"] = config.cycle
+
             # Validate
             if not self._validate_row(record, config):
                 summary.rows_skipped += 1
+                if summary.rows_skipped <= 5:
+                    print(f"DEBUG SKIP {config.table_name}: committee_id={record.get('committee_id')!r}, transaction_id={record.get('transaction_id')!r}, keys={list(record.keys())[:10]}")
                 record = next(stream, None)
                 continue
 
@@ -326,6 +333,10 @@ class TableLoader:
                 config.table_name,
                 file_hash,
                 datetime.now(UTC).isoformat(),
+                source=config.source,
+                source_file=config.tsv_files[0] if config.tsv_files else None,
+                rows_processed=summary.rows_upserted,
+                notes="loaded",
             )
 
         logger.info(
@@ -356,6 +367,30 @@ class TableLoader:
             batch: Records to upsert.
             summary: Accumulates counts (rows_failed updated on error).
         """
+        # De-duplicate within the batch by conflict key before the multi-row
+        # upsert. A single INSERT ... ON CONFLICT DO UPDATE cannot update the
+        # same target row twice in one statement (CardinalityViolation), which
+        # happens when the source file repeats a conflict key inside one batch
+        # (e.g. FEC itoth transfer rows sharing a transaction_id). Keeping the
+        # LAST occurrence per key reproduces the last-write-wins result of the
+        # row-by-row retry path, but in one fast statement instead of N
+        # single-row transactions.
+        if config.conflict_columns and len(batch) > 1:
+            deduped: dict[tuple, dict] = {}
+            for record in batch:
+                key = tuple(record.get(c) for c in config.conflict_columns)
+                deduped[key] = record
+            if len(deduped) < len(batch):
+                logger.info(
+                    "Deduplicated %d intra-batch conflict-key rows for %s "
+                    "(%d -> %d)",
+                    len(batch) - len(deduped),
+                    config.table_name,
+                    len(batch),
+                    len(deduped),
+                )
+                batch = list(deduped.values())
+
         try:
             with self.engine.begin() as conn:
                 upserted = upsert_records(
