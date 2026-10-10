@@ -67,10 +67,43 @@ class StateSourceAdapter(SourceAdapter):
                 access (ignoring any on-disk cache).
         """
         self.cache_dir = cache_dir or STATE_CACHE_DIR
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_writable_cache_dir(self.cache_dir)
         self.reader = TSVReader(has_header=True, empty_to_none=True)
         self.force_refresh = refresh
         self._cached_file: StateDownload | None = None
+
+    @staticmethod
+    def _ensure_writable_cache_dir(cache_dir: Path) -> None:
+        """Fail fast, with a fix, when the cache directory is not writable.
+
+        A bind-mounted cache directory keeps the HOST's ownership, which
+        overrides the ``chown`` the Dockerfile performs on
+        ``/app/state/cache``. The container runs as an unprivileged user,
+        so ``mkdir(exist_ok=True)`` succeeds (the directory already
+        exists) and the run then dies much later — after any checkpoint
+        work — with a bare ``PermissionError: [Errno 13] ...
+        /app/state/cache/dbwebexport.zip`` that names nothing actionable.
+
+        Probing here turns that into an immediate, self-explanatory error.
+        """
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            probe = cache_dir / ".write_probe"
+            probe.write_bytes(b"")
+            probe.unlink()
+        except PermissionError as exc:
+            raise PermissionError(
+                f"Cache directory {cache_dir} is not writable by uid "
+                f"{os.getuid()} (the user this container runs as). A "
+                "bind-mounted directory keeps the host's ownership and "
+                "overrides the image's chown. Fix one of:\n"
+                f"  1. chown the host directory to the container uid: "
+                f"sudo chown -R {os.getuid()}:{os.getgid()} <host cache path>\n"
+                "  2. use a named Docker volume instead of a bind mount "
+                "(Docker initialises ownership for the image user), or\n"
+                "  3. set STATE_CACHE_DIR to a path this user can write.\n"
+                "See https://github.com/mdaly001/campaign-finance-tracking-db/issues/10"
+            ) from exc
 
     # -- cache helpers ----------------------------------------------------- #
 
