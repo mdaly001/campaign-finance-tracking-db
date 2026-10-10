@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -380,3 +381,52 @@ def test_state_download_dataclass(cache_dir: Path) -> None:
     assert sd.checksum == "abc"
     assert sd.size_bytes == 1024
     assert sd.last_modified == "Mon, 01 Jan 2024 00:00:00 GMT"
+
+
+# -- Issue #10: bind-mounted cache directory ownership --------------------- #
+
+
+class TestCacheDirectoryWritability:
+    """A bind-mounted cache dir keeps the host's ownership and overrides the
+    image's chown, so the ETL must detect an unwritable dir at startup
+    instead of dying later with a bare PermissionError on the zip file."""
+
+    def test_creates_missing_cache_dir(self, tmp_path: Path) -> None:
+        target = tmp_path / "fresh" / "cache"
+        StateSourceAdapter(cache_dir=target)
+        assert target.is_dir()
+
+    def test_writable_dir_probes_clean(self, cache_dir: Path) -> None:
+        StateSourceAdapter(cache_dir=cache_dir)
+        # The write probe must not be left behind.
+        assert not (cache_dir / ".write_probe").exists()
+
+    def test_unwritable_dir_raises_actionable_error(self, tmp_path: Path) -> None:
+        if os.geteuid() == 0:
+            pytest.skip("root bypasses directory permission bits")
+        locked = tmp_path / "locked_cache"
+        locked.mkdir()
+        locked.chmod(0o555)  # r-x for the ETL user: exists but not writable
+        try:
+            with pytest.raises(PermissionError) as excinfo:
+                StateSourceAdapter(cache_dir=locked)
+        finally:
+            locked.chmod(0o755)
+        msg = str(excinfo.value)
+        # The message must name the remediation, not just the errno.
+        assert "not writable" in msg
+        assert "bind" in msg.lower()
+        assert "STATE_CACHE_DIR" in msg
+
+    def test_error_names_the_container_uid(self, tmp_path: Path) -> None:
+        if os.geteuid() == 0:
+            pytest.skip("root bypasses directory permission bits")
+        locked = tmp_path / "locked_cache2"
+        locked.mkdir()
+        locked.chmod(0o555)
+        try:
+            with pytest.raises(PermissionError) as excinfo:
+                StateSourceAdapter(cache_dir=locked)
+        finally:
+            locked.chmod(0o755)
+        assert str(os.getuid()) in str(excinfo.value)
