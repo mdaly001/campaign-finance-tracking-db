@@ -1,0 +1,100 @@
+# ============================================================================
+# CFDB TESTING ENVIRONMENT — isolated from the Prod stack.
+#
+# This file is the ONLY thing we run during development. It shares no
+# containers, no volumes, no network and no ports with the Prod deployment
+# (project `prod`, containers cfdb-db / cfdb-mcp on :9527).
+#
+#   bring up:      ./scripts/testing_env.sh up
+#   status:        ./scripts/testing_env.sh status
+#   tear down:     ./scripts/testing_env.sh down
+#   run tests:     ./scripts/testing_env.sh test
+#
+# Ports (host, loopback-only):
+#   MCP server   127.0.0.1:9528   (Prod is 9527)
+#   Postgres     127.0.0.1:5433   (Prod's db is not published to the host)
+#
+# Image tag is `cfdb-app:testing` so a local build never overwrites the
+# `cfdb-app:latest` that Prod runs.
+#
+# The database under ./dbdata is a one-time copy (pg_basebackup) of the Prod
+# cluster. After the copy the testing stack is authoritative for itself:
+# nothing here ever writes back to Prod.
+# ============================================================================
+
+name: cfdbtest
+
+services:
+  db:
+    image: postgres:16
+    container_name: cfdbtest-db
+    # Started as root so the image entrypoint can chown the copied cluster to
+    # its `postgres` user and then drop privileges via gosu (identical to the
+    # Prod pattern). Running the container as the host UID instead fails the
+    # entrypoint's ownership check.
+    environment:
+      POSTGRES_USER: cfdb
+      POSTGRES_PASSWORD: ${TEST_DB_PASSWORD:-cfdb_testing_only}
+      POSTGRES_DB: cfdb
+      TZ: America/Los_Angeles
+    ports:
+      - "127.0.0.1:${TEST_DB_PORT:-5433}:5432"
+    volumes:
+      # NOTE: `../dbdata` — the copied cluster lives OUTSIDE the git repo
+      # (Testing/dbdata), while this compose file is at Testing/cfdb/.
+      - ../dbdata:/var/lib/postgresql/data
+    # The default 64 MB /dev/shm is too small: parallel hash joins over the
+    # 12M+ row expenditure views fail with
+    #   psycopg2.errors.DiskFull: could not resize shared memory segment
+    # This is a container-shm limit, not a disk-space problem.
+    shm_size: 2gb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cfdb -d cfdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  mcp:
+    image: cfdb-app:${TEST_IMAGE_TAG:-testing}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cfdbtest-mcp
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${TEST_MCP_PORT:-9528}:9527"
+    environment:
+      # Read-only role, same as Prod. The role + password are created by
+      # migrations/0001 and carried into the copied cluster.
+      DATABASE_URL: "postgresql://cfdb_reader:cfdb_reader@db:5432/cfdb"
+      UNREDACTED_ENABLED: "false"
+      MCP_PORT: "9527"
+      LOG_LEVEL: "${TEST_LOG_LEVEL:-INFO}"
+    restart: unless-stopped
+
+  # ETL is opt-in only: `--profile etl`. Keeping it out of the default set
+  # means `up` can never trigger a 1.5 GB download or write into the copied
+  # dataset by accident.
+  etl:
+    profiles: ["etl"]
+    image: cfdb-app:${TEST_IMAGE_TAG:-testing}
+    container_name: cfdbtest-etl
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql://cfdb:${TEST_DB_PASSWORD:-cfdb_testing_only}@db:5432/cfdb"
+      STATE_CACHE_DIR: /app/state/cache
+      SOS_RAW_DATA_URL: "https://campaignfinance.cdn.sos.ca.gov/dbwebexport.zip"
+      LOG_LEVEL: "${TEST_LOG_LEVEL:-INFO}"
+    volumes:
+      - statecache:/app/state/cache
+    entrypoint: ["python", "-m", "state.etl"]
+    command: ["incremental", "--database-url", "postgresql://cfdb:${TEST_DB_PASSWORD:-cfdb_testing_only}@db:5432/cfdb"]
+    restart: "no"
+
+volumes:
+  statecache:
