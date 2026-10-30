@@ -27,7 +27,15 @@ export BUILDX_CONFIG="$REPO_ROOT/.buildx"
 mkdir -p "$BUILDX_CONFIG"
 
 # -p pins the project so we can never accidentally address the Prod stack.
-dc() { docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"; }
+# --env-file loads the gitignored .env.testing (TEST_DB_PASSWORD,
+# CFDB_READER_PASSWORD, ports, tag). If it's missing, compose fails loud on
+# the required vars rather than falling back to a literal default.
+ENV_FILE="$REPO_ROOT/.env.testing"
+ENV_ARGS=()
+if [ -f "$ENV_FILE" ]; then
+  ENV_ARGS=(--env-file "$ENV_FILE")
+fi
+dc() { docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "${ENV_ARGS[@]}" "$@"; }
 
 cmd="${1:-status}"
 shift || true

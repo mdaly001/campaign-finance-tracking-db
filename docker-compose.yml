@@ -6,7 +6,12 @@
 #
 # Incremental re-check (re-downloads only if the SOS export changed):
 #   docker compose run --rm etl -- incremental \
-#     --database-url postgresql://cfdb:change-me@db:5432/cfdb
+#     --database-url "postgresql://cfdb:${DB_PASSWORD}@db:5432/cfdb"
+#
+# Credentials are supplied via the environment (see .env.example):
+#   DB_PASSWORD            superuser (cfdb) password
+#   CFDB_READER_PASSWORD   read-only MCP role (cfdb_reader) password
+# Both are required; there are no in-file defaults.
 #
 # RAM note: the ETL parses RCPT_CD (~3.8 GB TSV) in-memory. Give the etl
 # container (or host) at least 8 GB of RAM; 16 GB recommended.
@@ -17,9 +22,13 @@ services:
     container_name: cfdb-db
     environment:
       POSTGRES_USER: cfdb
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-change-me}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set (see .env.example)}
       POSTGRES_DB: cfdb
       TZ: America/Los_Angeles
+      # Feeds the cfdb_reader role password into migration 0001 on a FRESH
+      # initdb (see the DO block there). Rotate an existing cluster with
+      # ALTER ROLE — see docs/credential-rotation.md.
+      PGOPTIONS: -c cfdb.reader_password=${CFDB_READER_PASSWORD:?CFDB_READER_PASSWORD must be set (see .env.example)}
     volumes:
       - pgdata:/var/lib/postgresql/data
       # Apply the schema (88 tables + cfdb_reader role) on FIRST boot only.
@@ -44,8 +53,10 @@ services:
     ports:
       - "${MCP_PORT:-9527}:9527"
     environment:
-      # MCP is read-only: the migration creates the cfdb_reader role.
-      DATABASE_URL: "postgresql://cfdb_reader:cfdb_reader@db:5432/cfdb"
+      # MCP is read-only. The cfdb_reader role's password comes from
+      # CFDB_READER_PASSWORD (never a literal); created by migration 0001 on
+      # a fresh cluster, rotated in place otherwise.
+      DATABASE_URL: "postgresql://cfdb_reader:${CFDB_READER_PASSWORD:?CFDB_READER_PASSWORD must be set}@db:5432/cfdb"
       UNREDACTED_ENABLED: "${UNREDACTED_ENABLED:-false}"
       MCP_PORT: "9527"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
@@ -59,7 +70,7 @@ services:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: "postgresql://cfdb:${DB_PASSWORD:-change-me}@db:5432/cfdb"
+      DATABASE_URL: "postgresql://cfdb:${DB_PASSWORD:?DB_PASSWORD must be set}@db:5432/cfdb"
       STATE_CACHE_DIR: /app/state/cache
       SOS_RAW_DATA_URL: "https://campaignfinance.cdn.sos.ca.gov/dbwebexport.zip"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
@@ -67,7 +78,7 @@ services:
       - statecache:/app/state/cache
     # Full load by default. Run incremental instead (see top of file).
     entrypoint: ["python", "-m", "state.etl"]
-    command: ["full", "--database-url", "postgresql://cfdb:${DB_PASSWORD:-change-me}@db:5432/cfdb"]
+    command: ["full", "--database-url", "postgresql://cfdb:${DB_PASSWORD:?DB_PASSWORD must be set}@db:5432/cfdb"]
     restart: "no"
 
 volumes:

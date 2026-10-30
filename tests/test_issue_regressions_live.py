@@ -10,9 +10,10 @@ Run them against the isolated testing stack:
     CFDB_LIVE_DB=1 python -m pytest tests/test_issue_regressions_live.py -q
 
 inside the ``cfdbtest-mcp`` container (which already points DATABASE_URL at
-the copied cluster), or from the host with
+the copied cluster), or from the host with the testing reader password
+(see ``.env.testing`` / ``docs/credential_rotation.md``):
 
-    DATABASE_URL=postgresql://cfdb_reader:cfdb_reader@127.0.0.1:5433/cfdb \\
+    DATABASE_URL="postgresql://cfdb_reader:${CFDB_READER_PASSWORD}@127.0.0.1:5433/cfdb" \\
       CFDB_LIVE_DB=1 python -m pytest tests/test_issue_regressions_live.py -q
 """
 
