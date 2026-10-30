@@ -34,9 +34,14 @@ services:
     # entrypoint's ownership check.
     environment:
       POSTGRES_USER: cfdb
-      POSTGRES_PASSWORD: ${TEST_DB_PASSWORD:-cfdb_testing_only}
+      POSTGRES_PASSWORD: ${TEST_DB_PASSWORD:?TEST_DB_PASSWORD must be set (see .env.testing.example)}
       POSTGRES_DB: cfdb
       TZ: America/Los_Angeles
+      # Feeds the cfdb_reader role password into migration 0001 on a FRESH
+      # initdb (see the DO block there). The copied testing cluster already
+      # has the role, so for this stack the value must match whatever the
+      # cluster was rotated to — see docs/credential-rotation.md.
+      PGOPTIONS: -c cfdb.reader_password=${CFDB_READER_PASSWORD:?CFDB_READER_PASSWORD must be set (see .env.testing.example)}
     ports:
       - "127.0.0.1:${TEST_DB_PORT:-5433}:5432"
     volumes:
@@ -67,9 +72,10 @@ services:
     ports:
       - "127.0.0.1:${TEST_MCP_PORT:-9528}:9527"
     environment:
-      # Read-only role, same as Prod. The role + password are created by
-      # migrations/0001 and carried into the copied cluster.
-      DATABASE_URL: "postgresql://cfdb_reader:cfdb_reader@db:5432/cfdb"
+      # Read-only role. Its password comes from CFDB_READER_PASSWORD (never a
+      # literal); the role is created by migration 0001 on a fresh cluster or
+      # rotated in place for a copied one — see docs/credential-rotation.md.
+      DATABASE_URL: "postgresql://cfdb_reader:${CFDB_READER_PASSWORD:?CFDB_READER_PASSWORD must be set}@db:5432/cfdb"
       UNREDACTED_ENABLED: "false"
       MCP_PORT: "9527"
       LOG_LEVEL: "${TEST_LOG_LEVEL:-INFO}"
@@ -86,14 +92,14 @@ services:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: "postgresql://cfdb:${TEST_DB_PASSWORD:-cfdb_testing_only}@db:5432/cfdb"
+      DATABASE_URL: "postgresql://cfdb:${TEST_DB_PASSWORD:?TEST_DB_PASSWORD must be set}@db:5432/cfdb"
       STATE_CACHE_DIR: /app/state/cache
       SOS_RAW_DATA_URL: "https://campaignfinance.cdn.sos.ca.gov/dbwebexport.zip"
       LOG_LEVEL: "${TEST_LOG_LEVEL:-INFO}"
     volumes:
       - statecache:/app/state/cache
     entrypoint: ["python", "-m", "state.etl"]
-    command: ["incremental", "--database-url", "postgresql://cfdb:${TEST_DB_PASSWORD:-cfdb_testing_only}@db:5432/cfdb"]
+    command: ["incremental", "--database-url", "postgresql://cfdb:${TEST_DB_PASSWORD:?TEST_DB_PASSWORD must be set}@db:5432/cfdb"]
     restart: "no"
 
 volumes:
