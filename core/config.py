@@ -2,10 +2,10 @@
 
 Keeps credential handling in one place so there are no hardcoded
 connection-string defaults scattered across the ETL and tooling. A
-hardcoded default such as ``postgresql://cfdb:cfdb@localhost:5432/cfdb``
-puts a known credential in the repository and silently points a script at
-the wrong database; every entry point should resolve its URL explicitly and
-fail loudly when it is missing.
+hardcoded default (a literal ``user:password@host`` in a connection
+string) puts a known credential in the repository and silently points a
+script at the wrong database; every entry point should resolve its URL
+explicitly and fail loudly when it is missing.
 """
 
 from __future__ import annotations

@@ -10,18 +10,28 @@ def get_env(name: str, default: str = "") -> str:
 
 
 def get_database_url() -> str:
-    """Construct DATABASE_URL from env vars or .env file.
+    """Construct DATABASE_URL from env vars.
 
-    Returns:
-        Database URL string for SQLAlchemy.
+    Precedence:
+      1. ``DATABASE_URL`` (full override)
+      2. ``DB_PASSWORD`` (+ optional DB_USER/DB_HOST/DB_PORT/DB_NAME)
+
+    There is no default password: if neither ``DATABASE_URL`` nor
+    ``DB_PASSWORD`` is set this raises rather than silently falling back
+    to the stock ``postgres``/``postgres`` pair.
     """
     db_url = get_env("DATABASE_URL")
     if db_url:
         return db_url
 
-    # Fallback: build from components
-    user = get_env("DB_USER", "postgres")
-    password = get_env("DB_PASSWORD", "postgres")
+    # Build from components. The password is required — no default.
+    password = get_env("DB_PASSWORD")
+    if not password:
+        raise RuntimeError(
+            "Neither DATABASE_URL nor DB_PASSWORD is set; cannot build a "
+            "database connection. Provide one — there is no default."
+        )
+    user = get_env("DB_USER", "cfdb")
     host = get_env("DB_HOST", "localhost")
     port = get_env("DB_PORT", "5432")
     dbname = get_env("DB_NAME", "cfdb")
