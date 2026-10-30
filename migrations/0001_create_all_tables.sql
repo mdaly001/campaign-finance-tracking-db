@@ -2046,10 +2046,37 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_load_checkpoint_table_hash
 -- Grant permissions (read-only role for MCP server)
 -- ============================================================================
 
+-- The cfdb_reader password is supplied at deploy time via the custom GUC
+-- `cfdb.reader_password` (wired through the compose file as
+-- PGOPTIONS="-c cfdb.reader_password=$CFDB_READER_PASSWORD"). There is
+-- deliberately NO default: if the role must be created and no password was
+-- supplied, the migration fails loudly rather than silently creating a
+-- role with a known literal.
+--
+-- The NULL/empty check is INSIDE the NOT EXISTS guard on purpose. The
+-- migration runner (core/migrations/migrate.py) re-applies this file by
+-- content-hash over a connection that carries no PGOPTIONS. If the check
+-- were unconditional, every re-apply on an EXISTING cluster (where the
+-- role already lives) would abort even though there is nothing to create.
+-- Gating on NOT EXISTS makes re-apply a no-op when the role exists, while
+-- still failing loud on a fresh cluster that has neither the role nor the
+-- GUC.
+--
+-- Rotate an EXISTING cluster with:
+--   ALTER ROLE cfdb_reader PASSWORD '<new>';
 DO $$
+DECLARE
+    reader_pw text := current_setting('cfdb.reader_password', true);
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cfdb_reader') THEN
-        CREATE ROLE cfdb_reader LOGIN PASSWORD 'cfdb_reader';
+        IF reader_pw IS NULL OR reader_pw = '' THEN
+            RAISE EXCEPTION
+                'cfdb.reader_password is not set. Provide CFDB_READER_PASSWORD in '
+                'the environment (compose passes it as '
+                'PGOPTIONS="-c cfdb.reader_password=..."). Refusing to create the '
+                'cfdb_reader role with a default password.';
+        END IF;
+        EXECUTE format('CREATE ROLE cfdb_reader LOGIN PASSWORD %L', reader_pw);
     END IF;
 END
 $$;

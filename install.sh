@@ -71,10 +71,23 @@ compose() { docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"; }
 ENVF="$INSTALL_DIR/.env"
 if [ ! -f "$ENVF" ]; then
   PW="$(openssl rand -hex 16 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-  printf 'DB_PASSWORD=%s\n' "$PW" > "$ENVF"
-  log "generated a random DB password -> $ENVF (keep it safe; it cannot be recovered later)"
+  READER_PW="$(openssl rand -hex 16 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  printf 'DB_PASSWORD=%s\nCFDB_READER_PASSWORD=%s\n' "$PW" "$READER_PW" > "$ENVF"
+  log "generated random DB + reader passwords -> $ENVF (keep it safe; they cannot be recovered later)"
 else
-  log "keeping the existing DB password in $ENVF"
+  # Back-compat: an .env written by an older installer has DB_PASSWORD but not
+  # CFDB_READER_PASSWORD. The compose file now requires the latter, so add it
+  # rather than failing the whole install on interpolation.
+  if ! grep -q '^CFDB_READER_PASSWORD=' "$ENVF"; then
+    READER_PW="$(openssl rand -hex 16 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    printf 'CFDB_READER_PASSWORD=%s\n' "$READER_PW" >> "$ENVF"
+    log "added a generated CFDB_READER_PASSWORD to the existing $ENVF"
+    log "NOTE: this is a NEW reader password. If the cfdb_reader role already"
+    log "      exists in a running cluster, rotate it to match:"
+    log "        docker exec <db> psql -U cfdb -d cfdb -c \"ALTER ROLE cfdb_reader PASSWORD '<value above>';\""
+  else
+    log "keeping the existing DB + reader passwords in $ENVF"
+  fi
 fi
 
 # --------------------------------------------------------- image ----
