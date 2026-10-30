@@ -28,6 +28,7 @@ from pathlib import Path
 
 from sqlalchemy import create_engine
 
+from core.config import require_database_url
 from core.etl.adapter import SourceAdapter, SourceFileInfo
 from core.etl.checkpoint import LoadCheckpoint
 from core.etl.committee_id import refresh_committee_views
@@ -756,7 +757,7 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
-    database_url = args.database_url or "postgresql://cfdb:cfdb@localhost:5432/cfdb"
+    database_url = args.database_url or require_database_url("the state ETL")
     cache_dir = Path(args.cache_dir)
 
     # Local source wins over the remote zip: --source-dir wins over env.

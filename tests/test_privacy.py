@@ -17,6 +17,10 @@ class TestPrivacyGuardrails:
 
         # Remove env var if set
         env_before = os.environ.pop("UNREDACTED_ENABLED", None)
+        # _build_url has no default password (by design), so supply one to
+        # exercise the URL-shape assertion.
+        pw_before = os.environ.get("DB_PASSWORD")
+        os.environ["DB_PASSWORD"] = "test-only-password"
         try:
             import importlib
 
@@ -32,6 +36,36 @@ class TestPrivacyGuardrails:
         finally:
             if env_before is not None:
                 os.environ["UNREDACTED_ENABLED"] = env_before
+            if pw_before is None:
+                os.environ.pop("DB_PASSWORD", None)
+            else:
+                os.environ["DB_PASSWORD"] = pw_before
+
+    def test_build_url_has_no_default_password(self):
+        """_build_url must raise, not fall back to a known credential."""
+        import os
+
+        saved = {k: os.environ.get(k) for k in ("DATABASE_URL", "DB_PASSWORD")}
+        os.environ.pop("DATABASE_URL", None)
+        os.environ.pop("DB_PASSWORD", None)
+        try:
+            from core.mcp import db
+
+            raised = False
+            try:
+                db._build_url()
+            except RuntimeError:
+                raised = True
+            assert raised, (
+                "_build_url must raise when neither DATABASE_URL nor "
+                "DB_PASSWORD is set (no hardcoded default credential)"
+            )
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
     def test_unredacted_enabled_sets_flag(self):
         """UNREDACTED_ENABLED=true should set the flag."""

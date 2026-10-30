@@ -59,10 +59,10 @@ WHERE filing_id IN (
 ## MCP Server Notes
 
 ### Server Configuration
-- Host: `192.168.87.41:9527`
+- Host: `<your-host>:9527`
 - User: `cfdb_reader` (read-only)
 - Database: `cfdb`
-- Docker container: `172.18.0.2`
+- Docker container: (internal, see `docker inspect`)
 
 ### MCP Tools
 1. `run_sql` — Execute SELECT queries (read-only)
@@ -72,8 +72,8 @@ WHERE filing_id IN (
 
 ### Direct DB Access (for migrations/ETL)
 - User: `cfdb`
-- Password: (in `.env`)
-- Host: `192.168.87.41:5432`
+- Password: in `.env` (`DB_PASSWORD`) — never committed
+- Host: `<your-host>:5432`
 - Database: `cfdb`
 
 ## ETL Process
@@ -82,7 +82,8 @@ WHERE filing_id IN (
 ```bash
 cd /tmp/campaign-finance-tracking-db
 source .venv/bin/activate
-python -m state.etl full --database-url "postgresql://cfdb:cfdb_secure_pass_2026@192.168.87.41:5432/cfdb" --cache-dir "/tmp/campaign-finance-tracking-db/state/cache" --batch-size 500
+# DATABASE_URL comes from the environment (see .env.example); never hardcode it.
+python -m state.etl full --database-url "$DATABASE_URL" --cache-dir "/tmp/campaign-finance-tracking-db/state/cache" --batch-size 500
 ```
 
 ### Resuming Incremental Load
@@ -150,5 +151,5 @@ ORDER BY x.effect_dt DESC LIMIT 1;
 - Project: `/tmp/campaign-finance-tracking-db/`
 - Cache: `/tmp/campaign-finance-tracking-db/state/cache/`
 - Migrations: `/tmp/campaign-finance-tracking-db/migrations/`
-- MCP Server: `http://192.168.87.41:9527/sse`
-- MCP Tools: `http://192.168.87.41:9527/mcp`
+- MCP Server: `http://<your-host>:9527/sse`
+- MCP Tools: `http://<your-host>:9527/mcp`

@@ -18,7 +18,7 @@ stay under the 60 req/min key limit, with backoff on HTTP 429.
 
 Usage:
     python -m federal.load_ie_api --cycle 2026 \
-        --database-url postgresql://cfdb:cfdb@172.19.0.2:5432/cfdb
+        --database-url "$DATABASE_URL"
 """
 from __future__ import annotations
 
