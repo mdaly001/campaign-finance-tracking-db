@@ -390,11 +390,12 @@ class LocalSourceAdapter(SourceAdapter):
 
     Example::
 
+        import os
         from state.adapter import LocalSourceAdapter
         from state.etl import FullLoadRunner
 
         runner = FullLoadRunner(
-            database_url="postgresql://cfdb:cfdb@localhost:5432/cfdb",
+            database_url=os.environ["DATABASE_URL"],
             adapter=LocalSourceAdapter("/data/CalAccess"),
         )
         runner.run()

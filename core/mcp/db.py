@@ -21,19 +21,28 @@ UNREDACTED_ENABLED = os.environ.get("UNREDACTED_ENABLED", "false").lower() == "t
 
 
 def _build_url() -> str:
-    """Build the database URL from environment or defaults.
+    """Build the database URL from environment.
 
     Order of precedence:
     1. ``DATABASE_URL`` env var (full override)
-    2. ``DB_PASSWORD`` + defaults
-    3. Hard-coded default
+    2. ``DB_PASSWORD`` (+ optional DB_USER/DB_HOST/DB_PORT/DB_NAME)
+
+    There is no default password: if neither ``DATABASE_URL`` nor
+    ``DB_PASSWORD`` is set, this raises rather than falling back to a
+    known credential.
     """
     from_env = os.environ.get("DATABASE_URL")
     if from_env:
         return from_env
 
+    password = os.environ.get("DB_PASSWORD")
+    if not password:
+        raise RuntimeError(
+            "Neither DATABASE_URL nor DB_PASSWORD is set; the MCP server "
+            "cannot connect. Provide one — there is no default password."
+        )
+
     user = os.environ.get("DB_USER", "cfdb_reader")
-    password = os.environ.get("DB_PASSWORD", "reader")
     host = os.environ.get("DB_HOST", "localhost")
     port = os.environ.get("DB_PORT", "5432")
     db = os.environ.get("DB_NAME", "cfdb")

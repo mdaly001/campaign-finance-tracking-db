@@ -11,11 +11,12 @@ logger = logging.getLogger(__name__)
 from sqlalchemy import create_engine, text
 from core.etl.tsv import TSVReader
 from core.etl.loader import TableLoader, LoadConfig
+from core.config import require_database_url
 from core.etl.checkpoint import LoadCheckpoint
 
 def load_fec_cm():
     """Load FEC_CM (cm.txt) with detailed debugging."""
-    engine = create_engine("postgresql://cfdb:cfdb@172.19.0.3:5432/cfdb", pool_size=1)
+    engine = create_engine(require_database_url("the FEC debug loader"), pool_size=1)
     
     # Download cm24.zip
     url = "https://www.fec.gov/files/bulk-downloads/2024/cm24.zip"

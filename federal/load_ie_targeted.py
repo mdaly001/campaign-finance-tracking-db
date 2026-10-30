@@ -6,7 +6,7 @@ quoted fields). This is the candidate-targeted IE file — distinct from oppexp.
 Usage:
     python -m federal.load_ie_targeted --cycle 2026 \
         --csv fec_cache/independent_expenditure_2026.csv \
-        --database-url postgresql://cfdb:cfdb@172.19.0.3:5432/cfdb
+        --database-url "$DATABASE_URL"
 """
 from __future__ import annotations
 
