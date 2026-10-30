@@ -42,3 +42,6 @@ node_modules/
 
 # Docker volumes
 pgdata/
+
+# buildx local state (testing env)
+.buildx/

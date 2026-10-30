@@ -121,7 +121,7 @@ CREATE TABLE IF NOT EXISTS fec.fec_individual_contributions (
     src_file TEXT,
     load_ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (sub_id, two_year_transaction_period)
-);
+) PARTITION BY LIST (two_year_transaction_period);
 COMMENT ON TABLE fec.fec_individual_contributions IS 'FEC individual contributions (itcont) — Schedule A';
 
 -- Partition by cycle
@@ -159,7 +159,7 @@ CREATE TABLE IF NOT EXISTS fec.fec_other_contributions (
     src_file TEXT,
     load_ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (sub_id, two_year_transaction_period)
-);
+) PARTITION BY LIST (two_year_transaction_period);
 CREATE TABLE fec.fec_other_contributions_2024 PARTITION OF fec.fec_other_contributions
     FOR VALUES IN (2024);
 CREATE TABLE fec.fec_other_contributions_2026 PARTITION OF fec.fec_other_contributions
@@ -192,7 +192,7 @@ CREATE TABLE IF NOT EXISTS fec.fec_conduit_contributions (
     src_file TEXT,
     load_ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (sub_id, two_year_transaction_period)
-);
+) PARTITION BY LIST (two_year_transaction_period);
 CREATE TABLE fec.fec_conduit_contributions_2024 PARTITION OF fec.fec_conduit_contributions
     FOR VALUES IN (2024);
 CREATE TABLE fec.fec_conduit_contributions_2026 PARTITION OF fec.fec_conduit_contributions
@@ -226,7 +226,7 @@ CREATE TABLE IF NOT EXISTS fec.fec_independent_expenditures (
     src_file TEXT,
     load_ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (sub_id, two_year_transaction_period)
-);
+) PARTITION BY LIST (two_year_transaction_period);
 CREATE TABLE fec.fec_independent_expenditures_2024 PARTITION OF fec.fec_independent_expenditures
     FOR VALUES IN (2024);
 CREATE TABLE fec.fec_independent_expenditures_2026 PARTITION OF fec.fec_independent_expenditures

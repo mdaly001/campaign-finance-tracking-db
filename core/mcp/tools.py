@@ -735,10 +735,23 @@ def total_expenditures(
 ) -> dict[str, Any]:
     """Return total expenditures for a committee in a cycle.
 
-    Uses Form E (vendor payments) and Form F461P5 (independent expenditure
-    reports) from the deduped view (latest amendment only). This gives the
-    actual total spending, excluding Form D (duplicate beneficiary tracking)
-    and Form G (outlet detail already counted in vendor payment).
+    Counts Form E (vendor payments) and Form F461P5 (independent
+    expenditure reports) from the deduped view (latest amendment only),
+    and falls back to Form D on any filing whose E/F461P5 lines for that
+    cycle are missing or undated.
+
+    The fallback is required because on an independent-expenditure filing
+    the dated lines ARE Form D (the IE totals, one line per beneficiary)
+    while the Form E vendor lines are NULL-dated. Excluding Form D
+    unconditionally — the previous behaviour, justified by calling D
+    "duplicate beneficiary tracking" — zeroes out every IEC, because the
+    dated lines are dropped by the form filter and the Form E lines are
+    dropped by the date filter. The "D duplicates E" premise does not hold
+    in general: only ~9% of filings that carry both forms in the same cycle
+    have equal D and E totals.
+
+    Form G (outlet detail) is never counted: it is a station-level
+    breakdown of money already carried on E/D.
 
     Scope is filing-based (see ``_committee_predicate``): the committee's
     filer id is resolved via ``filer_xref_cd`` and rows are attributed
@@ -757,34 +770,125 @@ def total_expenditures(
             donors.
 
     Returns:
-        Dict with ``transaction_count``, ``total_amount``, ``form_types``.
+        Dict with ``transaction_count``, ``total_amount``, ``form_types``,
+        ``form_d_total`` and ``form_e_total``. The last two are the
+        composition of ``total_amount`` (which side each counted line came
+        from) and must not be added together. On an IEC the reported total
+        is the Form D side and ``form_e_total`` is 0, because that
+        filing's Form E vendor lines are undated and are not counted; a
+        ``notes`` entry says so when it happens.
     """
     refund_clause = (
-        " AND NOT (COALESCE(e.expn_dscr, '') ~* :refund_rx)" if exclude_refunds
+        " AND NOT (COALESCE(expn_dscr, '') ~* :refund_rx)" if exclude_refunds
         else ""
     )
+    # Single pass over the deduped view. The window counts, per FILING, how
+    # many dated E/F461P5 rows fall in the requested cycle; that filing's
+    # Form D rows are admitted only when the count is zero.
+    #
+    # WHY (issue #11): on an independent-expenditure filing the *dated*
+    # lines are Form D (the IE totals, one line per beneficiary) and the
+    # Form E vendor lines are NULL-dated. Filtering on form type alone drops
+    # the dated lines, and the NULL-date cycle filter then drops the Form E
+    # lines, so an IEC reported $0 while having spent six figures.
+    #
+    # The rule is per-filing, not per-filer: a committee that files both a
+    # normal 460 (dated E) and an IE 460 (dated D + NULL-dated E) is
+    # counted correctly on both. Form D is never added to a filing that
+    # already has dated E in the cycle, which is what keeps the
+    # beneficiary-side duplicate out of regular-committee totals.
+    #
+    # Shape and latency: this evaluates the deduped view ONCE. A CTE
+    # anti-join form that evaluated the 12.6M-row DISTINCT ON view twice
+    # measured ~2x slower and was rejected.
+    #
+    # That said, this query is NOT free and the comment should not be read as
+    # "no cost": EXPLAIN ANALYZE on the 12.6M-row testing copy shows the
+    # filing_id = ANY(...) filter is applied AFTER the view's dedup
+    # (a Unique over ~6.3M rows, with a ~73 MB external sort), not pushed
+    # into an index scan. Measured on a 542-filing committee, twice each:
+    # the old query 10.1-10.5 s, this one 14.5-14.6 s — roughly a 40%
+    # regression on an already-slow path. The real fix is to materialize
+    # expn_cd_deduped (or add a covering index); until then, treat every
+    # call to this tool as a ~15 s operation.
     sql = f"""
+        WITH scoped AS (
+            SELECT
+                e.filing_id,
+                e.form_type,
+                e.amount,
+                e.expn_date,
+                e.expn_dscr,
+                (e.form_type IN ('E', 'F461P5')
+                    AND e.expn_date IS NOT NULL
+                    AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle) AS is_e_in_cycle,
+                COUNT(*) FILTER (
+                    WHERE e.form_type IN ('E', 'F461P5')
+                      AND e.expn_date IS NOT NULL
+                      AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle
+                ) OVER (PARTITION BY e.filing_id) AS dated_e_in_cycle
+            FROM expn_cd_deduped e
+            WHERE {_committee_predicate('e')}
+        )
         SELECT
             COUNT(*) AS transaction_count,
-            ROUND(COALESCE(SUM(e.amount), 0), 2) AS total_amount,
-            jsonb_agg(DISTINCT e.form_type) AS form_types
-        FROM expn_cd_deduped e
-        WHERE {_committee_predicate('e')}
-          AND e.form_type IN ('E', 'F461P5')
-          AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle{refund_clause}
+            ROUND(COALESCE(SUM(amount), 0), 2) AS total_amount,
+            jsonb_agg(DISTINCT form_type) AS form_types,
+            ROUND(COALESCE(SUM(amount) FILTER (WHERE form_type = 'D'), 0), 2)
+                AS form_d_total,
+            ROUND(COALESCE(SUM(amount) FILTER (
+                WHERE form_type IN ('E', 'F461P5')), 0), 2) AS form_e_total
+        FROM scoped
+        WHERE (is_e_in_cycle
+               OR (form_type = 'D'
+                   AND expn_date IS NOT NULL
+                   AND EXTRACT(YEAR FROM expn_date)::int = :cycle
+                   AND dated_e_in_cycle = 0)){refund_clause}
     """
     params = {"filer": _resolve_filer_id(committee_id), "cycle": cycle}
     if exclude_refunds:
         params["refund_rx"] = _REFUND_DSCR_REGEX
     row = execute_read(sql, params)
     if not row:
-        return {"transaction_count": 0, "total_amount": 0.0, "form_types": []}
+        return {
+            "transaction_count": 0,
+            "total_amount": 0.0,
+            "form_types": [],
+            "form_d_total": 0.0,
+            "form_e_total": 0.0,
+        }
     r = row[0]
-    return {
+    out = {
         "transaction_count": r.get("transaction_count", 0),
         "total_amount": _money(r.get("total_amount")),
         "form_types": r.get("form_types", []),
+        "form_d_total": _money(r.get("form_d_total")),
+        "form_e_total": _money(r.get("form_e_total")),
     }
+    # ``form_d_total`` / ``form_e_total`` are the composition of the
+    # reported ``total_amount`` — which side each counted line came from.
+    # They are deliberately NOT the vendor-side total for the same filings:
+    # on an IEC the Form E vendor lines are undated and are not counted at
+    # all, so the vendor-side figure would require a second pass over the
+    # filing. The note says so instead of implying a number we did not
+    # compute.
+    if out["form_d_total"] and out["form_e_total"]:
+        out["notes"] = [
+            "This cycle mixes Form E (vendor payments) and Form D (IE "
+            "beneficiary) lines; total_amount counts each filing on one "
+            "side only. form_d_total / form_e_total are the composition of "
+            "the reported total, not independent sides to be added."
+        ]
+    elif out["form_d_total"]:
+        out["notes"] = [
+            "Reported from Form D (independent-expenditure beneficiary "
+            "totals): this filing's Form E vendor lines carry no date and "
+            "are NOT included in total_amount, so form_e_total is 0 here. "
+            "The committee may have paid vendors more than this figure "
+            "shows; the vendor-side money is not reachable by a date-"
+            "filtered query on this filing."
+        ]
+    return out
 
 
 # -- 6. measure_spending -------------------------------------------------------- #
@@ -1010,6 +1114,13 @@ def committee_outlays_to(
 ) -> list[dict[str, Any]]:
     """Return expenditures from a committee to a vendor/payee in a cycle.
 
+    Counts vendor-bearing schedules only: Form E (vendor payments) and
+    Form F461P5 (independent expenditure reports). Form D (beneficiary
+    tracking) and Form G (outlet detail) are excluded — they carry payee
+    names that restate money already counted on Form E, so including them
+    inflates a vendor's outlay figure (over $6.5B of Form D rows carry a
+    payee across the corpus).
+
     Args:
         committee_id: Spending committee ID (``cmte_id`` or ``xref_id``,
             e.g. ``C0695132``).
@@ -1020,6 +1131,12 @@ def committee_outlays_to(
 
     Returns:
         List of OutlayRecord dicts (newest first).
+
+    Note:
+        The cycle is taken from ``expn_date``. On an independent-expenditure
+        filing the Form E vendor lines are NULL-dated, so they are not
+        reachable by this tool; use ``total_expenditures`` for that
+        committee's cycle total.
     """
     refund_clause = (
         " AND NOT (COALESCE(e.expn_dscr, '') ~* :refund_rx)" if exclude_refunds
@@ -1039,6 +1156,7 @@ def committee_outlays_to(
             e.memo_refno
         FROM expn_cd_deduped e
         WHERE {_committee_predicate('e')}
+          AND e.form_type IN ('E', 'F461P5')
           AND EXTRACT(YEAR FROM e.expn_date)::int = :cycle
           AND TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, ''))
                ~* :vendor{refund_clause}
@@ -1071,6 +1189,12 @@ def committee_outlays_to(
 def vendor_revenue(vendor_name: str, limit: int = 20) -> list[dict[str, Any]]:
     """Return total payments received by a vendor across all committees.
 
+    Counts vendor-bearing schedules only: Form E (vendor payments) and
+    Form F461P5 (independent expenditure reports). Form D (beneficiary
+    tracking) and Form G (outlet detail) are excluded — they restate money
+    already counted on Form E under the same payee name, so including them
+    inflates the vendor's revenue.
+
     The vendor is matched as a whole phrase anchored to a word boundary,
     so ``"AL Media"`` hits ``AL MEDIA`` / ``AL MEDIA LLC`` but not
     ``CENTRAL MEDIA``.
@@ -1091,7 +1215,8 @@ def vendor_revenue(vendor_name: str, limit: int = 20) -> list[dict[str, Any]]:
             COUNT(*) AS payments,
             COALESCE(SUM(e.amount), 0) AS total
         FROM expn_cd_deduped e
-        WHERE TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, ''))
+        WHERE e.form_type IN ('E', 'F461P5')
+          AND TRIM(COALESCE(e.payee_naml, '') || ' ' || COALESCE(e.payee_namf, ''))
               ~* :vendor
         GROUP BY 1
         ORDER BY total DESC
@@ -2663,15 +2788,27 @@ def fuzzy_name_search(
 
     match_rows: list[dict[str, Any]] = []
     totals: dict[int, dict[str, Any]] = {}
+    # CAL-ACCESS carries NULL dates on some historical rows, and on the
+    # Form E vendor lines of independent-expenditure filings. Those rows
+    # have no year bucket, but their money must stay visible: silently
+    # dropping them would make totals_by_year understate a name's activity
+    # with no signal that anything was left out.
+    undated: dict[str, float] = {"in": 0.0, "out": 0.0, "n": 0}
 
     def _accumulate_totals(rows: list, direction: str) -> None:
         for row in rows:
-            yr = int(row.get("yr"))
-            slot = totals.setdefault(yr, {"in": 0.0, "out": 0.0, "net": 0.0, "n": 0})
+            yr_raw = row.get("yr")
             amount = float(row.get("total") or 0.0)
+            n = int(row.get("n") or 0)
+            if yr_raw is None:
+                undated[direction] = round(undated[direction] + amount, 2)
+                undated["n"] += n
+                continue
+            yr = int(yr_raw)
+            slot = totals.setdefault(yr, {"in": 0.0, "out": 0.0, "net": 0.0, "n": 0})
             slot[direction] = round(slot[direction] + amount, 2)
             slot["net"] = round(slot["in"] - slot["out"], 2)
-            slot["n"] += int(row.get("n") or 0)
+            slot["n"] += n
 
     if etype in ("all", "donor"):
         rows = _q(
@@ -2839,6 +2976,17 @@ def fuzzy_name_search(
         for r in match_rows[: cap + 10]
     ]
     result["totals_by_year"] = {str(y): totals[y] for y in sorted(totals)}
+    if undated["n"]:
+        result["totals_undated"] = {
+            "in": undated["in"],
+            "out": undated["out"],
+            "net": round(undated["in"] - undated["out"], 2),
+            "n": undated["n"],
+        }
+        result["notes"].append(
+            f"{undated['n']} matched rows have no transaction date; their money is "
+            "reported under totals_undated and is NOT included in totals_by_year."
+        )
     if not entities and not alias_rows and match_rows:
         result["resolved_via"] = "name"
     return result

@@ -535,6 +535,21 @@ class TestCommitteeOutlaysTo:
         assert row["payee_name"] == "Acme Consulting"
         assert row["cmte_id"] == "C1"
 
+    def test_counts_vendor_schedules_only(self, patched_db):
+        """A vendor outlay must not include Form D or Form G.
+
+        Form D (beneficiary tracking) and Form G (outlet detail) carry
+        payee names that restate money already counted on Form E, so
+        summing them into a vendor's outlay inflates the figure.
+        """
+        from core.mcp.tools import committee_outlays_to
+
+        committee_outlays_to("C1", "Acme", 2026)
+        sql = next(
+            c["sql"] for c in _mock_db.calls if "FROM EXPN_CD_DEDUPED E" in c["sql"]
+        )
+        assert "FORM_TYPE IN ('E', 'F461P5')" in sql
+
 
 # ------------------------------------------------------------------ #
 #  Test: Tool 4 — vendor_revenue
@@ -559,6 +574,16 @@ class TestVendorRevenue:
         assert result[0]["vendor_name"] == "Acme Consulting"
         assert result[0]["total"] == 5000.0
         assert result[0]["payments"] == 2
+
+    def test_counts_vendor_schedules_only(self, patched_db):
+        """Vendor revenue must exclude Form D and Form G restatements."""
+        from core.mcp.tools import vendor_revenue
+
+        vendor_revenue("Acme")
+        sql = next(
+            c["sql"] for c in _mock_db.calls if "FROM EXPN_CD_DEDUPED E" in c["sql"]
+        )
+        assert "FORM_TYPE IN ('E', 'F461P5')" in sql
 
 
 # ------------------------------------------------------------------ #
@@ -924,6 +949,8 @@ class TestTotalExpendituresFilingScoped:
             "transaction_count": 0,
             "total_amount": 0.0,
             "form_types": [],
+            "form_d_total": 0.0,
+            "form_e_total": 0.0,
         }
         agg = [
             c for c in _mock_db.calls
@@ -935,6 +962,60 @@ class TestTotalExpendituresFilingScoped:
         assert "E.CMTE_ID = :COMMITTEE_ID" not in sql
         # the xref lookup resolved the committee id to a filer id first
         assert agg[0]["params"]["filer"] == 4242
+
+    def test_form_d_fallback_predicate(self, patched_db):
+        """Issue #11: the query must fall back to Form D per-filing.
+
+        An independent-expenditure filing carries its dated totals on
+        Form D and leaves its Form E vendor lines undated. Counting only
+        E/F461P5 made every IEC report $0, so the SQL must admit Form D
+        for a filing that has no dated E/F461P5 row in the cycle.
+        """
+        from core.mcp.tools import total_expenditures
+
+        total_expenditures("C001", 2024)
+        sql = next(
+            c["sql"] for c in _mock_db.calls if "FROM EXPN_CD_DEDUPED E" in c["sql"]
+        )
+        # per-filing count of dated vendor rows in the cycle
+        assert "DATED_E_IN_CYCLE" in sql
+        assert "PARTITION BY E.FILING_ID" in sql
+        # Form D is admitted only when that filing has no dated vendor row
+        assert "FORM_TYPE = 'D'" in sql
+        assert "DATED_E_IN_CYCLE = 0" in sql
+        # and the vendor side is still the primary basis
+        assert "FORM_TYPE IN ('E', 'F461P5')" in sql
+
+    def test_refund_clause_gates_both_admission_branches(self, patched_db):
+        """exclude_refunds must apply to the whole OR group, not just Form D.
+
+        ``A OR B AND C`` parses as ``A OR (B AND C)``. When the refund
+        predicate was appended to an unparenthesised OR, dated Form E
+        refund rows stayed in the total even with exclude_refunds=True, so
+        the flag silently became a no-op. The admission disjunct must be
+        wrapped so the refund clause gates both branches.
+        """
+        from core.mcp.tools import total_expenditures
+
+        total_expenditures("C001", 2024, exclude_refunds=True)
+        sql = next(
+            c["sql"] for c in _mock_db.calls if "FROM EXPN_CD_DEDUPED E" in c["sql"]
+        )
+        # The refund predicate must sit OUTSIDE the closing paren of the OR
+        # group, i.e. "... DATED_E_IN_CYCLE = 0)) AND NOT (".
+        assert "DATED_E_IN_CYCLE = 0)) AND NOT (" in sql, (
+            "refund clause is not applied to the whole admission group "
+            "(operator precedence: A OR B AND C == A OR (B AND C))"
+        )
+        assert ":REFUND_RX" in sql
+
+    def test_result_exposes_form_split(self, patched_db):
+        """The reported total must say which form side it came from."""
+        from core.mcp.tools import total_expenditures
+
+        result = total_expenditures("C001", 2024)
+        assert "form_d_total" in result
+        assert "form_e_total" in result
 
     def test_exclude_refunds_flag(self, patched_db):
         from core.mcp.tools import total_expenditures, _REFUND_DSCR_REGEX
