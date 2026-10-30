@@ -5,6 +5,8 @@ import time
 import requests
 from sqlalchemy import create_engine, text
 
+from core.config import require_database_url
+
 API_KEY = os.getenv("FEC_API_KEY", "DEMO_KEY")
 BASE_URL = "https://api.open.fec.gov/v1"
 
@@ -87,5 +89,5 @@ def load_independent_expenditures(engine):
 
 
 if __name__ == "__main__":
-    engine = create_engine("postgresql://cfdb:cfdb@172.19.0.3:5432/cfdb")
+    engine = create_engine(require_database_url("the federal API loader"))
     load_independent_expenditures(engine)

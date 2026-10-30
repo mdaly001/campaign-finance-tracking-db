@@ -20,6 +20,7 @@ from pathlib import Path
 
 from sqlalchemy import create_engine
 
+from core.config import require_database_url
 from core.etl.adapter import SourceFileInfo
 from core.etl.checkpoint import LoadCheckpoint
 from core.etl.loader import LoadConfig, TableLoader
@@ -269,7 +270,7 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
-    database_url = args.database_url or os.getenv("DATABASE_URL") or "postgresql://cfdb:cfdb@localhost:5432/cfdb"
+    database_url = args.database_url or require_database_url("the federal ETL")
     cache_dir = Path(args.cache_dir)
 
     if args.command == "full":

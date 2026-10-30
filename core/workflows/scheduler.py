@@ -25,6 +25,7 @@ import sys
 import time
 from pathlib import Path
 
+from core.config import require_database_url
 from core.etl.logging import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -44,7 +45,7 @@ def run_scheduler(
     start = time.monotonic()
     setup_logging(level=log_level)
 
-    database_url = database_url or "postgresql://cfdb:cfdb@localhost:5432/cfdb"
+    database_url = database_url or require_database_url("the scheduler")
     cache_dir = cache_dir or Path("/app/state/cache")
 
     print("\n" + "=" * 70)
