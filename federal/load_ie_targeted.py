@@ -76,14 +76,29 @@ def _clean(field, col):
     return s
 
 
+def _bulk_sub_id(rec):
+    """Deterministic sub_id for bulk-CSV rows.
+
+    The table's unique key is sub_id (migration 0016 — the OpenFEC API's
+    record id). The bulk CSV carries no sub_id, so synthesize one from the
+    CSV's natural key to keep this loader idempotent under that constraint.
+    Prefixed with 'BULK:' so bulk-synthesized ids can never collide with
+    real API sub_ids if both loaders target the same table.
+    """
+    return "BULK:{}:{}:{}".format(
+        rec.get("spender_id"), rec.get("file_number"), rec.get("transaction_id")
+    )
+
+
 def load(engine, csv_path, src_file, batch_size=1000):
     table_cols = list(COLMAP.values())
-    placeholders = ", ".join(f":{c}" for c in table_cols)
-    updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in table_cols if c != "spender_id")
+    all_cols = ["sub_id"] + table_cols
+    placeholders = ", ".join(f":{c}" for c in all_cols)
+    updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in all_cols if c != "sub_id")
     stmt = text(
-        f"INSERT INTO fec.fec_ie_targeted ({', '.join(table_cols)}, src_file) "
+        f"INSERT INTO fec.fec_ie_targeted ({', '.join(all_cols)}, src_file) "
         f"VALUES ({placeholders}, :src_file) "
-        f"ON CONFLICT (spender_id, file_number, transaction_id) DO UPDATE SET {updates}, src_file = EXCLUDED.src_file"
+        f"ON CONFLICT (sub_id) DO UPDATE SET {updates}, src_file = EXCLUDED.src_file"
     )
 
     read = ins = 0
@@ -92,6 +107,7 @@ def load(engine, csv_path, src_file, batch_size=1000):
         reader = csv.DictReader(f)
         for row in reader:
             rec = {COLMAP[k]: _clean(v, COLMAP[k]) for k, v in row.items() if k in COLMAP}
+            rec["sub_id"] = _bulk_sub_id(rec)
             rec["src_file"] = src_file
             batch.append(rec)
             read += 1
