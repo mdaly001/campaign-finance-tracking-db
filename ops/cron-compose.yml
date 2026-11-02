@@ -1,0 +1,37 @@
+# Standalone scheduler for the prod CFDB stack.
+#
+# Deploy at: /data/development/CFDB_v1/Prod/cron/cron-compose.yml
+#            (alongside a copy of ops/updater.py as ./updater.py)
+# Start:     docker compose -f cron-compose.yml up -d
+# Manual:    docker compose -f cron-compose.yml run --rm cron daily
+#            docker compose -f cron-compose.yml run --rm cron weekly
+#
+# Joins the EXISTING prod network/volume and reuses the deployed
+# cfdb-app:latest image — no rebuild required. The updater script is
+# bind-mounted read-only.
+services:
+  cron:
+    image: cfdb-app:latest
+    container_name: cfdb-cron
+    env_file:
+      - ../.env                    # DB_PASSWORD (prod superuser)
+    environment:
+      TZ: America/Los_Angeles
+      SOS_RAW_DATA_URL: "https://campaignfinance.cdn.sos.ca.gov/dbwebexport.zip"
+      # NB: no DATABASE_URL here — compose does not interpolate env_file values;
+      # updater.py builds the URL from DB_PASSWORD (injected via env_file).
+    volumes:
+      - prod_statecache:/app/state/cache
+      - ./updater.py:/ops/updater.py:ro
+    entrypoint: ["/app/.venv/bin/python", "/ops/updater.py"]
+    command: ["daemon"]
+    restart: unless-stopped
+
+networks:
+  default:
+    external: true
+    name: prod_default
+
+volumes:
+  prod_statecache:
+    external: true
