@@ -70,10 +70,18 @@ class TestFECTableDefinitions:
         for code in LOAD_ORDER:
             assert code in FEC_TABLE_DEFINITIONS, f"Missing definition for {code}"
 
-    def test_fec_indiv_has_transaction_id_conflict(self):
-        """Individual contributions must use transaction_id for dedup."""
+    def test_fec_indiv_conflict_key_is_receipt_no(self):
+        """Individual contributions dedup on (cycle, committee, receipt_no).
+
+        transaction_id is only unique per report — ~49% of itcont rows share
+        a (committee_id, transaction_id) — so it must NOT be a conflict
+        column; keying on it would collapse multi-line receipts.
+        """
         td = FEC_TABLE_DEFINITIONS["FEC_INDIV"]
-        assert "transaction_id" in (td.conflict_columns or [])
+        assert td.conflict_columns == [
+            "two_year_transaction_period", "committee_id", "receipt_no",
+        ]
+        assert "transaction_id" not in (td.conflict_columns or [])
 
     def test_fec_indiv_has_date_coercion(self):
         """Individual contributions must coerce contribution_date to date."""

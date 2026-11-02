@@ -277,9 +277,12 @@ class TestResumeRunner:
 
         cp = LoadCheckpoint(engine)
         a_path = local_data / "DATA" / "ACRONYMS_CD.TSV"
+        # rows_processed must be > 0: LoadCheckpoint.is_loaded() treats a
+        # NULL rows_processed as "not loaded" (guards against empty loads).
         cp.load_checkpoint(
             "acronyms_cd",
             hashlib.sha256(a_path.read_bytes()).hexdigest(),
+            rows_processed=2,
         )
 
         runner = etl.ResumeRunner(
