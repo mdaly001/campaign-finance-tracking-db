@@ -17,6 +17,10 @@ no dedicated tool covers.
 > `get_server_docs` tool after connecting — it returns exactly this text,
 > so you never need repository access to get up to speed.
 
+> **Just need to know which tool answers your question?** See the one-page
+> cheat sheet: `docs/MCP_TOOLS.md` (query intent → tool → minimal args →
+> caveats). This file is the full reference.
+
 ## 1. Attaching an agent
 
 The server speaks MCP over **Streamable HTTP**. Point any MCP client at:
@@ -179,6 +183,8 @@ MCP_PORT=9527 python -m core.mcp.server
    > **Refresh after load:** the resolved view is materialized, so run
    > `REFRESH MATERIALIZED VIEW CONCURRENTLY fec.fec_ie_targeted_resolved;`
    > after every IE load.
+   > The scheduled updater (`ops/updater.py`) does this automatically after each
+   > federal refresh.
 1b. **Per-candidate totals use `resolved_candidate_id`, not the raw
    `candidate_id`.** Some IEs carry a `candidate_name` but a NULL
    `candidate_id`, and the same candidate is reported under different name
@@ -196,8 +202,27 @@ MCP_PORT=9527 python -m core.mcp.server
    uses fuzzy — a false-positive merge would silently corrupt a total.
 2. **`cycle` is the FEC two-year period** (stored in `election_year`, e.g.
    `2026`). Omit it to span every loaded cycle. Federal data is loaded
-   per-cycle from the OpenFEC API (`federal/load_ie_api.py`), so only
-   loaded cycles return rows.
+   per-cycle either from the FEC bulk CSV (`federal/load_ie_targeted.py`,
+   public, no key) or the authoritative OpenFEC API
+   (`federal/load_ie_api.py`, needs `FEC_API_KEY`); only loaded cycles
+   return rows.
+2b. **Bulk-loaded rows carry undated expenditures.** Many 48-hour-notice
+   estimates in the bulk CSV have `expenditure_date IS NULL`. A date-window
+   query (`fec_ie_summary` with `start_date`/`end_date`, or a `WHERE
+   expenditure_date >= …` in `run_sql`) **silently excludes them** — so a
+   window total can miss a large chunk of a race. Before calling a windowed
+   total complete, check the undated remainder:
+   `SELECT sum(expenditure_amount) FROM fec.fec_ie_targeted_dedup WHERE
+   … AND expenditure_date IS NULL`.
+2c. **Loader-dependent columns.** `is_notice` and `filing_form` are
+   populated only by the API loader; rows from the bulk CSV have them
+   NULL. Bulk rows carry a synthesized `sub_id` prefixed `BULK:` (the API
+   loader uses the real OpenFEC record id) — useful for telling provenance
+   apart when both loaders have touched the table.
+2d. **Name casing varies** in the raw tables (`VALADAO, DAVID` vs
+   `Valadao, David`). The resolved view folds variants via its canonical
+   key, but raw `run_sql` grouping must normalize with `upper(...)` or it
+   will split the same candidate into multiple rows.
 3. **`support_oppose`**: `S` = independent expenditure **for** the
    candidate, `O` = **against**.
 4. **`candidate_id` is the target**, `spender_id` is the committee making
