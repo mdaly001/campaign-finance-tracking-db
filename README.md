@@ -1,6 +1,6 @@
 # Campaign Finance Disclosure Database
 
-A privacy-first campaign finance database for California, with a path to federal coverage. Download publicly available disclosure data from the California Secretary of State's [CAL-ACCESS](https://calaccess.calstate.edu/) system, load it into PostgreSQL, and query it through a standards-compliant MCP (Model Context Protocol) server.
+A privacy-first campaign finance database covering **California (CAL-ACCESS) and federal (FEC)** disclosures, with county coverage to come. Download publicly available data from the California Secretary of State's [CAL-ACCESS](https://calaccess.calstate.edu/) system and the FEC, load it into PostgreSQL, and query it through a standards-compliant MCP (Model Context Protocol) server.
 
 ## Project Description
 
@@ -118,9 +118,14 @@ To pin an immutable release instead of `:latest`, prefix any command with
 
 ## Querying the database with an MCP client or AI agent
 
-The MCP server (port **9527**) exposes ~15 analytical tools — donor lookups,
-committee profiles, payments-to-person, 24-hour-report vendor recovery, and
-a built-in `get_server_docs` guide so any connected agent can self-onboard.
+The MCP server (port **9527**) exposes **29 analytical tools** across both
+sources — donor lookups, committee profiles, expenditures and refund
+handling, payments-to-person, 24-hour-report vendor recovery, ballot
+measures, filing deadlines, **federal (FEC) candidate-targeted independent
+expenditures** (for/against totals, top spenders, race overviews),
+cross-source entity money flows, and a built-in `get_server_docs` guide so
+any connected agent can self-onboard. For a scannable query-intent index,
+see [`docs/MCP_TOOLS.md`](docs/MCP_TOOLS.md).
 The server is **read-only**: it connects to Postgres as the `cfdb_reader`
 role, so connected clients can query but never write.
 
@@ -154,18 +159,22 @@ the documentation files** before writing queries. Without this context, the
 agent will produce confidently wrong financial answers due to dataset quirks
 that are invisible from the schema alone.
 
-**Three files every agent MUST read:**
+**Four files every agent MUST read:**
 
-1. **`docs/data_caveats.md`** — All the gotchas that silently distort results:
+1. **`docs/MCP_TOOLS.md`** — The cheat sheet: query intent → tool, with
+   minimal call signatures and the caveats that change numbers. Start here
+   to know what exists for what kind of question.
+
+2. **`docs/data_caveats.md`** — All the gotchas that silently distort results:
    name storage order, 24-hour report dedup, row-count inflation from joins,
    committee renaming, refund-as-expenditure, and the correct SQL templates
    for common queries.
 
-2. **`docs/mcp_server.md`** — The MCP tool catalog and data conventions.
-   Call `get_server_docs` first if the agent doesn't have repo access — it
-   returns this exact text.
+3. **`docs/mcp_server.md`** — The full MCP guide: every tool's arguments,
+   data conventions, and worked examples. Call `get_server_docs` first if
+   the agent doesn't have repo access — it returns this exact text.
 
-3. **`docs/data_dictionary.md`** — Full table/column definitions.
+4. **`docs/data_dictionary.md`** — Full table/column definitions.
 
 **How to inject these into an agent:**
 
@@ -220,9 +229,18 @@ uv run pytest tests/
   - 80 TSV files under `CalAccess/DATA/`; table docs in the `CalAccessTablesWeb.pdf`
   - Update frequency: Daily
 
-### Federal (Planned)
+### Federal (Live)
 
+- **FEC targeted independent expenditures (Schedule E)** — loaded from the
+  FEC bulk `independent_expenditure_<cycle>.csv` (public, no key) via
+  `federal/load_ie_targeted.py`, or from the authoritative full-cycle
+  OpenFEC API via `federal/load_ie_api.py` (needs `FEC_API_KEY`).
+  De-duplicated for/against views: `fec.fec_ie_targeted_dedup`
+  (migrations 0017/0018) + candidate resolution matview
+  `fec.fec_ie_targeted_resolved` (0019).
 - **FEC Open Data** — Federal Election Commission REST API: <https://api.open.fec.gov/>
+- **Update cadence:** scheduled incremental Mon–Fri 01:00 + full reload
+  Sat 02:00 Pacific (`ops/updater.py`, `ops/cron-compose.yml`).
 
 ### Prior Art Attribution
 
@@ -243,8 +261,11 @@ This project prioritizes privacy and responsible data handling:
 ### Phase 1 — California State
 Ingest CAL-ACCESS data (committee, candidate, donor, contribution, expenditure, loan, transfer, lobbying, ballot measure). Full historical load plus daily incremental updates.
 
-### Phase 2 — Federal
-Ingest FEC campaign finance data. Cross-reference with California data for multi-jurisdiction entities.
+### Phase 2 — Federal ✅ (delivered)
+Ingest FEC campaign finance data — candidate-targeted independent
+expenditures (Schedule E) with de-duplicated for/against views, six
+`fec_*` query tools, and three cross-source (state + federal) entity money
+tools. Ongoing: broader FEC schedule coverage beyond targeted IEs.
 
 ### Phase 3 — California Counties
 Ingest county-level disclosure data for comprehensive local coverage.

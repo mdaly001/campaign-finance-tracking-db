@@ -24,6 +24,10 @@ COPY --chown=appuser:appuser state/ ./state/
 COPY --chown=appuser:appuser federal/ ./federal/
 COPY --chown=appuser:appuser migrations/ ./migrations/
 COPY --chown=appuser:appuser scripts/ ./scripts/
+# docs/ ships in the image: get_server_docs() reads docs/mcp_server.md at
+# runtime so connected agents get the real guide instead of the stale
+# built-in fallback string.
+COPY --chown=appuser:appuser docs/ ./docs/
 
 # ETL download cache + logs (zip is ~1.5 GB; mount a volume for persistence)
 RUN mkdir -p /app/state/cache && chown -R appuser:appuser /app
