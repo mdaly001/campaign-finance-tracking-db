@@ -859,9 +859,9 @@ class TestServer:
 
         tools = asyncio.run(server.list_tools())
         # Count is derived from the TOOLS list so it stays correct as tools
-        # are added (29 as of the returned_contributions cross-source tool).
+        # are added (30 as of ca_race_overview, the state-side race tool).
         assert len(tools) == len(TOOLS)
-        assert len(tools) == 29
+        assert len(tools) == 30
 
     def test_tool_names_registered(self, server):
         """All expected tool names should be present."""

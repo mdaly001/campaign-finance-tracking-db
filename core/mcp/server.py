@@ -34,6 +34,7 @@ from core.mcp.federal_tools import (
     fec_top_spending,
 )
 from core.mcp.tools import (
+    ca_race_overview,
     committee_outlays_to,
     committee_profile,
     committees_paying_vendor,
@@ -75,6 +76,7 @@ TOOLS: list[str] = [
     "rapid_expense_vendors",
     "fuzzy_name_search",
     "total_expenditures",
+    "ca_race_overview",
     "refunds_to_donors",
     "data_freshness",
     "describe_table",
@@ -471,6 +473,20 @@ def _create_server() -> MCPServer:
             "What a given federal spending committee bought, de-duplicated: "
             "by payee, by purpose (ad buy vs production vs other), and by "
             "target candidate. Optionally scope to one candidate/cycle."
+        ),
+    )
+    server.add_tool(
+        ca_race_overview,
+        name="ca_race_overview",
+        description=(
+            "All California state (CAL-ACCESS) independent expenditures in a "
+            "chamber + district + cycle race, grouped by candidate and "
+            "for/against side, with top IECs per candidate. The state-side "
+            "counterpart to fec_race_overview. Handles the chamber-ambiguity of "
+            "dist_no (district 29 holds both SD-29 and AD-29): the chamber is "
+            "taken from each IE row's office_cd, and the other chamber's lines "
+            "are surfaced in 'unmatched', never dropped. chamber is 'A' "
+            "(Assembly) or 'S' (Senate)."
         ),
     )
     server.add_tool(
