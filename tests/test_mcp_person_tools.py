@@ -378,8 +378,9 @@ class TestGetServerDocs:
 
 class TestServerRegistration:
     def test_sixteen_tools(self):
-        assert len(TOOLS) == 29  # 16 Phase-1/2 + total_expenditures,
+        assert len(TOOLS) == 30  # 16 Phase-1/2 + total_expenditures,
         # refunds_to_donors, data_freshness (caveats-gap fixes), fuzzy_name_search,
+        # + ca_race_overview (state-side race for/against),
         # + 6 federal FEC Schedule-E tools (fec_*)
         # + 3 cross-source entity tools (entity_contributions, entity_expenditures,
         #   returned_contributions)

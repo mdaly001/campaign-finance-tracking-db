@@ -118,14 +118,15 @@ To pin an immutable release instead of `:latest`, prefix any command with
 
 ## Querying the database with an MCP client or AI agent
 
-The MCP server (port **9527**) exposes **29 analytical tools** across both
+The MCP server (port **9527**) exposes **30 analytical tools** across both
 sources — donor lookups, committee profiles, expenditures and refund
 handling, payments-to-person, 24-hour-report vendor recovery, ballot
-measures, filing deadlines, **federal (FEC) candidate-targeted independent
-expenditures** (for/against totals, top spenders, race overviews),
-cross-source entity money flows, and a built-in `get_server_docs` guide so
-any connected agent can self-onboard. For a scannable query-intent index,
-see [`docs/MCP_TOOLS.md`](docs/MCP_TOOLS.md).
+measures, filing deadlines, **state (CAL-ACCESS) race overviews**
+(for/against by candidate in a chamber + district), **federal (FEC)
+candidate-targeted independent expenditures** (for/against totals, top
+spenders, race overviews), cross-source entity money flows, and a built-in
+`get_server_docs` guide so any connected agent can self-onboard. For a
+scannable query-intent index, see [`docs/MCP_TOOLS.md`](docs/MCP_TOOLS.md).
 The server is **read-only**: it connects to Postgres as the `cfdb_reader`
 role, so connected clients can query but never write.
 

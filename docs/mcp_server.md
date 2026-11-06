@@ -81,6 +81,7 @@ MCP_PORT=9527 python -m core.mcp.server
 | `upcoming_filings` | Filing deadlines within N days (from `filing_period_cd`) | `committee_id`, `days_ahead?` |
 | `filing_due_soon` | Scraper-tracked deadlines within N days | `days_ahead?` |
 | `total_expenditures` | Total spend by a committee in a cycle (deduped Form E/F461P5; optional refund exclusion) | `committee_id`, `cycle`, `exclude_refunds?` |
+| `ca_race_overview` | **State race.** All California (CAL-ACCESS) independent expenditures in a chamber + district + cycle race, by candidate and for/against side, with top IECs — the state-side counterpart to `fec_race_overview`. Splits the chamber-ambiguous `dist_no` on each row's `office_cd`; the other chamber's lines surface in `unmatched`, never dropped | `chamber` (`A`/`S`), `district`, `cycle`, `top_n?` |
 | `refunds_to_donors` | "Return of contribution" refund lines by a committee in a cycle | `committee_id`, `cycle`, `limit?` |
 | `data_freshness` | Snapshot freshness: newest transaction dates (corrupt future-dated rows excluded), last ETL load, row counts | — |
 | `fec_find_candidate` | **Federal.** Resolve a candidate name to FEC `candidate_id`(s) from Schedule E; substring **or fuzzy trigram** match (typos/reordered names), each hit scored `match` 0–1; optional state/district/cycle | `name`, `state?`, `district?`, `cycle?`, `limit?`, `min_similarity?` |

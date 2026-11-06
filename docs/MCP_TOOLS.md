@@ -1,4 +1,4 @@
-# MCP Tools Cheat Sheet — 29 read-only tools
+# MCP Tools Cheat Sheet — 30 read-only tools
 
 Quick index for AI agents: **what exists for what kind of query**. Full
 conventions and worked examples: `docs/mcp_server.md` (also served in-band
@@ -26,6 +26,7 @@ via `get_server_docs`).
 | "What did committee X refund?" | `refunds_to_donors(committee_id, cycle)` |
 | "Committee X's payments to vendor Y?" | `committee_outlays_to(committee_id, vendor_name, cycle)` |
 | "24-hr (Form 496) payees for committee X?" | `rapid_expense_vendors(committee_id)` — 496 lines carry **no payee**; this recovers them by date+amount (80–97%) |
+| "Whole state race picture (chamber + district + cycle), for/against by candidate + top IECs" | `ca_race_overview(chamber, district, cycle)` — the CAL-ACCESS counterpart to `fec_race_overview`; `chamber` is `'A'` (Assembly) / `'S'` (Senate); the other chamber's lines surface in `unmatched` |
 
 ### Vendors
 | Question | Tool |
@@ -84,6 +85,13 @@ via `get_server_docs`).
   total — the split is disclosed in `form_d_total` / `form_e_total` + notes.
 - Form 496 (24-hr expenditure) lines have **no payee name** — vendor answers
   from raw 496 data are a lower bound; use `rapid_expense_vendors`.
+- **`dist_no` is chamber-ambiguous** — district "29" holds both SD-29 and AD-29
+  lines. The chamber is `office_cd` on the row (`'SEN'`/`'ASM'`), not the
+  district. `ca_race_overview` splits on it and reports the other chamber in
+  `unmatched`; raw SQL must filter `office_cd` too.
+- A state IE is `expn_code='IND' AND form_type='D'` on `expn_cd_deduped`;
+  `cmte_id` is NULL on ~94% of them (never filter/group IEs on `cmte_id`), and
+  `sup_opp_cd` is the for/against flag.
 
 **Federal (FEC targeted IE):**
 - Tools read `fec.fec_ie_targeted_dedup` (F24-notice/F3X collapse + cross-

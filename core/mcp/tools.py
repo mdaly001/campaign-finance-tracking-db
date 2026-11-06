@@ -2990,3 +2990,285 @@ def fuzzy_name_search(
     if not entities and not alias_rows and match_rows:
         result["resolved_via"] = "name"
     return result
+
+
+# --------------------------------------------------------------------------- #
+#  ca_race_overview
+# --------------------------------------------------------------------------- #
+#
+# The CAL-ACCESS state-side counterpart to fec_race_overview: the full
+# for/against independent-expenditure picture for one chamber + district +
+# cycle. It exists because "all the IE money in a state race" otherwise needs
+# ~12 hand-rolled SQL calls, and every one of these traps yields wrong numbers
+# if missed:
+#
+#   * dist_no is CHAMBER-AMBIGUOUS — district "29" holds both SD-29 and AD-29
+#     lines. The disambiguation key is office_cd on the IE row ('SEN'/'ASM'),
+#     not the committee name. So the bucket is dist_no + cycle (BOTH chambers)
+#     and the chamber split is on office_cd; the other chamber's lines surface
+#     in `unmatched`, never silently dropped.
+#   * An IE is expn_code='IND' AND form_type='D' (the dated, candidate-level
+#     IE totals). Form E/G lines are vendor/outlet detail for the SAME IEs —
+#     including them double-counts.
+#   * cmte_id is NULL on ~94% of IND rows — never filter/group IEs on it. The
+#     spending IEC is recovered through the filing_filer matview
+#     (filing_id -> filer_id), which is already de-duplicated (the naive
+#     MIN(filer_id) over filer_filings_cd times out on ~3M duplicated pairs).
+#   * filername_cd holds a filer's FULL NAME HISTORY (many rows per filer_id);
+#     we pick exactly one (effect_dt DESC, id DESC) or totals inflate ~4x.
+#   * sup_opp_cd is the explicit for/against flag ('S' support / 'O' oppose).
+#   * Candidate names vary ("Reyes" / "Eloise Reyes" / "Eloise Gomez Reyes" /
+#     "Eloise Reyes for Senate 2024"); variants are merged by token-subset.
+#
+# The bucket reads the de-duplicated expn_cd_deduped view (migration 0022 adds
+# the indexes that keep its global dedup inside the query budget).
+# --------------------------------------------------------------------------- #
+
+def _candidate_tokens(name: Any) -> frozenset[str]:
+    """Normalize a candidate name to a token set for variant merging.
+
+    Uppercases, drops a trailing "FOR <OFFICE> <YEAR>" committee suffix,
+    reduces runs of non-alphanumerics to single spaces, and returns the set of
+    tokens. Two spellings of the same person yield overlapping token sets.
+    """
+    if not name:
+        return frozenset()
+    s = re.sub(
+        r"\bFOR\s+(?:SENATE|ASSEMBLY|SUPERIOR|COURT|STATE)\s+\d{4}\b",
+        " ",
+        str(name).strip(),
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(r"[^A-Z0-9]+", " ", s.upper()).strip()
+    return frozenset(s.split())
+
+
+def _merge_candidate_variants(names: list[Any]) -> dict[str, str]:
+    """Map each raw candidate name to a merged group key (token-subset union-find).
+
+    Two names merge when one's token-set is a subset of the other's and the
+    smaller set has >= 2 tokens — so "ELOISE REYES" folds into "ELOISE GOMEZ
+    REYES" and into "REYES ELOISE", while a bare one-token name cannot swallow
+    unrelated same-surname candidates. The returned value is a stable group id
+    (the lexicographically-first member is the root); the caller picks the human
+    display name per group.
+    """
+    uniq = sorted({str(n).strip() for n in names if n and str(n).strip()})
+    toks = {n: _candidate_tokens(n) for n in uniq}
+    parent = {n: n for n in uniq}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(len(uniq)):
+        for j in range(i + 1, len(uniq)):
+            a, b = toks[uniq[i]], toks[uniq[j]]
+            if a and b and min(len(a), len(b)) >= 2 and (a <= b or b <= a):
+                parent[find(uniq[i])] = find(uniq[j])
+
+    return {n: find(n) for n in uniq}
+
+
+def _iec_display(r: dict[str, Any]) -> str:
+    """Human name for the spending IEC from a bucket row (naml / namf)."""
+    naml = (r.get("iec_naml") or "").strip()
+    namf = (r.get("iec_namf") or "").strip()
+    if naml and namf:
+        return f"{naml}, {namf}"
+    return naml or namf or "(unresolved IEC)"
+
+
+def _cand_full(r: dict[str, Any]) -> str:
+    """Full candidate name from a bucket row.
+
+    CAL-ACCESS populates the candidate name INCONSISTENTLY across the two
+    fields: some rows put the whole name in ``cand_naml`` (with ``cand_namf``
+    empty), others put the last name in ``cand_naml`` and the first name in
+    ``cand_namf``. Concatenating both is the only spelling-complete form to
+    merge on (using ``cand_naml`` alone splits "Eloise Reyes" from "Reyes
+    [namf=Eloise]").
+    """
+    naml = (r.get("cand_naml") or "").strip()
+    namf = (r.get("cand_namf") or "").strip()
+    return f"{naml} {namf}".strip()
+
+
+def ca_race_overview(
+    chamber: str,
+    district: str,
+    cycle: int,
+    top_n: int = 10,
+) -> dict[str, Any]:
+    """Full for/against independent-expenditure picture for a CA state race.
+
+    The CAL-ACCESS state-side counterpart to ``fec_race_overview``: answers
+    "all the IE money in a given chamber + district + cycle" in one call, with
+    the chamber-ambiguity of ``dist_no`` handled explicitly (see the module
+    note above this function).
+
+    Args:
+        chamber: ``"A"`` (Assembly) or ``"S"`` (Senate).
+        district: District number as a string (e.g. ``"29"``).
+        cycle: Calendar year of the race. Form D lines are dated, so the window
+            is Jan 1 .. Dec 31 of ``cycle`` (no NULL-date trap, unlike Form E).
+        top_n: How many top IECs to return per candidate + side (default 10).
+
+    Returns:
+        ``{chamber, district, cycle, office,
+           race_roster: [candidate, ...],
+           by_candidate: [{candidate, for_total, against_total, for_count,
+               against_count, first_date, last_date}],
+           top_spenders: [{candidate, side, iec, total, n_lines}],
+           unmatched: {total, n_lines,
+               by_candidate: [{candidate, office_cd, total, n_lines}]}}``
+
+    Note: ``dist_no`` is chamber-ambiguous (district 29 holds both SD-29 and
+    AD-29 lines). The chamber is taken from each IE row's ``office_cd``; lines
+    from the other chamber are reported in ``unmatched`` — never dropped.
+    """
+    ch = str(chamber).strip().upper()
+    if ch not in ("A", "S"):
+        raise ValueError("chamber must be 'A' (Assembly) or 'S' (Senate)")
+    district = str(district).strip()
+    if not district:
+        raise ValueError("district is required (e.g. '29')")
+    office = "ASM" if ch == "A" else "SEN"
+    cycle = int(cycle)
+    top_n = max(1, int(top_n))
+
+    # One pass: the de-duplicated IE bucket for the district+cycle (BOTH
+    # chambers, so bleed is visible) with the spending IEC name attached. The
+    # filername_cd scan is scoped to the bucket's filers only (a name-history
+    # dedup over the whole table would be far slower and is unnecessary).
+    sql = """
+        WITH bucket AS (
+            SELECT filing_id, cand_naml, cand_namf, office_cd, sup_opp_cd, amount, expn_date
+            FROM expn_cd_deduped
+            WHERE expn_code = 'IND'
+              AND form_type = 'D'
+              AND dist_no = :district
+              AND expn_date >= :cyc_start
+              AND expn_date <= :cyc_end
+        ),
+        bucket_filers AS (
+            SELECT DISTINCT ff.filer_id
+            FROM bucket b
+            JOIN filing_filer ff ON ff.filing_id = b.filing_id
+        ),
+        ln AS (
+            SELECT DISTINCT ON (filer_id) filer_id, naml, namf
+            FROM filername_cd
+            WHERE filer_id::text IN (SELECT filer_id FROM bucket_filers)
+            ORDER BY filer_id, effect_dt DESC, id DESC
+        )
+        SELECT b.cand_naml, b.cand_namf, b.office_cd, b.sup_opp_cd, b.amount, b.expn_date,
+               ln.naml AS iec_naml, ln.namf AS iec_namf
+        FROM bucket b
+        LEFT JOIN filing_filer ff ON ff.filing_id = b.filing_id
+        LEFT JOIN ln ON ln.filer_id::text = ff.filer_id::text
+    """
+    rows = execute_read(
+        sql,
+        {
+            "district": district,
+            "cyc_start": f"{cycle}-01-01",
+            "cyc_end": f"{cycle}-12-31",
+        },
+    )
+
+    # -- merge candidate name variants -------------------------------------- #
+    root_of = _merge_candidate_variants([_cand_full(r) for r in rows])
+    group_rows: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        name = _cand_full(r)
+        if not name:
+            continue
+        group_rows.setdefault(root_of.get(name, name), []).append(r)
+
+    # Display name per group = the raw variant with the most rows (the most
+    # common filing spelling); ties broken alphabetically for determinism.
+    display: dict[str, str] = {}
+    for root, rs in group_rows.items():
+        counts: dict[str, int] = {}
+        for r in rs:
+            nm = _cand_full(r)
+            counts[nm] = counts.get(nm, 0) + 1
+        display[root] = max(counts, key=lambda k: (counts[k], k))
+
+    # -- roster = candidate groups with a line in the requested chamber ----- #
+    roster = [root for root, rs in group_rows.items()
+              if any(r.get("office_cd") == office for r in rs)]
+
+    # -- by_candidate ------------------------------------------------------- #
+    by_candidate: list[dict[str, Any]] = []
+    for root in roster:
+        rs = [r for r in group_rows[root] if r.get("office_cd") == office]
+        for_tot = sum(_money(r.get("amount")) for r in rs if r.get("sup_opp_cd") == "S")
+        ag_tot = sum(_money(r.get("amount")) for r in rs if r.get("sup_opp_cd") == "O")
+        dates = sorted(_dtos(r.get("expn_date")) for r in rs if r.get("expn_date"))
+        by_candidate.append({
+            "candidate": display[root],
+            "for_total": round(for_tot, 2),
+            "against_total": round(ag_tot, 2),
+            "for_count": sum(1 for r in rs if r.get("sup_opp_cd") == "S"),
+            "against_count": sum(1 for r in rs if r.get("sup_opp_cd") == "O"),
+            "first_date": dates[0] if dates else None,
+            "last_date": dates[-1] if dates else None,
+        })
+    by_candidate.sort(key=lambda c: (c["for_total"] + c["against_total"]), reverse=True)
+
+    # -- top_spenders (per candidate + side) -------------------------------- #
+    top_spenders: list[dict[str, Any]] = []
+    for root in roster:
+        for side, scode in (("for", "S"), ("against", "O")):
+            agg: dict[str, dict[str, Any]] = {}
+            for r in group_rows[root]:
+                if r.get("office_cd") != office or r.get("sup_opp_cd") != scode:
+                    continue
+                e = agg.setdefault(_iec_display(r), {"total": 0.0, "n": 0})
+                e["total"] += _money(r.get("amount"))
+                e["n"] += 1
+            for iec, e in sorted(agg.items(), key=lambda kv: kv[1]["total"], reverse=True)[:top_n]:
+                top_spenders.append({
+                    "candidate": display[root],
+                    "side": side,
+                    "iec": iec,
+                    "total": round(e["total"], 2),
+                    "n_lines": e["n"],
+                })
+
+    # -- unmatched (other-chamber bleed, never dropped) --------------------- #
+    un_agg: dict[str, dict[str, Any]] = {}
+    un_total = 0.0
+    un_lines = 0
+    for r in rows:
+        if r.get("office_cd") == office:
+            continue
+        name = _cand_full(r) or "(unnamed)"
+        e = un_agg.setdefault(name, {"total": 0.0, "n": 0, "office_cd": r.get("office_cd")})
+        e["total"] += _money(r.get("amount"))
+        e["n"] += 1
+        un_total += _money(r.get("amount"))
+        un_lines += 1
+    un_by_cand = [
+        {"candidate": k, "office_cd": v["office_cd"], "total": round(v["total"], 2), "n_lines": v["n"]}
+        for k, v in sorted(un_agg.items(), key=lambda kv: kv[1]["total"], reverse=True)
+    ]
+
+    return {
+        "chamber": ch,
+        "district": district,
+        "cycle": cycle,
+        "office": office,
+        "race_roster": [display[r] for r in sorted(roster, key=lambda x: display[x])],
+        "by_candidate": by_candidate,
+        "top_spenders": top_spenders,
+        "unmatched": {
+            "total": round(un_total, 2),
+            "n_lines": un_lines,
+            "by_candidate": un_by_cand,
+        },
+    }
